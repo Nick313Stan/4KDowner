@@ -1,0 +1,43 @@
+{
+  "configurations": [
+    {
+      "name": "linux-gcc-x64",
+      "includePath": [
+        "${workspaceFolder}/src",
+        "${workspaceFolder}/../packages/raylib/src",
+        "${workspaceFolder}/../packages/tinyfiledialogs"
+      ],
+      "defines": [
+        "FOURKDOWNER_VERSION=\"1.0.0\"",
+        "PLATFORM_DESKTOP",
+        "GRAPHICS_API_OPENGL_33"
+      ],
+      "compilerPath": "/usr/bin/g++",
+      "cStandard": "c17",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "linux-gcc-x64",
+      "compileCommands": "${workspaceFolder}/build-linux/compile_commands.json",
+      "configurationProvider": "ms-vscode.cmake-tools"
+    },
+    {
+      "name": "windows-msvc-x64",
+      "includePath": [
+        "${workspaceFolder}/src",
+        "${workspaceFolder}/../packages/raylib/src",
+        "${workspaceFolder}/../packages/tinyfiledialogs"
+      ],
+      "defines": [
+        "_DEBUG",
+        "UNICODE",
+        "_UNICODE"
+      ],
+      "windowsSdkVersion": "10.0.26100.0",
+      "compilerPath": "C:/Program Files/Microsoft Visual Studio/18/Community/VC/Tools/MSVC/14.51.36231/bin/Hostx64/x64/cl.exe",
+      "cStandard": "c17",
+      "cppStandard": "c++17",
+      "intelliSenseMode": "windows-msvc-x64",
+      "configurationProvider": "ms-vscode.cmake-tools"
+    }
+  ],
+  "version": 4
+}
