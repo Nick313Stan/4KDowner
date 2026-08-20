@@ -81,6 +81,14 @@ private:
     Rectangle GetListActionButtonBounds(Rectangle leftPanel, int index, float scrollOffset) const;
     Rectangle GetDownloadButtonBounds(Rectangle settingsPanel) const;
     Rectangle GetSecondaryActionButtonBounds(Rectangle settingsPanel) const;
+    struct SettingsActionGrid
+    {
+        Rectangle primarySelected{};
+        Rectangle primaryAll{};
+        Rectangle cancelSelected{};
+        Rectangle cancelAll{};
+    };
+    SettingsActionGrid GetSettingsActionGrid(Rectangle settingsPanel) const;
     Rectangle GetCardBounds(Rectangle leftPanel, int index, float scrollOffset = 0.0f) const;
     void RebuildDownloaderLayoutCache() const;
     float GetDownloaderItemTop(Rectangle leftPanel, int index, float scrollOffset) const;
@@ -194,6 +202,8 @@ private:
     void StartConvert(ConvertRequest request);
     void QueueAutoConvertForCard(LinkCardNode& card);
     bool AnyLinkCardConverting() const;
+    bool HasPendingDownloadAutoConverts() const;
+    void CancelAllDownloadAutoConverts();
     void CancelLinkCardConvert(const std::string& inputPath);
     void RemovePendingConvertsForPath(const std::string& inputPath);
     void CancelConverterCard(const std::string& inputPath);
@@ -205,8 +215,10 @@ private:
                                 const std::string& clipboardLog = "");
     void UpdateFooterNotificationTimer();
     void UpdateOverwritePrompt(int windowWidth, int windowHeight);
+    void UpdateCancelConfirmPrompt(int windowWidth, int windowHeight);
     void UpdateAboutDialog(int windowWidth, int windowHeight, Font font);
     void UpdateInfoDialog(int windowWidth, int windowHeight, Font font);
+    void OpenCancelConfirmPrompt(bool cancelAll, bool isConvert);
     void DrawRightPanel(Rectangle rightPanel, Font font) const;
     void DrawHeader(Rectangle header, Font font) const;
     void UpdateFooter();
@@ -226,6 +238,7 @@ private:
     void DrawFooterCloseIcon(Rectangle bounds, bool hovered) const;
     void DrawFooterCopyIcon(Rectangle bounds, bool hovered) const;
     void DrawOverwritePrompt(int windowWidth, int windowHeight, Font font) const;
+    void DrawCancelConfirmPrompt(int windowWidth, int windowHeight, Font font) const;
     void DrawAboutDialog(int windowWidth, int windowHeight, Font font) const;
     void DrawInfoDialog(int windowWidth, int windowHeight, Font font) const;
     static std::string GetDefaultDownloadPath();
@@ -258,11 +271,13 @@ private:
     Button downloadAllButton_{"Download All"};
     Button convertButton_{"Convert Selected"};
     Button convertAllButton_{"Convert All"};
-    Button cancelDownloadButton_{"Cancel"};
+    Button cancelDownloadButton_{"Cancel Selected"};
     Button cancelAllActionButton_{"Cancel All"};
     Button replaceFileButton_{"Replace"};
     Button cancelReplaceButton_{"Cancel"};
     Button cancelAllReplaceButton_{"Cancel All"};
+    Button confirmCancelYesButton_{"Yes"};
+    Button confirmCancelNoButton_{"Cancel"};
     Button closeAboutButton_{"OK"};
     Button closeInfoButton_{"OK"};
     Dropdown fileFormatDropdown_{{"MP4"}};
@@ -337,10 +352,14 @@ private:
     float infoDialogScrollOffset_ = 0.0f;
     Workspace activeWorkspace_ = Workspace::Downloader;
     bool isOverwritePromptOpen_ = false;
+    bool isCancelConfirmOpen_ = false;
     bool isAboutDialogOpen_ = false;
     bool isInfoDialogOpen_ = false;
     bool overwritePromptIsConvert_ = false;
+    bool cancelConfirmIsConvert_ = false;
+    bool cancelConfirmIsAll_ = false;
     int overwritePromptFocusIndex_ = 0;
+    int cancelConfirmFocusIndex_ = 0;
     bool isBatchDownloading_ = false;
     bool isBatchConverting_ = false;
     double batchConvertElapsedTotal_ = 0.0;

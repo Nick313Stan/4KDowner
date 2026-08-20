@@ -43,7 +43,7 @@ On Windows, install CMake via the Visual Studio installer or from cmake.org, and
 - Sibling `packages/` folder next to this repo with:
   - `raylib`
   - `tinyfiledialogs`
-  - (for running packaged builds) `ffmpeg`, and optionally `ytdown`
+  - (for running packaged builds) `ffmpeg`, `ytdown`, and `nodejs`
 
 `packages/` can hold both Windows and Linux binaries side by side (for example `ffmpeg.exe` and `ffmpeg`). The app picks the native tools for the current OS.
 
@@ -57,6 +57,7 @@ Coding/
     tinyfiledialogs/
     ffmpeg/
     ytdown/
+    nodejs/
 ```
 
 ### Windows
@@ -74,7 +75,7 @@ sudo apt install build-essential cmake libgl1-mesa-dev libx11-dev libxcursor-dev
   libxinerama-dev libxrandr-dev libxi-dev libasound2-dev
 ```
 
-At runtime you also need `ytdown` and `ffmpeg` either on `PATH` or under `packages/` in the portable tree. Thumbnail fetch uses `curl` when available.
+At runtime you also need `ytdown`, `ffmpeg`, and a JS runtime (`packages/nodejs` or system Node) either on `PATH` or under `packages/` in the portable tree. Thumbnail fetch uses `curl` when available.
 
 ## Build
 

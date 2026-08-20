@@ -113,16 +113,28 @@ void Button::Draw(Rectangle bounds, Font font, bool enabled, bool focused) const
     DrawButtonChrome(bounds, font, text_, background, border, text, enabled && isPressed_);
 }
 
-void Button::DrawDanger(Rectangle bounds, Font font, bool focused) const
+void Button::DrawDanger(Rectangle bounds, Font font, bool enabled, bool focused) const
 {
-    const bool highlight = isHovered_ || focused;
-    const Color background =
-        isPressed_ ? Color{94, 36, 34, 255} : (highlight ? Color{130, 52, 48, 255} : Color{54, 74, 54, 255});
-    const Color border = isPressed_ ? Color{204, 88, 78, 255}
-                                    : (focused ? Color{224, 140, 120, 255}
-                                               : (isHovered_ ? Color{224, 104, 92, 255} : Color{88, 112, 88, 255}));
-    const Color text = {232, 238, 232, 255};
-    DrawButtonChrome(bounds, font, text_, background, border, text, isPressed_);
+    Color background{};
+    Color border{};
+    Color text{};
+    if (!enabled)
+    {
+        background = Color{28, 34, 28, 255};
+        border = Color{54, 64, 54, 255};
+        text = Color{118, 128, 118, 255};
+    }
+    else
+    {
+        const bool highlight = isHovered_ || focused;
+        background =
+            isPressed_ ? Color{94, 36, 34, 255} : (highlight ? Color{130, 52, 48, 255} : Color{54, 74, 54, 255});
+        border = isPressed_ ? Color{204, 88, 78, 255}
+                            : (focused ? Color{224, 140, 120, 255}
+                                       : (isHovered_ ? Color{224, 104, 92, 255} : Color{88, 112, 88, 255}));
+        text = {232, 238, 232, 255};
+    }
+    DrawButtonChrome(bounds, font, text_, background, border, text, enabled && isPressed_);
 }
 
 void Button::SetText(const char* text)

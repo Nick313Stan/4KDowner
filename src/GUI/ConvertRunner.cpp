@@ -27,7 +27,12 @@
 #define POPEN _popen
 #define PCLOSE _pclose
 #else
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
+#include <unistd.h>
 #define POPEN popen
 #define PCLOSE pclose
 #endif
@@ -252,32 +257,140 @@ int RunProcessCaptureOutput(const std::string& commandLine,
                             const std::shared_ptr<std::atomic_bool>& cancelRequested,
                             const std::function<void(const std::string&)>& onOutput)
 {
-    (void)cancelRequested;
-    FILE* pipe = POPEN(commandLine.c_str(), "r");
-    if (pipe == nullptr)
+    int pipefd[2] = {-1, -1};
+    if (pipe(pipefd) != 0)
     {
         return -1;
     }
 
-    std::array<char, 512> buffer{};
-    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr)
+    const pid_t pid = fork();
+    if (pid < 0)
     {
-        const std::string line = buffer.data();
-        fullOutput += line;
-        if (!line.empty())
-        {
-            lastLine = line;
-        }
-        if (onOutput)
-        {
-            onOutput(line);
-        }
-    }
-    const int status = PCLOSE(pipe);
-    if (status == -1)
-    {
+        close(pipefd[0]);
+        close(pipefd[1]);
         return -1;
     }
+
+    if (pid == 0)
+    {
+        setpgid(0, 0);
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        if (pipefd[1] != STDOUT_FILENO && pipefd[1] != STDERR_FILENO)
+        {
+            close(pipefd[1]);
+        }
+        execl("/bin/sh", "sh", "-c", commandLine.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    setpgid(pid, pid);
+    close(pipefd[1]);
+
+    const int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags >= 0)
+    {
+        fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+    }
+
+    std::string pendingText;
+    std::array<char, 512> buffer{};
+    bool childExited = false;
+    int status = 0;
+    while (!childExited)
+    {
+        if (cancelRequested != nullptr && cancelRequested->load())
+        {
+            KillProcessTree(static_cast<unsigned long>(pid));
+            waitpid(pid, &status, 0);
+            close(pipefd[0]);
+            return -2;
+        }
+
+        pollfd pfd{};
+        pfd.fd = pipefd[0];
+        pfd.events = POLLIN;
+        const int pollResult = poll(&pfd, 1, 100);
+        if (pollResult > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0)
+        {
+            for (;;)
+            {
+                const ssize_t bytesRead = read(pipefd[0], buffer.data(), buffer.size());
+                if (bytesRead > 0)
+                {
+                    pendingText.append(buffer.data(), static_cast<size_t>(bytesRead));
+                    fullOutput.append(buffer.data(), static_cast<size_t>(bytesRead));
+                    if (onOutput)
+                    {
+                        onOutput(std::string(buffer.data(), static_cast<size_t>(bytesRead)));
+                    }
+                    continue;
+                }
+                if (bytesRead == 0)
+                {
+                    break;
+                }
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    break;
+                }
+                break;
+            }
+        }
+
+        const pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid)
+        {
+            childExited = true;
+        }
+        else if (waited < 0 && errno != EINTR)
+        {
+            childExited = true;
+            status = 1;
+        }
+    }
+
+    for (;;)
+    {
+        const ssize_t bytesRead = read(pipefd[0], buffer.data(), buffer.size());
+        if (bytesRead > 0)
+        {
+            pendingText.append(buffer.data(), static_cast<size_t>(bytesRead));
+            fullOutput.append(buffer.data(), static_cast<size_t>(bytesRead));
+            if (onOutput)
+            {
+                onOutput(std::string(buffer.data(), static_cast<size_t>(bytesRead)));
+            }
+            continue;
+        }
+        break;
+    }
+    close(pipefd[0]);
+
+    if (cancelRequested != nullptr && cancelRequested->load())
+    {
+        return -2;
+    }
+
+    size_t separator = pendingText.find_last_of("\r\n");
+    if (separator != std::string::npos)
+    {
+        lastLine = pendingText.substr(separator + 1);
+        while (!lastLine.empty() && (lastLine.back() == '\r' || lastLine.back() == '\n'))
+        {
+            lastLine.pop_back();
+        }
+    }
+    else
+    {
+        lastLine = pendingText;
+    }
+
     if (WIFEXITED(status))
     {
         return WEXITSTATUS(status);

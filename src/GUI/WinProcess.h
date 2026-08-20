@@ -46,8 +46,12 @@ inline void KillProcessTree(unsigned long processId)
     {
         return;
     }
+    const pid_t pid = static_cast<pid_t>(processId);
     // Negative PID = process group (runners should setpgid).
-    ::kill(-static_cast<pid_t>(processId), SIGTERM);
-    ::kill(static_cast<pid_t>(processId), SIGTERM);
+    ::kill(-pid, SIGTERM);
+    ::kill(pid, SIGTERM);
+    ::usleep(100000);
+    ::kill(-pid, SIGKILL);
+    ::kill(pid, SIGKILL);
 }
 #endif
