@@ -7,7 +7,7 @@
 # Optional:
 #   --ensure-ytdown   refresh packages/ytdown/bin/yt-dlp if missing
 #   --out-root DIR    output root (default: ../yCompiled/4KDownerCompiled)
-#   --app-version VER version segment in folder name (default: 1.0.0)
+#   --app-version VER version segment in folder name (default: 1.1.0)
 #   --portable-root DIR  override full portable folder path
 #   --build-dir DIR   CMake build dir (default: <repo>/build-linux)
 
@@ -22,7 +22,7 @@ PACKAGES_ROOT="$CODING_ROOT/packages"
 
 ENSURE_YTDOWN=0
 OUT_ROOT=""
-APP_VERSION="1.0.0"
+APP_VERSION="1.1.0"
 PORTABLE_ROOT=""
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build-linux}"
 

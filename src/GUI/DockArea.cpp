@@ -31,7 +31,7 @@
 #include <vector>
 
 #ifndef FOURKDOWNER_VERSION
-#define FOURKDOWNER_VERSION "1.0.0"
+#define FOURKDOWNER_VERSION "1.1.0"
 #endif
 
 #ifdef _WIN32
@@ -1505,27 +1505,27 @@ std::string FormatDownloadFinishedStatus(double seconds, bool allDownloads)
 {
     if (allDownloads)
     {
-        return "All downloads finished вЂ” took " + FormatElapsedTime(seconds);
+        return "All downloads finished - took " + FormatElapsedTime(seconds);
     }
-    return "Download finished вЂ” took " + FormatElapsedTime(seconds);
+    return "Download finished - took " + FormatElapsedTime(seconds);
 }
 
 std::string FormatConvertFinishedStatus(double seconds, bool allConversions)
 {
     if (allConversions)
     {
-        return "All videos converted successfully вЂ” took " + FormatElapsedTime(seconds);
+        return "All videos converted successfully - took " + FormatElapsedTime(seconds);
     }
-    return "Video converted successfully вЂ” took " + FormatElapsedTime(seconds);
+    return "Video converted successfully - took " + FormatElapsedTime(seconds);
 }
 
 std::string FormatDownloadConvertFinishedStatus(double seconds, bool allJobs)
 {
     if (allJobs)
     {
-        return "All downloads & converts finished вЂ” took " + FormatElapsedTime(seconds);
+        return "All downloads & converts finished - took " + FormatElapsedTime(seconds);
     }
-    return "Download & convert finished вЂ” took " + FormatElapsedTime(seconds);
+    return "Download & convert finished - took " + FormatElapsedTime(seconds);
 }
 
 std::filesystem::path GetLogPath()
@@ -1880,9 +1880,6 @@ void DockArea::Update(int windowWidth, int windowHeight, Font font)
 
     const Rectangle leftPanel = GetLeftPanel(windowWidth, windowHeight);
     const Rectangle rightPanel = GetRightPanel(windowWidth, windowHeight);
-    const Rectangle insertLinkButton = GetInsertLinkButtonBounds(leftPanel);
-    const Rectangle downloadButton = GetDownloadButtonBounds(GetRightSettingsPanel(rightPanel));
-    const Rectangle downloadAllButton = GetSecondaryActionButtonBounds(GetRightSettingsPanel(rightPanel));
 
     for (DownloadRunner& runner : downloadRunners_)
     {
@@ -1904,8 +1901,8 @@ void DockArea::Update(int windowWidth, int windowHeight, Font font)
         ProcessFinishedDownloadRunner(runner);
     }
 
-    if (!pendingConvertQueue_.empty() && !isOverwritePromptOpen_ && !isAboutDialogOpen_ && !isInfoDialogOpen_ &&
-        FirstFreeConvertRunner() != nullptr)
+    if (!pendingConvertQueue_.empty() && !isOverwritePromptOpen_ && !isCancelConfirmOpen_ && !isAboutDialogOpen_ &&
+        !isInfoDialogOpen_ && FirstFreeConvertRunner() != nullptr)
     {
         StartNextPendingConvert();
     }
@@ -1933,8 +1930,14 @@ void DockArea::Update(int windowWidth, int windowHeight, Font font)
         return;
     }
 
-    if (!pendingDownloadQueue_.empty() && !isOverwritePromptOpen_ && FirstFreeDownloadRunner() != nullptr &&
-        GetTime() >= nextDownloadStartTime_)
+    if (isCancelConfirmOpen_)
+    {
+        UpdateCancelConfirmPrompt(windowWidth, windowHeight);
+        return;
+    }
+
+    if (!pendingDownloadQueue_.empty() && !isOverwritePromptOpen_ && !isCancelConfirmOpen_ &&
+        FirstFreeDownloadRunner() != nullptr && GetTime() >= nextDownloadStartTime_)
     {
         WriteDebugLog("starting scheduled next download");
         StartNextPendingDownload();
@@ -1945,42 +1948,22 @@ void DockArea::Update(int windowWidth, int windowHeight, Font font)
         UpdateDownloaderWorkspace(leftPanel, rightPanel, font);
         if (!overlayBlocksActions_)
         {
-            if (SelectedCardShowsCancel())
-            {
-                if (cancelDownloadButton_.Update(downloadButton))
-                {
-                    HandleCancelSelectedRequest();
-                }
-                else if (HasDownloadableIdleCards())
-                {
-                    if (downloadAllButton_.Update(downloadAllButton))
-                    {
-                        HandleDownloadAllRequest();
-                    }
-                }
-                else if (cancelAllActionButton_.Update(downloadAllButton))
-                {
-                    HandleCancelAllDownloadsRequest();
-                }
-            }
-            else if (HasActiveDownloadWorkspaceWork())
-            {
-                if (downloadButton_.Update(downloadButton, CanDownloadSelected()))
-                {
-                    HandleDownloadRequest();
-                }
-                else if (cancelAllActionButton_.Update(downloadAllButton))
-                {
-                    HandleCancelAllDownloadsRequest();
-                }
-            }
-            else if (downloadButton_.Update(downloadButton, CanDownloadSelected()))
+            const SettingsActionGrid actions = GetSettingsActionGrid(GetRightSettingsPanel(rightPanel));
+            if (downloadButton_.Update(actions.primarySelected, CanDownloadSelected()))
             {
                 HandleDownloadRequest();
             }
-            else if (downloadAllButton_.Update(downloadAllButton, HasDownloadableIdleCards()))
+            else if (downloadAllButton_.Update(actions.primaryAll, HasDownloadableIdleCards()))
             {
                 HandleDownloadAllRequest();
+            }
+            else if (cancelDownloadButton_.Update(actions.cancelSelected, SelectedCardShowsCancel()))
+            {
+                OpenCancelConfirmPrompt(false, false);
+            }
+            else if (cancelAllActionButton_.Update(actions.cancelAll, HasActiveDownloadWorkspaceWork()))
+            {
+                OpenCancelConfirmPrompt(true, false);
             }
         }
     }
@@ -1990,8 +1973,7 @@ void DockArea::Update(int windowWidth, int windowHeight, Font font)
         const Rectangle settingsPanel = GetRightSettingsPanel(rightPanel);
         if (!overlayBlocksActions_)
         {
-            const Rectangle convertLeft = GetDownloadButtonBounds(settingsPanel);
-            const Rectangle convertRight = GetSecondaryActionButtonBounds(settingsPanel);
+            const SettingsActionGrid actions = GetSettingsActionGrid(settingsPanel);
             const auto canConvertSelected = [this]()
             {
                 return std::any_of(converterCards_.begin(),
@@ -2007,47 +1989,26 @@ void DockArea::Update(int windowWidth, int windowHeight, Font font)
                                    });
             };
 
-            if (SelectedConverterShowsCancel())
-            {
-                if (cancelDownloadButton_.Update(convertLeft))
-                {
-                    HandleCancelSelectedConvertsRequest();
-                }
-                else if (CanBuildAnyConvertRequest())
-                {
-                    if (convertAllButton_.Update(convertRight))
-                    {
-                        HandleConvertAllRequest();
-                    }
-                }
-                else if (cancelAllActionButton_.Update(convertRight))
-                {
-                    HandleCancelAllConvertsRequest();
-                }
-            }
-            else if (HasActiveConverterWorkspaceWork())
-            {
-                if (convertButton_.Update(convertLeft, canConvertSelected()))
-                {
-                    HandleConvertRequest();
-                }
-                else if (cancelAllActionButton_.Update(convertRight))
-                {
-                    HandleCancelAllConvertsRequest();
-                }
-            }
-            else if (convertButton_.Update(convertLeft, canConvertSelected()))
+            if (convertButton_.Update(actions.primarySelected, canConvertSelected()))
             {
                 HandleConvertRequest();
             }
-            else if (convertAllButton_.Update(convertRight, CanBuildAnyConvertRequest()))
+            else if (convertAllButton_.Update(actions.primaryAll, CanBuildAnyConvertRequest()))
             {
                 HandleConvertAllRequest();
+            }
+            else if (cancelDownloadButton_.Update(actions.cancelSelected, SelectedConverterShowsCancel()))
+            {
+                OpenCancelConfirmPrompt(false, true);
+            }
+            else if (cancelAllActionButton_.Update(actions.cancelAll, HasActiveConverterWorkspaceWork()))
+            {
+                OpenCancelConfirmPrompt(true, true);
             }
         }
     }
 
-    if (!isOverwritePromptOpen_)
+    if (!isOverwritePromptOpen_ && !isCancelConfirmOpen_)
     {
         CollectParseFailures();
         CollectConverterLoadResults();
@@ -2097,12 +2058,13 @@ void DockArea::Draw(int windowWidth, int windowHeight, Font font, Font fontFoote
         DrawConverterWorkspace(leftPanel, rightPanel, font);
     }
     DrawFooter(footer, font, fontFooterAa);
-    if (isOverwritePromptOpen_ || isAboutDialogOpen_ || isInfoDialogOpen_)
+    if (isOverwritePromptOpen_ || isCancelConfirmOpen_ || isAboutDialogOpen_ || isInfoDialogOpen_)
     {
         Tooltip::Clear();
         UiCursor::BeginFrame();
     }
     DrawOverwritePrompt(windowWidth, windowHeight, font);
+    DrawCancelConfirmPrompt(windowWidth, windowHeight, font);
     DrawAboutDialog(windowWidth, windowHeight, font);
     DrawInfoDialog(windowWidth, windowHeight, font);
     Tooltip::Flush();
@@ -2279,18 +2241,36 @@ Rectangle DockArea::GetListActionButtonBounds(Rectangle leftPanel, int index, fl
     return {slot.x + (slot.width - width) * 0.5f, slot.y + (slot.height - height) * 0.5f, width, height};
 }
 
+DockArea::SettingsActionGrid DockArea::GetSettingsActionGrid(Rectangle settingsPanel) const
+{
+    constexpr float kButtonHeight = 30.0f;
+    constexpr float kPadX = 14.0f;
+    constexpr float kPadBottom = 12.0f;
+    constexpr float kGapX = 14.0f;
+    constexpr float kGapY = 8.0f;
+
+    const float width = (settingsPanel.width - kPadX * 2.0f - kGapX) * 0.5f;
+    const float row1Y = settingsPanel.y + settingsPanel.height - kPadBottom - kButtonHeight;
+    const float row0Y = row1Y - kGapY - kButtonHeight;
+    const float x0 = settingsPanel.x + kPadX;
+    const float x1 = x0 + width + kGapX;
+
+    SettingsActionGrid grid;
+    grid.primarySelected = {x0, row0Y, width, kButtonHeight};
+    grid.primaryAll = {x1, row0Y, width, kButtonHeight};
+    grid.cancelSelected = {x0, row1Y, width, kButtonHeight};
+    grid.cancelAll = {x1, row1Y, width, kButtonHeight};
+    return grid;
+}
+
 Rectangle DockArea::GetDownloadButtonBounds(Rectangle settingsPanel) const
 {
-    return {settingsPanel.x + 14.0f,
-            settingsPanel.y + settingsPanel.height - 34.0f - 12.0f,
-            (settingsPanel.width - 42.0f) * 0.5f,
-            34.0f};
+    return GetSettingsActionGrid(settingsPanel).primarySelected;
 }
 
 Rectangle DockArea::GetSecondaryActionButtonBounds(Rectangle settingsPanel) const
 {
-    const float width = (settingsPanel.width - 42.0f) * 0.5f;
-    return {settingsPanel.x + 28.0f + width, settingsPanel.y + settingsPanel.height - 34.0f - 12.0f, width, 34.0f};
+    return GetSettingsActionGrid(settingsPanel).primaryAll;
 }
 
 void DockArea::RebuildDownloaderLayoutCache() const
@@ -4440,7 +4420,7 @@ void DockArea::NavigateConverterSelection(int delta, Rectangle leftPanel, bool a
 
 void DockArea::HandleShortcuts(Rectangle leftPanel, Rectangle rightPanel)
 {
-    if (isAboutDialogOpen_ || isInfoDialogOpen_ || isOverwritePromptOpen_)
+    if (isAboutDialogOpen_ || isInfoDialogOpen_ || isOverwritePromptOpen_ || isCancelConfirmOpen_)
     {
         return;
     }
@@ -4614,7 +4594,10 @@ void DockArea::HandleShortcuts(Rectangle leftPanel, Rectangle rightPanel)
     {
         if (ShortcutRouter::Pressed({KEY_ENTER, false, true, false}))
         {
-            HandleCancelAllDownloadsRequest();
+            if (HasActiveDownloadWorkspaceWork())
+            {
+                OpenCancelConfirmPrompt(true, false);
+            }
             return;
         }
         if (ShortcutRouter::Pressed({KEY_ENTER, true, false, false}))
@@ -4630,7 +4613,7 @@ void DockArea::HandleShortcuts(Rectangle leftPanel, Rectangle rightPanel)
         {
             if (SelectedCardShowsCancel())
             {
-                HandleCancelSelectedRequest();
+                OpenCancelConfirmPrompt(false, false);
             }
             else if (CanDownloadSelected())
             {
@@ -4684,7 +4667,10 @@ void DockArea::HandleShortcuts(Rectangle leftPanel, Rectangle rightPanel)
     {
         if (ShortcutRouter::Pressed({KEY_ENTER, false, true, false}))
         {
-            HandleCancelAllConvertsRequest();
+            if (HasActiveConverterWorkspaceWork())
+            {
+                OpenCancelConfirmPrompt(true, true);
+            }
             return;
         }
         if (ShortcutRouter::Pressed({KEY_ENTER, true, false, false}))
@@ -4697,7 +4683,7 @@ void DockArea::HandleShortcuts(Rectangle leftPanel, Rectangle rightPanel)
         {
             if (SelectedConverterShowsCancel())
             {
-                HandleCancelSelectedConvertsRequest();
+                OpenCancelConfirmPrompt(false, true);
             }
             else
             {
@@ -5557,7 +5543,7 @@ void DockArea::DrawConverterDefaultDock(Rectangle defaultDockPanel, Font font, b
                 {
                     const Color muted = {150, 162, 150, 255};
                     DrawWrappedText(font,
-                                    "Mixed settings вЂ” edits apply to all selected.",
+                                    "Mixed settings - edits apply to all selected.",
                                     {layout.customFoldoutPanelBounds.x + 12.0f, layout.customMixedHintY},
                                     13.0f,
                                     layout.customFoldoutPanelBounds.width - 24.0f,
@@ -5776,28 +5762,11 @@ void DockArea::DrawConverterCardOptions(Rectangle settingsPanel, Font font) cons
                                                     ConvertRequest request;
                                                     return BuildConvertRequestForCard(card, request);
                                                 });
-    if (SelectedConverterShowsCancel())
-    {
-        cancelDownloadButton_.DrawDanger(convertButton, font);
-        if (CanBuildAnyConvertRequest())
-        {
-            convertAllButton_.Draw(GetSecondaryActionButtonBounds(settingsPanel), font);
-        }
-        else
-        {
-            cancelAllActionButton_.DrawDanger(GetSecondaryActionButtonBounds(settingsPanel), font);
-        }
-    }
-    else if (HasActiveConverterWorkspaceWork())
-    {
-        convertButton_.Draw(convertButton, font, canConvertSelected);
-        cancelAllActionButton_.DrawDanger(GetSecondaryActionButtonBounds(settingsPanel), font);
-    }
-    else
-    {
-        convertButton_.Draw(convertButton, font, canConvertSelected);
-        convertAllButton_.Draw(GetSecondaryActionButtonBounds(settingsPanel), font, CanBuildAnyConvertRequest());
-    }
+    const SettingsActionGrid actions = GetSettingsActionGrid(settingsPanel);
+    convertButton_.Draw(actions.primarySelected, font, canConvertSelected);
+    convertAllButton_.Draw(actions.primaryAll, font, CanBuildAnyConvertRequest());
+    cancelDownloadButton_.DrawDanger(actions.cancelSelected, font, SelectedConverterShowsCancel());
+    cancelAllActionButton_.DrawDanger(actions.cancelAll, font, HasActiveConverterWorkspaceWork());
 }
 
 bool DockArea::UpdateAutoConvertDock(Rectangle autoConvertPanel, Font font)
@@ -6916,7 +6885,8 @@ void DockArea::HandleCancelSelectedRequest()
 
 void DockArea::HandleCancelAllDownloadsRequest()
 {
-    const bool hadWork = AnyDownloadRunning() || !pendingDownloadQueue_.empty() || isBatchDownloading_;
+    const bool hadWork = AnyDownloadRunning() || !pendingDownloadQueue_.empty() || isBatchDownloading_ ||
+                         AnyLinkCardConverting() || HasPendingDownloadAutoConverts();
     pendingDownloadQueue_.clear();
     isBatchDownloading_ = false;
     overwriteAllExisting_ = false;
@@ -6937,6 +6907,7 @@ void DockArea::HandleCancelAllDownloadsRequest()
         });
 
     CancelAllDownloads();
+    CancelAllDownloadAutoConverts();
 
     if (hadWork)
     {
@@ -7018,7 +6989,8 @@ void DockArea::PrioritizeDownload(const std::string& url)
     DownloadRunner* victim = FindLowestProgressDownloadRunner();
     if (victim == nullptr)
     {
-        ShowFooterNotification("Queued first вЂ” waiting for a free slot", FooterNotificationScope::Downloader);
+        ShowFooterNotification("Queued first - waiting for a free slot", FooterNotificationScope::Downloader);
+
         return;
     }
 
@@ -7026,14 +6998,16 @@ void DockArea::PrioritizeDownload(const std::string& url)
     LinkCardNode* victimCard = FindLinkCardByUrl(victimUrl);
     if (victimCard == nullptr)
     {
-        ShowFooterNotification("Queued first вЂ” waiting for a free slot", FooterNotificationScope::Downloader);
+        ShowFooterNotification("Queued first - waiting for a free slot", FooterNotificationScope::Downloader);
+
         return;
     }
 
     DownloadRequest victimRequest;
     if (!BuildDownloadRequestForCard(*victimCard, victimRequest))
     {
-        ShowFooterNotification("Queued first вЂ” waiting for a free slot", FooterNotificationScope::Downloader);
+        ShowFooterNotification("Queued first - waiting for a free slot", FooterNotificationScope::Downloader);
+
         return;
     }
 
@@ -7047,7 +7021,7 @@ void DockArea::PrioritizeDownload(const std::string& url)
 
     const std::string priorityTitle = card->Title();
     const std::string victimTitle = victimCard->Title();
-    ShowFooterNotification("Started " + priorityTitle + " вЂ” paused " + victimTitle,
+    ShowFooterNotification("Started " + priorityTitle + " - paused " + victimTitle,
                            FooterNotificationScope::Downloader);
 }
 
@@ -8012,6 +7986,65 @@ bool DockArea::AnyLinkCardConverting() const
     return converting;
 }
 
+bool DockArea::HasPendingDownloadAutoConverts() const
+{
+    for (const ConvertRequest& request : pendingConvertQueue_)
+    {
+        if (!request.linkCardUrl.empty())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void DockArea::CancelAllDownloadAutoConverts()
+{
+    pendingConvertQueue_.erase(std::remove_if(pendingConvertQueue_.begin(),
+                                              pendingConvertQueue_.end(),
+                                              [](const ConvertRequest& request)
+                                              {
+                                                  return !request.linkCardUrl.empty();
+                                              }),
+                               pendingConvertQueue_.end());
+
+    std::vector<std::string> convertingPaths;
+    ForEachLinkCard(
+        [&](LinkCardNode& card)
+        {
+            if (!card.IsConverting())
+            {
+                return;
+            }
+            convertingPaths.push_back(card.LastDownloadedPath());
+            card.ClearConverting();
+            card.ClearAutoConvertSnapshot();
+            card.ClearAutoConvertDelivery();
+        });
+
+    for (const std::string& inputPath : convertingPaths)
+    {
+        if (inputPath.empty())
+        {
+            continue;
+        }
+        if (ConvertRunner* runner = FindConvertRunnerByPath(inputPath))
+        {
+            runner->Cancel();
+        }
+    }
+
+    if (!AnyLinkCardConverting() && !HasPendingDownloadAutoConverts())
+    {
+        batchIncludesDownloadConvert_ = false;
+        if (!HasActiveConverterWorkspaceWork())
+        {
+            isBatchConverting_ = false;
+            batchConvertElapsedTotal_ = 0.0;
+        }
+    }
+}
+
 void DockArea::CancelLinkCardConvert(const std::string& inputPath)
 {
     RemovePendingConvertsForPath(inputPath);
@@ -8347,6 +8380,66 @@ void DockArea::UpdateOverwritePrompt(int windowWidth, int windowHeight)
             ClearBatchQueueStates();
             ShowFooterNotification("Download cancelled.", FooterNotificationScope::Downloader);
         }
+    }
+}
+
+void DockArea::OpenCancelConfirmPrompt(bool cancelAll, bool isConvert)
+{
+    cancelConfirmIsAll_ = cancelAll;
+    cancelConfirmIsConvert_ = isConvert;
+    cancelConfirmFocusIndex_ = 0;
+    isCancelConfirmOpen_ = true;
+}
+
+void DockArea::UpdateCancelConfirmPrompt(int windowWidth, int windowHeight)
+{
+    const float modalWidth = 420.0f;
+    const float modalHeight = 145.0f;
+    const Rectangle modal = {(static_cast<float>(windowWidth) - modalWidth) * 0.5f,
+                             (static_cast<float>(windowHeight) - modalHeight) * 0.5f,
+                             modalWidth,
+                             modalHeight};
+
+    const Rectangle yesBounds = {modal.x + modal.width - 200.0f, modal.y + modal.height - 48.0f, 84.0f, 34.0f};
+    const Rectangle cancelBounds = {modal.x + modal.width - 106.0f, modal.y + modal.height - 48.0f, 88.0f, 34.0f};
+
+    if (IsKeyPressed(KEY_TAB))
+    {
+        cancelConfirmFocusIndex_ = (cancelConfirmFocusIndex_ + 1) % 2;
+    }
+
+    const bool activateFocused = IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_SPACE);
+    const bool clickedYes = confirmCancelYesButton_.Update(yesBounds);
+    const bool clickedCancel = confirmCancelNoButton_.Update(cancelBounds);
+
+    if (clickedYes || (activateFocused && cancelConfirmFocusIndex_ == 0))
+    {
+        const bool cancelAll = cancelConfirmIsAll_;
+        const bool isConvert = cancelConfirmIsConvert_;
+        isCancelConfirmOpen_ = false;
+        if (isConvert)
+        {
+            if (cancelAll)
+            {
+                HandleCancelAllConvertsRequest();
+            }
+            else
+            {
+                HandleCancelSelectedConvertsRequest();
+            }
+        }
+        else if (cancelAll)
+        {
+            HandleCancelAllDownloadsRequest();
+        }
+        else
+        {
+            HandleCancelSelectedRequest();
+        }
+    }
+    else if (clickedCancel || IsKeyPressed(KEY_ESCAPE) || (activateFocused && cancelConfirmFocusIndex_ == 1))
+    {
+        isCancelConfirmOpen_ = false;
     }
 }
 
@@ -8798,28 +8891,11 @@ void DockArea::DrawRightPanel(Rectangle rightPanel, Font font) const
         }
     }
 
-    if (SelectedCardShowsCancel())
-    {
-        cancelDownloadButton_.DrawDanger(GetDownloadButtonBounds(settingsPanel), font);
-        if (HasDownloadableIdleCards())
-        {
-            downloadAllButton_.Draw(GetSecondaryActionButtonBounds(settingsPanel), font);
-        }
-        else
-        {
-            cancelAllActionButton_.DrawDanger(GetSecondaryActionButtonBounds(settingsPanel), font);
-        }
-    }
-    else if (HasActiveDownloadWorkspaceWork())
-    {
-        downloadButton_.Draw(GetDownloadButtonBounds(settingsPanel), font, CanDownloadSelected());
-        cancelAllActionButton_.DrawDanger(GetSecondaryActionButtonBounds(settingsPanel), font);
-    }
-    else
-    {
-        downloadButton_.Draw(GetDownloadButtonBounds(settingsPanel), font, CanDownloadSelected());
-        downloadAllButton_.Draw(GetSecondaryActionButtonBounds(settingsPanel), font, HasDownloadableIdleCards());
-    }
+    const SettingsActionGrid actions = GetSettingsActionGrid(settingsPanel);
+    downloadButton_.Draw(actions.primarySelected, font, CanDownloadSelected());
+    downloadAllButton_.Draw(actions.primaryAll, font, HasDownloadableIdleCards());
+    cancelDownloadButton_.DrawDanger(actions.cancelSelected, font, SelectedCardShowsCancel());
+    cancelAllActionButton_.DrawDanger(actions.cancelAll, font, HasActiveDownloadWorkspaceWork());
 
     DrawGlobalPathLabel(font, globalPanel, "Global Download Path", text);
     globalPathField_.Draw({globalPanel.x + 10.0f, globalPanel.y + 34.0f, globalPanel.width - 20.0f, 26.0f},
@@ -9365,8 +9441,45 @@ void DockArea::DrawOverwritePrompt(int windowWidth, int windowHeight, Font font)
                     Color{218, 226, 218, 255});
 
     replaceFileButton_.Draw(replaceBounds, font, true, overwritePromptFocusIndex_ == 0);
-    cancelReplaceButton_.DrawDanger(cancelBounds, font, overwritePromptFocusIndex_ == 1);
-    cancelAllReplaceButton_.DrawDanger(cancelAllBounds, font, overwritePromptFocusIndex_ == 2);
+    cancelReplaceButton_.DrawDanger(cancelBounds, font, true, overwritePromptFocusIndex_ == 1);
+    cancelAllReplaceButton_.DrawDanger(cancelAllBounds, font, true, overwritePromptFocusIndex_ == 2);
+}
+
+void DockArea::DrawCancelConfirmPrompt(int windowWidth, int windowHeight, Font font) const
+{
+    if (!isCancelConfirmOpen_)
+    {
+        return;
+    }
+
+    DrawRectangle(0, 0, windowWidth, windowHeight, Color{0, 0, 0, 120});
+
+    const float modalWidth = 420.0f;
+    const float modalHeight = 145.0f;
+    const Rectangle modal = {(static_cast<float>(windowWidth) - modalWidth) * 0.5f,
+                             (static_cast<float>(windowHeight) - modalHeight) * 0.5f,
+                             modalWidth,
+                             modalHeight};
+    const Rectangle yesBounds = {modal.x + modal.width - 200.0f, modal.y + modal.height - 48.0f, 84.0f, 34.0f};
+    const Rectangle cancelBounds = {modal.x + modal.width - 106.0f, modal.y + modal.height - 48.0f, 88.0f, 34.0f};
+
+    DrawRectangleRounded(modal, 0.08f, 14, Color{24, 32, 24, 255});
+    DrawRectangleRoundedLines(modal, 0.08f, 14, Color{96, 126, 96, 255});
+    DrawTextEx(font, "Are you sure?", {modal.x + 18.0f, modal.y + 16.0f}, 18.0f, 0.0f, Color{232, 238, 232, 255});
+
+    const char* body = "Cancel this action?";
+    if (cancelConfirmIsAll_)
+    {
+        body = cancelConfirmIsConvert_ ? "Cancel all converts?" : "Cancel all downloads?";
+    }
+    else
+    {
+        body = cancelConfirmIsConvert_ ? "Cancel selected converts?" : "Cancel selected downloads?";
+    }
+    DrawTextEx(font, body, {modal.x + 18.0f, modal.y + 52.0f}, 15.0f, 0.0f, Color{178, 192, 178, 255});
+
+    confirmCancelYesButton_.DrawDanger(yesBounds, font, true, cancelConfirmFocusIndex_ == 0);
+    confirmCancelNoButton_.Draw(cancelBounds, font, true, cancelConfirmFocusIndex_ == 1);
 }
 
 void DockArea::UpdateAboutDialog(int windowWidth, int windowHeight, Font font)
@@ -9862,7 +9975,8 @@ bool DockArea::IsConverterCardQueued(const std::string& inputPath) const
 
 bool DockArea::HasActiveDownloadWorkspaceWork() const
 {
-    return AnyDownloadRunning() || !pendingDownloadQueue_.empty() || isBatchDownloading_;
+    return AnyDownloadRunning() || !pendingDownloadQueue_.empty() || isBatchDownloading_ || AnyLinkCardConverting() ||
+           HasPendingDownloadAutoConverts();
 }
 
 bool DockArea::HasActiveConverterWorkspaceWork() const
@@ -9950,11 +10064,18 @@ void DockArea::ProcessFinishedDownloadRunner(DownloadRunner& runner)
     {
         WriteDebugLog("download completed: " + completedDownloadUrl);
         LinkCardNode* completedCard = nullptr;
+        bool skippedCancelledCard = false;
         ForEachLinkCard(
             [&](LinkCardNode& card)
             {
                 if (card.HasUrl(completedDownloadUrl))
                 {
+                    // Cancel already marked this card; do not promote it to "took".
+                    if (card.IsCancelled())
+                    {
+                        skippedCancelledCard = true;
+                        return;
+                    }
                     card.SetDownloadElapsed(completedDownloadElapsed);
                     card.SetDownloadBrowserReport(runner.LastDownloadBrowserReport());
 
@@ -9987,6 +10108,11 @@ void DockArea::ProcessFinishedDownloadRunner(DownloadRunner& runner)
                     completedCard = &card;
                 }
             });
+        if (skippedCancelledCard && completedCard == nullptr)
+        {
+            runner.SetStatus("");
+            return;
+        }
         AppendFooterDiagnosticsForCard(completedDownloadUrl, runner.LastDownloadBrowserReport());
 
         if (completedCard != nullptr)

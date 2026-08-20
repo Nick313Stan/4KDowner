@@ -26,7 +26,7 @@ CODING_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
 SKIP_ARCHIVE=0
 ENSURE_YTDOWN=0
 OUT_ROOT=""
-APP_VERSION="1.0.0"
+APP_VERSION="1.1.0"
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build-linux}"
 
 while [[ $# -gt 0 ]]; do

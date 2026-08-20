@@ -1,4 +1,4 @@
-# Portable staging: exe + assets + optional packages/ffmpeg + packages/ytdown
+# Portable staging: exe + assets + optional packages/ffmpeg + packages/ytdown + packages/nodejs
 # Usage:
 #   cmake --build build --config Release --target package-portable
 #   cmake --build build --config Release --target package-archive

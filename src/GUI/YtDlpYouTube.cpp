@@ -12,6 +12,28 @@ namespace
 std::string g_preferredCookieBrowser;
 bool g_preferredCookieBrowserExplicit = false;
 
+std::filesystem::path FindFromCurrentPath(const std::filesystem::path& relativePath)
+{
+    std::filesystem::path directory = std::filesystem::current_path();
+    while (!directory.empty())
+    {
+        const std::filesystem::path candidate = directory / relativePath;
+        if (std::filesystem::exists(candidate))
+        {
+            return std::filesystem::absolute(candidate);
+        }
+
+        const std::filesystem::path parent = directory.parent_path();
+        if (parent == directory)
+        {
+            break;
+        }
+        directory = parent;
+    }
+
+    return {};
+}
+
 std::filesystem::path FindExecutableInPath(const std::string& executableName)
 {
     const char* pathValue = std::getenv("PATH");
@@ -49,6 +71,24 @@ std::filesystem::path FindExecutableInPath(const std::string& executableName)
 
 std::filesystem::path FindNodeExecutable()
 {
+#ifdef _WIN32
+    const std::array<std::filesystem::path, 2> portablePaths = {
+        std::filesystem::path("packages") / "nodejs" / "bin" / "node.exe",
+        std::filesystem::path("4kdowner.shared") / "packages" / "nodejs" / "bin" / "node.exe"};
+#else
+    const std::array<std::filesystem::path, 2> portablePaths = {
+        std::filesystem::path("packages") / "nodejs" / "bin" / "node",
+        std::filesystem::path("4kdowner.shared") / "packages" / "nodejs" / "bin" / "node"};
+#endif
+    for (const std::filesystem::path& relativePath : portablePaths)
+    {
+        const std::filesystem::path found = FindFromCurrentPath(relativePath);
+        if (!found.empty())
+        {
+            return found;
+        }
+    }
+
     const std::filesystem::path fromPath = FindExecutableInPath("node");
     if (!fromPath.empty())
     {

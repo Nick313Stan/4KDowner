@@ -24,12 +24,13 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
-#define POPEN _popen
-#define PCLOSE _pclose
 #else
+#include <cerrno>
+#include <csignal>
+#include <fcntl.h>
+#include <poll.h>
 #include <sys/wait.h>
-#define POPEN popen
-#define PCLOSE pclose
+#include <unistd.h>
 #endif
 
 namespace
@@ -542,7 +543,6 @@ std::string BuildProgressStatus(const std::string& line, float progress)
     return status;
 }
 
-#ifdef _WIN32
 void ApplyDownloadProgress(const std::shared_ptr<DownloadSharedState>& sharedState,
                            DownloadProgressTracker& tracker,
                            const std::string& line,
@@ -583,6 +583,39 @@ void ApplyDownloadProgress(const std::shared_ptr<DownloadSharedState>& sharedSta
     }
 }
 
+void IngestDownloadOutputChunk(const std::shared_ptr<DownloadSharedState>& sharedState,
+                               DownloadProgressTracker& tracker,
+                               std::string& pendingText,
+                               std::string& fullOutput,
+                               std::string& lastMeaningfulLine,
+                               const char* data,
+                               size_t size)
+{
+    pendingText.append(data, size);
+    fullOutput.append(data, size);
+    size_t separator = pendingText.find_first_of("\r\n");
+    while (separator != std::string::npos)
+    {
+        std::string line = TrimLine(pendingText.substr(0, separator));
+        pendingText.erase(0, separator + 1);
+        ApplyDownloadProgress(sharedState, tracker, line, lastMeaningfulLine);
+        separator = pendingText.find_first_of("\r\n");
+    }
+
+    const float previousProgress = tracker.PhaseProgress();
+    const auto previousPhase = tracker.Phase();
+    tracker.UpdateChunk(pendingText);
+    if (tracker.Phase() != previousPhase || tracker.PhaseProgress() > previousProgress + 0.001f)
+    {
+        const float progress = tracker.PhaseProgress();
+        const std::string status = tracker.Phase() == DownloadSharedState::Phase::Merging
+                                       ? ("Merging " + std::to_string(static_cast<int>(progress * 100.0f)) + "%")
+                                       : ("Downloading " + std::to_string(static_cast<int>(progress * 100.0f)) + "%");
+        DownloadRunner::SetSharedStatus(sharedState, status, progress, tracker.Phase());
+    }
+}
+
+#ifdef _WIN32
 DownloadRunResult RunProcess(std::string command,
                              const std::shared_ptr<std::atomic_bool>& cancelRequested,
                              const std::shared_ptr<DownloadSharedState>& sharedState,
@@ -750,6 +783,175 @@ DownloadRunResult RunProcess(std::string command,
     result.exitCode = static_cast<int>(exitCode);
     return result;
 }
+#else
+DownloadRunResult RunProcess(std::string command,
+                             const std::shared_ptr<std::atomic_bool>& cancelRequested,
+                             const std::shared_ptr<DownloadSharedState>& sharedState,
+                             int downloadStreams)
+{
+    DownloadRunResult result;
+    int pipefd[2] = {-1, -1};
+    if (pipe(pipefd) != 0)
+    {
+        result.status = "Download failed: could not create output pipe.";
+        return result;
+    }
+
+    const pid_t pid = fork();
+    if (pid < 0)
+    {
+        close(pipefd[0]);
+        close(pipefd[1]);
+        result.status = "Download failed: could not start yt-dlp.";
+        return result;
+    }
+
+    if (pid == 0)
+    {
+        setpgid(0, 0);
+        close(pipefd[0]);
+        dup2(pipefd[1], STDOUT_FILENO);
+        dup2(pipefd[1], STDERR_FILENO);
+        if (pipefd[1] != STDOUT_FILENO && pipefd[1] != STDERR_FILENO)
+        {
+            close(pipefd[1]);
+        }
+        execl("/bin/sh", "sh", "-c", command.c_str(), static_cast<char*>(nullptr));
+        _exit(127);
+    }
+
+    setpgid(pid, pid);
+    close(pipefd[1]);
+
+    const int flags = fcntl(pipefd[0], F_GETFL, 0);
+    if (flags >= 0)
+    {
+        fcntl(pipefd[0], F_SETFL, flags | O_NONBLOCK);
+    }
+
+    std::string pendingText;
+    std::string fullOutput;
+    std::string lastMeaningfulLine;
+    DownloadProgressTracker tracker(downloadStreams);
+    DownloadRunner::SetSharedStatus(sharedState, "Downloading 4%", tracker.PhaseProgress(), tracker.Phase());
+
+    std::array<char, 512> buffer{};
+    bool childExited = false;
+    int status = 0;
+    while (!childExited)
+    {
+        if (cancelRequested != nullptr && cancelRequested->load())
+        {
+            KillProcessTree(static_cast<unsigned long>(pid));
+            waitpid(pid, &status, 0);
+            close(pipefd[0]);
+            result.status = "Download cancelled.";
+            return result;
+        }
+
+        pollfd pfd{};
+        pfd.fd = pipefd[0];
+        pfd.events = POLLIN;
+        const int pollResult = poll(&pfd, 1, 50);
+        if (pollResult > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0)
+        {
+            for (;;)
+            {
+                const ssize_t bytesRead = read(pipefd[0], buffer.data(), buffer.size());
+                if (bytesRead > 0)
+                {
+                    IngestDownloadOutputChunk(sharedState,
+                                              tracker,
+                                              pendingText,
+                                              fullOutput,
+                                              lastMeaningfulLine,
+                                              buffer.data(),
+                                              static_cast<size_t>(bytesRead));
+                    continue;
+                }
+                if (bytesRead == 0)
+                {
+                    break;
+                }
+                if (errno == EINTR)
+                {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK)
+                {
+                    break;
+                }
+                break;
+            }
+        }
+
+        const pid_t waited = waitpid(pid, &status, WNOHANG);
+        if (waited == pid)
+        {
+            childExited = true;
+        }
+        else if (waited < 0 && errno != EINTR)
+        {
+            childExited = true;
+            status = 1;
+        }
+    }
+
+    for (;;)
+    {
+        const ssize_t bytesRead = read(pipefd[0], buffer.data(), buffer.size());
+        if (bytesRead > 0)
+        {
+            IngestDownloadOutputChunk(sharedState,
+                                      tracker,
+                                      pendingText,
+                                      fullOutput,
+                                      lastMeaningfulLine,
+                                      buffer.data(),
+                                      static_cast<size_t>(bytesRead));
+            continue;
+        }
+        break;
+    }
+    close(pipefd[0]);
+
+    if (!pendingText.empty())
+    {
+        const std::string tailLine = TrimLine(pendingText);
+        if (!tailLine.empty())
+        {
+            ApplyDownloadProgress(sharedState, tracker, tailLine, lastMeaningfulLine);
+        }
+    }
+
+    // Cancel may arrive after the child already exited; still honor it.
+    if (cancelRequested != nullptr && cancelRequested->load())
+    {
+        result.status = "Download cancelled.";
+        return result;
+    }
+
+    int exitCode = 1;
+    if (WIFEXITED(status))
+    {
+        exitCode = WEXITSTATUS(status);
+    }
+    else if (WIFSIGNALED(status))
+    {
+        exitCode = 128 + WTERMSIG(status);
+    }
+
+    if (exitCode == 0)
+    {
+        result.status = "Download finished.";
+        return result;
+    }
+
+    result.status = BuildDownloadFailureStatus(lastMeaningfulLine, fullOutput, exitCode);
+    result.errorLog = fullOutput;
+    result.exitCode = exitCode;
+    return result;
+}
 #endif
 } // namespace
 
@@ -854,6 +1056,7 @@ void DownloadRunner::Update()
 
     if (future_.wait_for(std::chrono::seconds(0)) == std::future_status::ready)
     {
+        const bool cancelWasRequested = cancelRequested_ != nullptr && cancelRequested_->load();
         try
         {
             const DownloadRunResult result = future_.get();
@@ -872,6 +1075,10 @@ void DownloadRunner::Update()
             lastErrorLog_.clear();
         }
         elapsedSeconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt_).count();
+        if (cancelWasRequested && status_ == "Download finished.")
+        {
+            status_ = "Download cancelled.";
+        }
         progress_ = status_ == "Download finished." ? 1.0f : progress_;
         if (status_ == "Download finished.")
         {
@@ -1052,48 +1259,10 @@ DownloadRunResult DownloadRunner::Run(DownloadRequest request,
 #ifdef _WIN32
                 command = "cmd /S /C \"chcp 65001>nul && set PYTHONIOENCODING=utf-8 && set PYTHONUNBUFFERED=1 && " +
                           command + "\"";
-                result = RunProcess(command, cancelRequested, sharedState, CountDownloadStreams(request.mediaMode));
 #else
-                FILE* pipe = POPEN(command.c_str(), "r");
-                if (pipe == nullptr)
-                {
-                    result.status = "Download failed: could not start yt-dlp.";
-                    result.errorLog = result.status;
-                    return false;
-                }
-
-                std::string output;
-                std::array<char, 512> buffer{};
-                while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr)
-                {
-                    output += buffer.data();
-                }
-
-                const int waitStatus = PCLOSE(pipe);
-                int exitCode = waitStatus;
-                if (waitStatus != -1)
-                {
-                    if (WIFEXITED(waitStatus))
-                    {
-                        exitCode = WEXITSTATUS(waitStatus);
-                    }
-                    else if (WIFSIGNALED(waitStatus))
-                    {
-                        exitCode = 128 + WTERMSIG(waitStatus);
-                    }
-                }
-                result.exitCode = exitCode;
-                if (exitCode != 0)
-                {
-                    result.status = BuildDownloadFailureStatus(ExtractLastOutputLine(output), output, exitCode);
-                    result.errorLog = output;
-                }
-                else
-                {
-                    result.status = "Download finished.";
-                    result.errorLog.clear();
-                }
+                command = "PYTHONIOENCODING=utf-8 PYTHONUNBUFFERED=1 " + command;
 #endif
+                result = RunProcess(command, cancelRequested, sharedState, CountDownloadStreams(request.mediaMode));
                 lastOutput = result.errorLog;
                 return result.status == "Download finished.";
             };

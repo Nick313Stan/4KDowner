@@ -18,7 +18,7 @@ param(
     [switch]$SkipArchive,
     [switch]$EnsureYtDown,
     [string]$OutRoot = "",
-    [string]$AppVersion = "1.0.0"
+    [string]$AppVersion = "1.1.0"
 )
 
 $ErrorActionPreference = "Stop"
