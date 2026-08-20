@@ -9,9 +9,14 @@
 #include <mutex>
 #include <string>
 
-struct ConvertRequest {
+struct ConvertRequest
+{
     std::string inputPath;
     std::string outputDirectory;
+    // If set, final file is "{outputBaseName}.{ext}" instead of "{stem}_converted.{ext}".
+    std::string outputBaseName;
+    // Downloader auto-convert: URL of the LinkCardNode that owns this job.
+    std::string linkCardUrl;
     std::string container;
     bool convertContainer = false;
     std::string videoCodec;
@@ -19,20 +24,24 @@ struct ConvertRequest {
     std::string audioCodec;
     bool convertAudio = false;
     bool overwriteExisting = false;
+    bool deleteInputOnSuccess = false;
     double sourceDurationSeconds = 0.0;
 };
 
-struct ConvertSharedState {
+struct ConvertSharedState
+{
     mutable std::mutex mutex;
     float progress = 0.0f;
 };
 
-struct ConvertRunResult {
+struct ConvertRunResult
+{
     std::string status;
     std::string errorLog;
 };
 
-class ConvertRunner {
+class ConvertRunner
+{
 public:
     void Start(ConvertRequest request);
     void Cancel();
@@ -45,15 +54,18 @@ public:
     const std::string& CurrentInputPath() const;
     float Progress() const;
     double ElapsedSeconds() const;
-    bool ConsumeCompletedConvert(std::string& inputPath, double& elapsedSeconds);
+    bool ConsumeCompletedConvert(std::string& inputPath,
+                                 std::string& outputPath,
+                                 double& elapsedSeconds,
+                                 std::string& linkCardUrl,
+                                 bool& deleteInputOnSuccess);
 
     static std::filesystem::path GetOutputPath(const ConvertRequest& request);
 
 private:
-    static ConvertRunResult Run(
-        ConvertRequest request,
-        std::shared_ptr<std::atomic_bool> cancelRequested,
-        std::shared_ptr<ConvertSharedState> sharedState);
+    static ConvertRunResult Run(ConvertRequest request,
+                                std::shared_ptr<std::atomic_bool> cancelRequested,
+                                std::shared_ptr<ConvertSharedState> sharedState);
     static std::string Quote(const std::string& value);
 
     std::future<ConvertRunResult> future_;
@@ -62,10 +74,14 @@ private:
     std::string status_;
     std::string lastErrorLog_;
     std::string currentInputPath_;
+    ConvertRequest activeRequest_{};
     float progress_ = 0.0f;
     double elapsedSeconds_ = 0.0;
     double completedElapsedSeconds_ = 0.0;
     std::string completedInputPath_;
+    std::string completedOutputPath_;
+    std::string completedLinkCardUrl_;
+    bool completedDeleteInputOnSuccess_ = false;
     bool hasCompletedConvert_ = false;
     double sourceDurationSeconds_ = 0.0;
     std::chrono::steady_clock::time_point startedAt_{};

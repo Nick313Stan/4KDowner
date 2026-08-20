@@ -3,14 +3,16 @@
 #include <string>
 #include <vector>
 
-struct BrowserAttempt {
+struct BrowserAttempt
+{
     std::string browserSpec;
     bool success = false;
     std::string summary;
     std::string nextAction;
 };
 
-class BrowserAttemptLog {
+class BrowserAttemptLog
+{
 public:
     void Clear();
     void AddAttempt(BrowserAttempt attempt);
@@ -31,12 +33,8 @@ private:
 
 std::string FormatBrowserAuthLabel(const std::string& browserSpec);
 std::string SummarizeBrowserAttemptOutput(const std::string& output, bool parseMode);
-std::string DescribeBrowserRetryAction(
-    const std::string& output,
-    bool hasMoreBrowsers,
-    bool success);
-std::string FormatBrowserSessionReport(
-    const std::string& url,
-    const std::string& title,
-    const std::string& parseReport,
-    const std::string& downloadReport);
+std::string DescribeBrowserRetryAction(const std::string& output, bool hasMoreBrowsers, bool success);
+std::string FormatBrowserSessionReport(const std::string& url,
+                                       const std::string& title,
+                                       const std::string& parseReport,
+                                       const std::string& downloadReport);

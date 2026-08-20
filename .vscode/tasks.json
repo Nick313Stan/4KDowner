@@ -4,53 +4,106 @@
     {
       "label": "Configure 4KDowner",
       "type": "shell",
-      "command": "cmake",
-      "args": [
-        "-S",
-        "${workspaceFolder}",
-        "-B",
-        "${workspaceFolder}/build",
-        "-G",
-        "Visual Studio 18 2026",
-        "-A",
-        "x64"
-      ],
-      "problemMatcher": []
+      "problemMatcher": [],
+      "windows": {
+        "command": "cmake",
+        "args": [
+          "-S",
+          "${workspaceFolder}",
+          "-B",
+          "${workspaceFolder}/build",
+          "-G",
+          "Visual Studio 18 2026",
+          "-A",
+          "x64"
+        ]
+      },
+      "linux": {
+        "command": "cmake",
+        "args": [
+          "-S",
+          "${workspaceFolder}",
+          "-B",
+          "${workspaceFolder}/build-linux",
+          "-DCMAKE_BUILD_TYPE=Debug"
+        ],
+        "options": {
+          "env": {
+            "PATH": "/usr/bin:/bin"
+          }
+        }
+      }
     },
     {
       "label": "Build 4KDowner",
       "dependsOn": "Configure 4KDowner",
       "type": "shell",
-      "command": "cmake",
-      "args": [
-        "--build",
-        "${workspaceFolder}/build",
-        "--config",
-        "Release",
-        "--target",
-        "4KDowner"
-      ],
       "group": {
         "kind": "build",
         "isDefault": true
       },
-      "problemMatcher": "$msCompile"
+      "windows": {
+        "command": "cmake",
+        "args": [
+          "--build",
+          "${workspaceFolder}/build",
+          "--config",
+          "Release",
+          "--target",
+          "4KDowner"
+        ],
+        "problemMatcher": "$msCompile"
+      },
+      "linux": {
+        "command": "cmake",
+        "args": [
+          "--build",
+          "${workspaceFolder}/build-linux",
+          "--target",
+          "4KDowner",
+          "-j"
+        ],
+        "options": {
+          "env": {
+            "PATH": "/usr/bin:/bin"
+          }
+        },
+        "problemMatcher": "$gcc"
+      }
     },
     {
       "label": "Build 4KDowner (Debug)",
       "dependsOn": "Configure 4KDowner",
       "type": "shell",
-      "command": "cmake",
-      "args": [
-        "--build",
-        "${workspaceFolder}/build",
-        "--config",
-        "Debug",
-        "--target",
-        "4KDowner"
-      ],
       "group": "build",
-      "problemMatcher": "$msCompile"
+      "windows": {
+        "command": "cmake",
+        "args": [
+          "--build",
+          "${workspaceFolder}/build",
+          "--config",
+          "Debug",
+          "--target",
+          "4KDowner"
+        ],
+        "problemMatcher": "$msCompile"
+      },
+      "linux": {
+        "command": "cmake",
+        "args": [
+          "--build",
+          "${workspaceFolder}/build-linux",
+          "--target",
+          "4KDowner",
+          "-j"
+        ],
+        "options": {
+          "env": {
+            "PATH": "/usr/bin:/bin"
+          }
+        },
+        "problemMatcher": "$gcc"
+      }
     }
   ]
 }

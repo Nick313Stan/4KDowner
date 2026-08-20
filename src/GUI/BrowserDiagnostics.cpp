@@ -20,7 +20,7 @@ std::string TrimForSummary(std::string value, size_t maxLength = 220)
 
     return value.substr(0, maxLength) + "...";
 }
-}
+} // namespace
 
 void BrowserAttemptLog::Clear()
 {
@@ -80,10 +80,7 @@ std::string SummarizeBrowserAttemptOutput(const std::string& output, bool parseM
     return TrimForSummary(SimplifyYtDlpError(output));
 }
 
-std::string DescribeBrowserRetryAction(
-    const std::string& output,
-    bool hasMoreBrowsers,
-    bool success)
+std::string DescribeBrowserRetryAction(const std::string& output, bool hasMoreBrowsers, bool success)
 {
     if (success)
     {
@@ -143,11 +140,10 @@ std::string BrowserAttemptLog::FormatSection(const std::string& title) const
     return stream.str();
 }
 
-std::string FormatBrowserSessionReport(
-    const std::string& url,
-    const std::string& title,
-    const std::string& parseReport,
-    const std::string& downloadReport)
+std::string FormatBrowserSessionReport(const std::string& url,
+                                       const std::string& title,
+                                       const std::string& parseReport,
+                                       const std::string& downloadReport)
 {
     std::ostringstream stream;
     stream << "4KDowner browser report\n";

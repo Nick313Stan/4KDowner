@@ -1,12 +1,15 @@
 #include "ConverterFileCardNode.h"
 
+#include "CardChrome.h"
 #include "MouseCursor.h"
+#include "Tooltip.h"
+#include "UiClip.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
-#include <sstream>
 #include <utility>
 #include <vector>
 
@@ -32,10 +35,7 @@ constexpr int kPreviewPixelHeight = 92;
 Rectangle GetPreviewBounds(Rectangle cardBounds)
 {
     return {
-        cardBounds.x + 8.0f,
-        cardBounds.y + (cardBounds.height - kPreviewHeight) * 0.5f,
-        kPreviewWidth,
-        kPreviewHeight};
+        cardBounds.x + 8.0f, cardBounds.y + (cardBounds.height - kPreviewHeight) * 0.5f, kPreviewWidth, kPreviewHeight};
 }
 
 void PreparePreviewImage(Image& image)
@@ -67,11 +67,11 @@ void PreparePreviewImage(Image& image)
 
     if (cropW != image.width || cropH != image.height)
     {
-        ImageCrop(&image, {
-            static_cast<float>(cropX),
-            static_cast<float>(cropY),
-            static_cast<float>(cropW),
-            static_cast<float>(cropH)});
+        ImageCrop(&image,
+                  {static_cast<float>(cropX),
+                   static_cast<float>(cropY),
+                   static_cast<float>(cropW),
+                   static_cast<float>(cropH)});
     }
 
     if (image.data == nullptr || image.width <= 0 || image.height <= 0)
@@ -82,53 +82,16 @@ void PreparePreviewImage(Image& image)
     ImageResize(&image, kPreviewPixelWidth, kPreviewPixelHeight);
 }
 
-void DrawMetaTooltip(Font font, Rectangle anchor, const char* text)
-{
-    const float fontSize = 15.0f;
-    const float padX = 8.0f;
-    const float padY = 4.0f;
-    const Vector2 textSize = MeasureTextEx(font, text, fontSize, 0.0f);
-    const float tipWidth = textSize.x + padX * 2.0f;
-    const float tipHeight = textSize.y + padY * 2.0f;
-    Rectangle tip = {
-        anchor.x + anchor.width * 0.5f - tipWidth * 0.5f,
-        anchor.y - tipHeight - 6.0f,
-        tipWidth,
-        tipHeight};
-
-    if (tip.x < 4.0f)
-    {
-        tip.x = 4.0f;
-    }
-    if (tip.x + tip.width > static_cast<float>(GetScreenWidth()) - 4.0f)
-    {
-        tip.x = static_cast<float>(GetScreenWidth()) - tip.width - 4.0f;
-    }
-
-    DrawRectangleRounded(tip, 0.22f, 8, Color{38, 48, 38, 245});
-    DrawRectangleRoundedLines(tip, 0.22f, 8, Color{96, 126, 96, 255});
-    DrawTextEx(font, text, {tip.x + padX, tip.y + padY}, fontSize, 0.0f, Color{224, 232, 224, 255});
-}
-
 bool TryDrawMetaSegmentTooltip(
-    Font font,
-    const std::string& label,
-    const char* tooltip,
-    float& cursorX,
-    float metaY,
-    float metaHeight)
+    Font font, const std::string& label, const char* tooltip, float& cursorX, float metaY, float metaHeight)
 {
     const float labelWidth = MeasureTextEx(font, label.c_str(), 14.0f, 0.0f).x;
     const Rectangle bounds = {cursorX, metaY - 2.0f, labelWidth, metaHeight};
     cursorX += labelWidth;
-    if (CheckCollisionPointRec(GetMousePosition(), bounds))
-    {
-        DrawMetaTooltip(font, bounds, tooltip);
-        return true;
-    }
-    return false;
+    Tooltip::DrawIfHovered(font, bounds, tooltip);
+    return CheckCollisionPointRec(GetMousePosition(), bounds);
 }
-}
+} // namespace
 
 ConverterFileCardNode::~ConverterFileCardNode()
 {
@@ -147,11 +110,14 @@ ConverterFileCardNode::ConverterFileCardNode(ConverterFileCardNode&& other) noex
       triedLoadingPreview_(other.triedLoadingPreview_),
       hasFile_(other.hasFile_),
       isLoading_(other.isLoading_),
+      dismissedDuringLoad_(other.dismissedDuringLoad_),
       isHovered_(other.isHovered_),
       isSelected_(other.isSelected_),
       wasClicked_(other.wasClicked_),
       shouldClose_(other.shouldClose_),
       wasConvertCancelClicked_(other.wasConvertCancelClicked_),
+      wasCopyClicked_(other.wasCopyClicked_),
+      wasOpenPathClicked_(other.wasOpenPathClicked_),
       pendingLoadSuccessReport_(other.pendingLoadSuccessReport_),
       pendingLoadErrorReport_(other.pendingLoadErrorReport_),
       isConverting_(other.isConverting_),
@@ -159,12 +125,17 @@ ConverterFileCardNode::ConverterFileCardNode(ConverterFileCardNode&& other) noex
       convertingElapsedSeconds_(other.convertingElapsedSeconds_),
       convertElapsedSeconds_(other.convertElapsedSeconds_),
       operationProgress_(other.operationProgress_),
-      pulseStartTime_(other.pulseStartTime_)
+      pulseStartTime_(other.pulseStartTime_),
+      lastErrorText_(std::move(other.lastErrorText_)),
+      lastConvertedPath_(std::move(other.lastConvertedPath_)),
+      useDefaultConvertSettings_(other.useDefaultConvertSettings_),
+      customOptions_(other.customOptions_)
 {
     other.previewTexture_ = {};
     other.hasPreviewTexture_ = false;
     other.hasFile_ = false;
     other.isLoading_ = false;
+    other.dismissedDuringLoad_ = false;
     other.pendingLoadSuccessReport_ = false;
     other.pendingLoadErrorReport_ = false;
 }
@@ -185,11 +156,14 @@ ConverterFileCardNode& ConverterFileCardNode::operator=(ConverterFileCardNode&& 
         triedLoadingPreview_ = other.triedLoadingPreview_;
         hasFile_ = other.hasFile_;
         isLoading_ = other.isLoading_;
+        dismissedDuringLoad_ = other.dismissedDuringLoad_;
         isHovered_ = other.isHovered_;
         isSelected_ = other.isSelected_;
         wasClicked_ = other.wasClicked_;
         shouldClose_ = other.shouldClose_;
         wasConvertCancelClicked_ = other.wasConvertCancelClicked_;
+        wasCopyClicked_ = other.wasCopyClicked_;
+        wasOpenPathClicked_ = other.wasOpenPathClicked_;
         pendingLoadSuccessReport_ = other.pendingLoadSuccessReport_;
         pendingLoadErrorReport_ = other.pendingLoadErrorReport_;
         isConverting_ = other.isConverting_;
@@ -198,11 +172,16 @@ ConverterFileCardNode& ConverterFileCardNode::operator=(ConverterFileCardNode&& 
         convertElapsedSeconds_ = other.convertElapsedSeconds_;
         operationProgress_ = other.operationProgress_;
         pulseStartTime_ = other.pulseStartTime_;
+        lastErrorText_ = std::move(other.lastErrorText_);
+        lastConvertedPath_ = std::move(other.lastConvertedPath_);
+        useDefaultConvertSettings_ = other.useDefaultConvertSettings_;
+        customOptions_ = other.customOptions_;
 
         other.previewTexture_ = {};
         other.hasPreviewTexture_ = false;
         other.hasFile_ = false;
         other.isLoading_ = false;
+        other.dismissedDuringLoad_ = false;
         other.pendingLoadSuccessReport_ = false;
         other.pendingLoadErrorReport_ = false;
     }
@@ -221,6 +200,10 @@ void ConverterFileCardNode::SetInfo(ConverterFileInfo info)
     wasClicked_ = false;
     pendingLoadSuccessReport_ = false;
     pendingLoadErrorReport_ = false;
+    if (info_.success)
+    {
+        ClearLastError();
+    }
 }
 
 void ConverterFileCardNode::StartLoading(std::string filePath)
@@ -236,6 +219,7 @@ void ConverterFileCardNode::StartLoading(std::string filePath)
     info_.fileName = separator == std::string::npos ? info_.filePath : info_.filePath.substr(separator + 1);
     hasFile_ = true;
     isLoading_ = true;
+    dismissedDuringLoad_ = false;
     triedLoadingPreview_ = false;
     shouldClose_ = false;
     wasClicked_ = false;
@@ -244,11 +228,14 @@ void ConverterFileCardNode::StartLoading(std::string filePath)
     operationProgress_ = -1.0f;
     pendingLoadSuccessReport_ = false;
     pendingLoadErrorReport_ = false;
+    ClearLastError();
+    ClearLastConvertedPath();
     loader_.Start(info_.filePath);
 }
 
-void ConverterFileCardNode::Update(Rectangle bounds)
+void ConverterFileCardNode::Update(Rectangle bounds, Font font)
 {
+    (void)font;
     if (!hasFile_)
     {
         return;
@@ -274,20 +261,21 @@ void ConverterFileCardNode::Update(Rectangle bounds)
                 isLoading_ = false;
                 pendingLoadErrorReport_ = true;
                 pendingLoadSuccessReport_ = false;
+                SetLastError(info_.error.empty() ? "Unknown load error." : info_.error);
             }
         }
     }
 
     LoadPreview();
 
-    const Rectangle closeButton = GetCloseButtonBounds(bounds);
+    const Rectangle closeButton = CardChrome::CloseButtonBounds(bounds);
     isHovered_ = CheckCollisionPointRec(GetMousePosition(), bounds);
     wasClicked_ = false;
     wasConvertCancelClicked_ = false;
+    wasCopyClicked_ = false;
+    wasOpenPathClicked_ = false;
 
-    if (isConverting_ &&
-        hasConvertStatusBounds_ &&
-        CheckCollisionPointRec(GetMousePosition(), convertStatusBounds_) &&
+    if (isConverting_ && hasConvertStatusBounds_ && CheckCollisionPointRec(GetMousePosition(), convertStatusBounds_) &&
         IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     {
         wasConvertCancelClicked_ = true;
@@ -296,8 +284,32 @@ void ConverterFileCardNode::Update(Rectangle bounds)
 
     if (CheckCollisionPointRec(GetMousePosition(), closeButton) && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     {
-        shouldClose_ = true;
+        RequestClose();
         return;
+    }
+
+    if (!isLoading_ && CanCopyInfo())
+    {
+        const Rectangle copyButton = CardChrome::CopyButtonBounds(bounds);
+        if (CheckCollisionPointRec(GetMousePosition(), copyButton) && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+        {
+            SetClipboardText(BuildCopyPayload().c_str());
+            wasCopyClicked_ = true;
+            return;
+        }
+    }
+
+    if (CanRevealPath())
+    {
+        const Rectangle openPathButton = CardChrome::OpenPathButtonBounds(bounds);
+        const Rectangle previewBounds = GetPreviewBounds(bounds);
+        const Vector2 mouse = GetMousePosition();
+        if ((CheckCollisionPointRec(mouse, openPathButton) || CheckCollisionPointRec(mouse, previewBounds)) &&
+            IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+        {
+            wasOpenPathClicked_ = true;
+            return;
+        }
     }
 
     if (isHovered_ && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
@@ -306,16 +318,33 @@ void ConverterFileCardNode::Update(Rectangle bounds)
     }
 }
 
-void ConverterFileCardNode::Draw(Rectangle bounds, Font font) const
+void ConverterFileCardNode::Draw(Rectangle bounds, Font font, int displayIndex) const
 {
     if (!hasFile_)
     {
         return;
     }
 
-    const Rectangle animatedBounds = GetAnimatedBounds(bounds);
-    const Color background = isSelected_ ? Color{18, 34, 18, 255} : (isHovered_ ? Color{14, 26, 14, 255} : Color{10, 18, 10, 255});
-    const Color border = isSelected_ ? Color{120, 178, 120, 255} : (isHovered_ ? Color{90, 124, 90, 255} : Color{64, 84, 64, 255});
+    const Rectangle animatedBounds = CardChrome::AnimatedBounds(bounds, pulseStartTime_, kPulseSeconds);
+    const Color background =
+        isSelected_ ? Color{18, 34, 18, 255} : (isHovered_ ? Color{14, 26, 14, 255} : Color{10, 18, 10, 255});
+    Color border =
+        isSelected_ ? Color{120, 178, 120, 255} : (isHovered_ ? Color{90, 124, 90, 255} : Color{64, 84, 64, 255});
+    if (!useDefaultConvertSettings_)
+    {
+        if (isSelected_)
+        {
+            border = Color{230, 200, 80, 255};
+        }
+        else if (isHovered_)
+        {
+            border = Color{215, 185, 70, 255};
+        }
+        else
+        {
+            border = Color{200, 170, 60, 255};
+        }
+    }
     const Color titleColor = {240, 244, 240, 255};
     const Color metaColor = {150, 170, 150, 255};
     const float minSide = animatedBounds.width < animatedBounds.height ? animatedBounds.width : animatedBounds.height;
@@ -326,54 +355,88 @@ void ConverterFileCardNode::Draw(Rectangle bounds, Font font) const
     DrawRectangleRoundedLines(animatedBounds, roundness, 16, border);
     if (isSelected_)
     {
-        DrawRectangleRoundedLines(
-            {animatedBounds.x + 1.0f, animatedBounds.y + 1.0f, animatedBounds.width - 2.0f, animatedBounds.height - 2.0f},
-            roundness,
-            16,
-            border);
+        DrawRectangleRoundedLines({animatedBounds.x + 1.0f,
+                                   animatedBounds.y + 1.0f,
+                                   animatedBounds.width - 2.0f,
+                                   animatedBounds.height - 2.0f},
+                                  roundness,
+                                  16,
+                                  border);
     }
 
     const Rectangle iconBounds = GetPreviewBounds(animatedBounds);
     DrawRectangleRounded(iconBounds, kPreviewRoundness, kPreviewSegments, {28, 40, 28, 255});
     if (isLoading_)
     {
-        DrawMiniSpinner({
-            iconBounds.x + iconBounds.width * 0.5f,
-            iconBounds.y + iconBounds.height * 0.5f});
+        DrawMiniSpinner({iconBounds.x + iconBounds.width * 0.5f, iconBounds.y + iconBounds.height * 0.5f});
     }
     else if (hasPreviewTexture_)
     {
         const Rectangle source = {
-            0.0f,
-            0.0f,
-            static_cast<float>(previewTexture_.width),
-            static_cast<float>(previewTexture_.height)};
-        BeginScissorMode(
-            static_cast<int>(iconBounds.x),
-            static_cast<int>(iconBounds.y),
-            static_cast<int>(iconBounds.width),
-            static_cast<int>(iconBounds.height));
+            0.0f, 0.0f, static_cast<float>(previewTexture_.width), static_cast<float>(previewTexture_.height)};
         DrawTexturePro(previewTexture_, source, iconBounds, {0.0f, 0.0f}, 0.0f, WHITE);
-        EndScissorMode();
+    }
+    else if (!info_.success)
+    {
+        DrawTextEx(font, "!", {iconBounds.x + 34.0f, iconBounds.y + 18.0f}, 28.0f, 0.0f, {232, 160, 150, 255});
     }
     else
     {
-        DrawTextEx(font, info_.container.c_str(), {iconBounds.x + 10.0f, iconBounds.y + 24.0f}, 18.0f, 0.0f, {220, 232, 220, 255});
+        DrawTextEx(font,
+                   info_.container.c_str(),
+                   {iconBounds.x + 10.0f, iconBounds.y + 24.0f},
+                   18.0f,
+                   0.0f,
+                   {220, 232, 220, 255});
     }
     DrawRectangleRoundedLines(iconBounds, kPreviewRoundness, kPreviewSegments, {64, 84, 64, 255});
+    if (isConverting_)
+    {
+        CardChrome::DrawPreviewElapsedOverlay(font, iconBounds, convertingElapsedSeconds_);
+    }
+    CardChrome::DrawPreviewIndexBadge(font, iconBounds, displayIndex);
 
-    const float textX = animatedBounds.x + 104.0f;
-    const float titleMaxWidth = animatedBounds.width - 138.0f;
+    const float textX = animatedBounds.x + CardChrome::kTextXOffset;
+    const float titleMaxWidth = CardChrome::TitleMaxWidth(bounds.width);
 
     if (isLoading_)
     {
         DrawTextEx(font, "Loading...", {textX, animatedBounds.y + 14.0f}, 18.0f, 0.0f, titleColor);
-        DrawWrappedText(font, info_.fileName, {textX, animatedBounds.y + 38.0f}, 14.5f, titleMaxWidth, 2, metaColor);
-        DrawCloseButton(animatedBounds);
+        CardChrome::DrawWrappedText(
+            font, info_.fileName, {textX, animatedBounds.y + 38.0f}, 14.5f, titleMaxWidth, 2, metaColor);
+        CardChrome::DrawCloseButton(animatedBounds, font);
+        CardChrome::DrawCopyButton(animatedBounds, font, false);
+        CardChrome::DrawOpenPathButton(animatedBounds, font, false);
         return;
     }
 
-    DrawWrappedText(font, info_.fileName, {textX, animatedBounds.y + 9.0f}, 16.0f, titleMaxWidth, 2, titleColor);
+    if (!info_.success)
+    {
+        DrawTextEx(font, "Could not load video", {textX, animatedBounds.y + 14.0f}, 18.0f, 0.0f, {232, 160, 150, 255});
+        CardChrome::DrawWrappedText(
+            font, info_.fileName, {textX, animatedBounds.y + 38.0f}, 14.5f, titleMaxWidth, 2, metaColor);
+        CardChrome::DrawCloseButton(animatedBounds, font);
+        CardChrome::DrawCopyButton(animatedBounds, font, CanCopyInfo());
+        CardChrome::DrawOpenPathButton(animatedBounds, font, CanRevealPath());
+        return;
+    }
+
+    const bool revealPathAvailable = CanRevealPath();
+    const Rectangle previewHitBounds = GetPreviewBounds(bounds);
+    const Rectangle titleHitBounds = {animatedBounds.x, animatedBounds.y, bounds.width, animatedBounds.height};
+    const bool titleHovered = CardChrome::IsTitleTextHovered(titleHitBounds, font, info_.fileName, 9.0f);
+    const bool previewHovered = revealPathAvailable && CheckCollisionPointRec(GetMousePosition(), previewHitBounds);
+    const Color drawTitleColor = titleHovered ? Color{210, 255, 210, 255} : titleColor;
+    CardChrome::DrawWrappedText(
+        font, info_.fileName, {textX, animatedBounds.y + 9.0f}, 16.0f, titleMaxWidth, 2, drawTitleColor);
+    if (previewHovered)
+    {
+        UiCursor::RequestHand();
+    }
+    if (revealPathAvailable)
+    {
+        Tooltip::DrawIfHovered(font, previewHitBounds, "Open folder");
+    }
 
     const std::string container = info_.container.empty() ? "Unknown" : info_.container;
     const std::string videoCodec = info_.videoCodec.empty() ? "None" : info_.videoCodec;
@@ -381,9 +444,8 @@ void ConverterFileCardNode::Draw(Rectangle bounds, Font font) const
     const std::string details = container + "  |  " + videoCodec + "  |  " + audioCodec;
 
     std::string statusText;
-    const bool statusHovered = isConverting_ &&
-        hasConvertStatusBounds_ &&
-        CheckCollisionPointRec(GetMousePosition(), convertStatusBounds_);
+    const bool statusHovered =
+        isConverting_ && hasConvertStatusBounds_ && CheckCollisionPointRec(GetMousePosition(), convertStatusBounds_);
     const bool showConvertSpinner = isConverting_ && !statusHovered;
     if (isConverting_)
     {
@@ -408,17 +470,25 @@ void ConverterFileCardNode::Draw(Rectangle bounds, Font font) const
     const float maxDetailsWidth = std::max(0.0f, metaMaxX - textX - durationBlockWidth - statusWidth);
     const float detailsWidth = std::min(MeasureTextEx(font, details.c_str(), 14.0f, 0.0f).x, maxDetailsWidth);
 
-    BeginScissorMode(static_cast<int>(textX), static_cast<int>(animatedBounds.y + 48.0f), static_cast<int>(maxDetailsWidth), 20);
+    UiClip::Push({textX, animatedBounds.y + 48.0f, maxDetailsWidth, 20.0f});
     DrawTextEx(font, details.c_str(), {textX, animatedBounds.y + 49.0f}, 14.0f, 0.0f, metaColor);
-    EndScissorMode();
+    UiClip::Pop();
 
     const float durationSeparatorX = textX + detailsWidth;
     DrawTextEx(font, "  |  ", {durationSeparatorX, animatedBounds.y + 49.0f}, 14.0f, 0.0f, metaColor);
 
     const Vector2 clockCenter = {durationSeparatorX + separatorWidth + 8.0f, animatedBounds.y + 58.0f};
     DrawCircleLines(static_cast<int>(clockCenter.x), static_cast<int>(clockCenter.y), 5.0f, metaColor);
-    DrawLine(static_cast<int>(clockCenter.x), static_cast<int>(clockCenter.y), static_cast<int>(clockCenter.x), static_cast<int>(clockCenter.y - 3.0f), metaColor);
-    DrawLine(static_cast<int>(clockCenter.x), static_cast<int>(clockCenter.y), static_cast<int>(clockCenter.x + 2.0f), static_cast<int>(clockCenter.y + 2.0f), metaColor);
+    DrawLine(static_cast<int>(clockCenter.x),
+             static_cast<int>(clockCenter.y),
+             static_cast<int>(clockCenter.x),
+             static_cast<int>(clockCenter.y - 3.0f),
+             metaColor);
+    DrawLine(static_cast<int>(clockCenter.x),
+             static_cast<int>(clockCenter.y),
+             static_cast<int>(clockCenter.x + 2.0f),
+             static_cast<int>(clockCenter.y + 2.0f),
+             metaColor);
     const Vector2 durationPosition = {clockCenter.x + 12.0f, animatedBounds.y + 49.0f};
     DrawTextEx(font, info_.duration.c_str(), durationPosition, 14.0f, 0.0f, metaColor);
 
@@ -432,19 +502,10 @@ void ConverterFileCardNode::Draw(Rectangle bounds, Font font) const
         if (isConverting_)
         {
             convertStatusBounds_ = {
-                statusSlotStart - 3.0f,
-                animatedBounds.y + 45.0f,
-                convertActionSlotWidth + 6.0f,
-                24.0f};
+                statusSlotStart - 3.0f, animatedBounds.y + 45.0f, convertActionSlotWidth + 6.0f, 24.0f};
             hasConvertStatusBounds_ = true;
         }
-        DrawTextEx(
-            font,
-            statusText.c_str(),
-            {statusSlotStart, animatedBounds.y + 49.0f},
-            14.0f,
-            0.0f,
-            statusColor);
+        DrawTextEx(font, statusText.c_str(), {statusSlotStart, animatedBounds.y + 49.0f}, 14.0f, 0.0f, statusColor);
         if (statusHovered)
         {
             UiCursor::RequestHand();
@@ -464,12 +525,13 @@ void ConverterFileCardNode::Draw(Rectangle bounds, Font font) const
     metaCursorX += separatorWidth;
     TryDrawMetaSegmentTooltip(font, audioCodec, "Audio Codec", metaCursorX, metaY, metaHeight);
 
-    if (CheckCollisionPointRec(GetMousePosition(), iconBounds))
-    {
-        DrawMetaTooltip(font, iconBounds, "File Format");
-    }
+    const Rectangle durationBounds = {
+        clockCenter.x - 6.0f, metaY - 2.0f, (durationPosition.x + durationWidth) - (clockCenter.x - 6.0f), metaHeight};
+    Tooltip::DrawIfHovered(font, durationBounds, "Duration");
 
-    DrawCloseButton(animatedBounds);
+    CardChrome::DrawCloseButton(animatedBounds, font);
+    CardChrome::DrawCopyButton(animatedBounds, font, CanCopyInfo());
+    CardChrome::DrawOpenPathButton(animatedBounds, font, CanRevealPath());
 }
 
 void ConverterFileCardNode::Clear()
@@ -487,6 +549,8 @@ void ConverterFileCardNode::Clear()
     triedLoadingPreview_ = false;
     pendingLoadSuccessReport_ = false;
     pendingLoadErrorReport_ = false;
+    lastErrorText_.clear();
+    lastConvertedPath_.clear();
     info_ = {};
 }
 
@@ -502,6 +566,8 @@ void ConverterFileCardNode::SetConverting()
     convertElapsedSeconds_ = 0.0;
     convertingElapsedSeconds_ = 0.0;
     operationProgress_ = 0.04f;
+    ClearLastError();
+    ClearLastConvertedPath();
 }
 
 void ConverterFileCardNode::ClearConverting()
@@ -524,6 +590,16 @@ void ConverterFileCardNode::SetConvertElapsed(double seconds)
     operationProgress_ = -1.0f;
 }
 
+void ConverterFileCardNode::SetLastConvertedPath(std::string path)
+{
+    lastConvertedPath_ = std::move(path);
+}
+
+void ConverterFileCardNode::ClearLastConvertedPath()
+{
+    lastConvertedPath_.clear();
+}
+
 bool ConverterFileCardNode::IsConverting() const
 {
     return isConverting_;
@@ -539,6 +615,11 @@ double ConverterFileCardNode::ConvertElapsedSeconds() const
     return convertElapsedSeconds_;
 }
 
+const std::string& ConverterFileCardNode::LastConvertedPath() const
+{
+    return lastConvertedPath_;
+}
+
 void ConverterFileCardNode::SetOperationProgress(float progress)
 {
     operationProgress_ = std::clamp(progress, 0.0f, 1.0f);
@@ -547,6 +628,16 @@ void ConverterFileCardNode::SetOperationProgress(float progress)
 void ConverterFileCardNode::ClearOperationProgress()
 {
     operationProgress_ = -1.0f;
+}
+
+void ConverterFileCardNode::SetLastError(std::string error)
+{
+    lastErrorText_ = std::move(error);
+}
+
+void ConverterFileCardNode::ClearLastError()
+{
+    lastErrorText_.clear();
 }
 
 void ConverterFileCardNode::TriggerPulse()
@@ -574,6 +665,26 @@ bool ConverterFileCardNode::ShouldClose() const
     return shouldClose_;
 }
 
+void ConverterFileCardNode::RequestClose()
+{
+    if (isLoading_)
+    {
+        dismissedDuringLoad_ = true;
+        CancelLoading();
+    }
+    shouldClose_ = true;
+}
+
+bool ConverterFileCardNode::WasDismissedDuringLoad() const
+{
+    return dismissedDuringLoad_;
+}
+
+bool ConverterFileCardNode::IsHovered() const
+{
+    return isHovered_;
+}
+
 bool ConverterFileCardNode::WasConvertCancelClicked() const
 {
     return wasConvertCancelClicked_;
@@ -582,6 +693,16 @@ bool ConverterFileCardNode::WasConvertCancelClicked() const
 bool ConverterFileCardNode::WasClicked() const
 {
     return wasClicked_;
+}
+
+bool ConverterFileCardNode::WasCopyClicked() const
+{
+    return wasCopyClicked_;
+}
+
+bool ConverterFileCardNode::WasOpenPathClicked() const
+{
+    return wasOpenPathClicked_;
 }
 
 bool ConverterFileCardNode::IsSelected() const
@@ -624,38 +745,127 @@ void ConverterFileCardNode::CancelLoading()
     isLoading_ = false;
 }
 
+bool ConverterFileCardNode::CanCopyInfo() const
+{
+    if (isLoading_ || isConverting_)
+    {
+        return false;
+    }
+    return info_.success || !lastErrorText_.empty() || !info_.error.empty() || hasConvertElapsed_;
+}
+
+bool ConverterFileCardNode::CanRevealPath() const
+{
+    return !isLoading_ && hasConvertElapsed_ && !ResolvePathForReveal().empty();
+}
+
+std::string ConverterFileCardNode::BuildCopyPayload() const
+{
+    if (!lastErrorText_.empty() || !info_.error.empty())
+    {
+        std::string payload;
+        if (!info_.filePath.empty())
+        {
+            payload += "File: ";
+            payload += info_.filePath;
+            payload += "\n\n";
+        }
+        payload += lastErrorText_.empty() ? info_.error : lastErrorText_;
+        return payload;
+    }
+
+    const bool hasOutput = !lastConvertedPath_.empty();
+    std::string displayName = info_.fileName;
+    std::string displayContainer = info_.container.empty() ? "Unknown" : info_.container;
+    if (hasOutput)
+    {
+        const std::filesystem::path outputPath = std::filesystem::u8path(lastConvertedPath_);
+        displayName = outputPath.filename().u8string();
+        std::string ext = outputPath.extension().u8string();
+        if (!ext.empty() && ext.front() == '.')
+        {
+            ext.erase(ext.begin());
+        }
+        for (char& ch : ext)
+        {
+            ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+        }
+        if (ext == "M4V")
+        {
+            displayContainer = "MP4";
+        }
+        else if (!ext.empty())
+        {
+            displayContainer = ext;
+        }
+    }
+
+    std::string payload = "4KDowner convert info\n";
+    if (!info_.filePath.empty())
+    {
+        payload += "Input: ";
+        payload += info_.filePath;
+        payload += '\n';
+    }
+    if (hasOutput)
+    {
+        payload += "Output: ";
+        payload += lastConvertedPath_;
+        payload += '\n';
+    }
+    if (!displayName.empty())
+    {
+        payload += "Name: ";
+        payload += displayName;
+        payload += '\n';
+    }
+    payload += "Container: ";
+    payload += displayContainer;
+    payload += "\nVideo: ";
+    payload += info_.videoCodec.empty() ? "None" : info_.videoCodec;
+    payload += "\nAudio: ";
+    payload += info_.audioCodec.empty() ? "None" : info_.audioCodec;
+    if (!info_.duration.empty())
+    {
+        payload += "\nDuration: ";
+        payload += info_.duration;
+    }
+    if (hasConvertElapsed_)
+    {
+        const int totalSeconds = static_cast<int>(convertElapsedSeconds_ + 0.5);
+        char buffer[32]{};
+        std::snprintf(buffer, sizeof(buffer), "%d:%02d", totalSeconds / 60, totalSeconds % 60);
+        payload += "\nTook: ";
+        payload += buffer;
+    }
+    return payload;
+}
+
+std::string ConverterFileCardNode::ResolvePathForReveal() const
+{
+    if (lastConvertedPath_.empty())
+    {
+        return {};
+    }
+
+    std::error_code error;
+    const std::filesystem::path path = std::filesystem::u8path(lastConvertedPath_);
+    if (std::filesystem::exists(path, error))
+    {
+        return lastConvertedPath_;
+    }
+
+    const std::filesystem::path parent = path.parent_path();
+    if (!parent.empty() && std::filesystem::is_directory(parent, error))
+    {
+        return parent.u8string();
+    }
+    return {};
+}
+
 const ConverterFileInfo& ConverterFileCardNode::Info() const
 {
     return info_;
-}
-
-Rectangle ConverterFileCardNode::GetAnimatedBounds(Rectangle bounds) const
-{
-    const double elapsed = GetTime() - pulseStartTime_;
-    if (elapsed < 0.0 || elapsed > kPulseSeconds)
-    {
-        return bounds;
-    }
-
-    const float progress = static_cast<float>(elapsed / kPulseSeconds);
-    const float scale = 1.0f + std::sin(progress * 3.14159265f) * 0.035f;
-    const float width = bounds.width * scale;
-    const float height = bounds.height * scale;
-
-    return {
-        bounds.x - (width - bounds.width) * 0.5f,
-        bounds.y - (height - bounds.height) * 0.5f,
-        width,
-        height};
-}
-
-Rectangle ConverterFileCardNode::GetCloseButtonBounds(Rectangle bounds) const
-{
-    return {
-        bounds.x + bounds.width - 28.0f,
-        bounds.y + 9.0f,
-        18.0f,
-        18.0f};
 }
 
 void ConverterFileCardNode::LoadPreview()
@@ -718,28 +928,29 @@ void ConverterFileCardNode::DrawBackgroundProgress(Rectangle bounds, float round
         return;
     }
 
-    BeginScissorMode(
-        static_cast<int>(bounds.x),
-        static_cast<int>(bounds.y),
-        static_cast<int>(fillWidth),
-        static_cast<int>(bounds.height));
-    DrawRectangleRounded(bounds, roundness, 16, Color{52, 104, 52, 120});
-    EndScissorMode();
+    UiClip::Push({bounds.x, bounds.y, fillWidth, bounds.height});
+    DrawRectangleRounded(bounds, roundness, 16, Color{52, 92, 148, 120});
+    UiClip::Pop();
 }
 
-void ConverterFileCardNode::DrawCloseButton(Rectangle bounds) const
+bool ConverterFileCardNode::UseDefaultConvertSettings() const
 {
-    const Rectangle closeButton = GetCloseButtonBounds(bounds);
-    const bool hovered = CheckCollisionPointRec(GetMousePosition(), closeButton);
-    const Color color = hovered ? Color{255, 96, 86, 255} : Color{220, 72, 64, 255};
-    const float padding = 4.0f;
+    return useDefaultConvertSettings_;
+}
 
-    DrawLineEx({closeButton.x + padding, closeButton.y + padding}, {closeButton.x + closeButton.width - padding, closeButton.y + closeButton.height - padding}, 2.0f, color);
-    DrawLineEx({closeButton.x + closeButton.width - padding, closeButton.y + padding}, {closeButton.x + padding, closeButton.y + closeButton.height - padding}, 2.0f, color);
-    if (hovered)
-    {
-        UiCursor::RequestHand();
-    }
+void ConverterFileCardNode::SetUseDefaultConvertSettings(bool useDefault)
+{
+    useDefaultConvertSettings_ = useDefault;
+}
+
+ConverterOptions& ConverterFileCardNode::CustomConvertOptions()
+{
+    return customOptions_;
+}
+
+const ConverterOptions& ConverterFileCardNode::CustomConvertOptions() const
+{
+    return customOptions_;
 }
 
 void ConverterFileCardNode::DrawMiniSpinner(Vector2 center) const
@@ -750,55 +961,8 @@ void ConverterFileCardNode::DrawMiniSpinner(Vector2 center) const
     {
         const float angle = static_cast<float>(time * 6.0 + index * (6.2831853 / segments));
         const float alpha = static_cast<float>(index + 1) / static_cast<float>(segments);
-        const Vector2 start = {
-            center.x + std::cos(angle) * 4.0f,
-            center.y + std::sin(angle) * 4.0f};
-        const Vector2 end = {
-            center.x + std::cos(angle) * 7.0f,
-            center.y + std::sin(angle) * 7.0f};
+        const Vector2 start = {center.x + std::cos(angle) * 4.0f, center.y + std::sin(angle) * 4.0f};
+        const Vector2 end = {center.x + std::cos(angle) * 7.0f, center.y + std::sin(angle) * 7.0f};
         DrawLineEx(start, end, 1.5f, Color{160, 178, 160, static_cast<unsigned char>(70 + alpha * 150)});
-    }
-}
-
-void ConverterFileCardNode::DrawWrappedText(Font font, const std::string& text, Vector2 position, float fontSize, float maxWidth, int maxLines, Color color) const
-{
-    std::stringstream stream(text);
-    std::vector<std::string> lines;
-    std::string word;
-    std::string currentLine;
-
-    while (stream >> word)
-    {
-        const std::string candidate = currentLine.empty() ? word : currentLine + " " + word;
-        if (MeasureTextEx(font, candidate.c_str(), fontSize, 0.0f).x <= maxWidth)
-        {
-            currentLine = candidate;
-            continue;
-        }
-
-        if (!currentLine.empty())
-        {
-            lines.push_back(currentLine);
-            currentLine = word;
-        }
-        else
-        {
-            lines.push_back(word);
-        }
-
-        if (static_cast<int>(lines.size()) >= maxLines)
-        {
-            break;
-        }
-    }
-
-    if (!currentLine.empty() && static_cast<int>(lines.size()) < maxLines)
-    {
-        lines.push_back(currentLine);
-    }
-
-    for (int index = 0; index < static_cast<int>(lines.size()); ++index)
-    {
-        DrawTextEx(font, lines[index].c_str(), {position.x, position.y + static_cast<float>(index) * (fontSize + 3.0f)}, fontSize, 0.0f, color);
     }
 }

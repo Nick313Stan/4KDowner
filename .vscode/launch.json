@@ -9,7 +9,10 @@
       "args": [],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build 4KDowner (Debug)",
-      "terminal": "integrated"
+      "terminal": "integrated",
+      "linux": {
+        "program": "${workspaceFolder}/build-linux/4KDowner"
+      }
     }
   ]
 }

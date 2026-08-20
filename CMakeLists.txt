@@ -5,7 +5,7 @@ if(POLICY CMP0091)
 endif()
 
 project(FourKDowner
-    VERSION 0.1.0
+    VERSION 1.0.0
     LANGUAGES C CXX
 )
 
@@ -61,20 +61,43 @@ add_executable(4KDowner
     src/GUI/DownloadRunner.h
     src/GUI/Dropdown.cpp
     src/GUI/Dropdown.h
+    src/GUI/FoldoutPanel.cpp
+    src/GUI/FoldoutPanel.h
     src/GUI/BrowserDiagnostics.cpp
     src/GUI/BrowserDiagnostics.h
+    src/GUI/CardChrome.cpp
+    src/GUI/CardChrome.h
     src/GUI/LinkInfoLoader.cpp
     src/GUI/LinkInfoLoader.h
     src/GUI/LinkCardNode.cpp
     src/GUI/LinkCardNode.h
+    src/GUI/LinkCardGroupNode.cpp
+    src/GUI/LinkCardGroupNode.h
+    src/GUI/LinkGroupInfoLoader.cpp
+    src/GUI/LinkGroupInfoLoader.h
+    src/GUI/DownloaderListItem.cpp
+    src/GUI/DownloaderListItem.h
     src/GUI/LoadingSpinner.cpp
     src/GUI/LoadingSpinner.h
     src/GUI/PathField.cpp
     src/GUI/PathField.h
+    src/GUI/ShortcutRouter.cpp
+    src/GUI/ShortcutRouter.h
+    src/GUI/Tooltip.cpp
+    src/GUI/Tooltip.h
+    src/GUI/TaskbarProgress.cpp
+    src/GUI/TaskbarProgress.h
+    src/GUI/UiClip.cpp
+    src/GUI/UiClip.h
+    src/GUI/UndoStack.cpp
+    src/GUI/UndoStack.h
+    src/GUI/ToolPaths.cpp
+    src/GUI/ToolPaths.h
     "${TINYFILEDIALOGS_DIR}/tinyfiledialogs.c"
 )
 
 target_link_libraries(4KDowner PRIVATE raylib)
+target_compile_definitions(4KDowner PRIVATE "FOURKDOWNER_VERSION=\"${PROJECT_VERSION}\"")
 
 if(WIN32)
     target_link_libraries(4KDowner PRIVATE Shell32 Ole32 winhttp)
@@ -84,13 +107,29 @@ if(WIN32)
     endif()
 endif()
 
+if(UNIX AND NOT APPLE)
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(DBUS QUIET dbus-1)
+        if(DBUS_FOUND)
+            target_compile_definitions(4KDowner PRIVATE FOURKDOWNER_HAS_DBUS=1)
+            target_include_directories(4KDowner PRIVATE ${DBUS_INCLUDE_DIRS})
+            target_link_libraries(4KDowner PRIVATE ${DBUS_LIBRARIES})
+        endif()
+    endif()
+endif()
+
+target_include_directories(4KDowner BEFORE PRIVATE
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/shim")
 target_include_directories(4KDowner PRIVATE
     "${CMAKE_CURRENT_SOURCE_DIR}/src"
     "${TINYFILEDIALOGS_DIR}"
 )
 
 if(MSVC)
-    target_compile_options(4KDowner PRIVATE /W4)
+    target_compile_options(4KDowner PRIVATE /W4 /FS)
 else()
     target_compile_options(4KDowner PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+include("${CMAKE_CURRENT_SOURCE_DIR}/cmake/PackagePortable.cmake")

@@ -1,6 +1,7 @@
 #include "PathField.h"
 
 #include "MouseCursor.h"
+#include "UiClip.h"
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -19,9 +20,9 @@
 #endif
 
 #include <algorithm>
-#include <filesystem>
 
-namespace {
+namespace
+{
 #ifdef _WIN32
 std::wstring Utf8ToWide(const std::string& value)
 {
@@ -127,7 +128,8 @@ std::string SelectFolder(const std::string& currentPath)
 
     return selectedPath;
 #else
-    const char* selected = tinyfd_selectFolderDialog("Choose download folder", currentPath.empty() ? nullptr : currentPath.c_str());
+    const char* selected =
+        tinyfd_selectFolderDialog("Choose download folder", currentPath.empty() ? nullptr : currentPath.c_str());
     return selected == nullptr ? std::string{} : std::string(selected);
 #endif
 }
@@ -190,10 +192,19 @@ size_t NextUtf8Index(const std::string& value, size_t cursorIndex)
     }
     return index;
 }
-}
+} // namespace
 
 void PathField::Update(Rectangle bounds, Font font, std::string& path, bool enabled)
 {
+    // Defer blur by one frame so DockArea::HandleShortcuts still sees IsActive() on the
+    // same Enter/Escape press that commits the path (updates run before shortcuts).
+    if (pendingBlur_)
+    {
+        isActive_ = false;
+        pendingBlur_ = false;
+        isDraggingSelection_ = false;
+    }
+
     cursorIndex_ = std::min(cursorIndex_, path.size());
     selectionAnchor_ = std::min(selectionAnchor_, path.size());
 
@@ -201,6 +212,7 @@ void PathField::Update(Rectangle bounds, Font font, std::string& path, bool enab
     {
         CommitPath(path);
         isActive_ = false;
+        pendingBlur_ = false;
         isDraggingSelection_ = false;
         return;
     }
@@ -209,7 +221,8 @@ void PathField::Update(Rectangle bounds, Font font, std::string& path, bool enab
     const Rectangle textBounds = {bounds.x + 8.0f, bounds.y, bounds.width - 40.0f, bounds.height};
     browseHovered_ = enabled && CheckCollisionPointRec(GetMousePosition(), browseBounds);
 
-    const auto cursorXFromMouse = [&]() {
+    const auto cursorXFromMouse = [&]()
+    {
         return GetMousePosition().x - textBounds.x + scrollOffset_;
     };
 
@@ -225,6 +238,7 @@ void PathField::Update(Rectangle bounds, Font font, std::string& path, bool enab
         }
 
         isActive_ = inField;
+        pendingBlur_ = false;
         if (inField)
         {
             if (inText)
@@ -264,6 +278,7 @@ void PathField::Update(Rectangle bounds, Font font, std::string& path, bool enab
             wasEditedManually_ = false;
         }
         isActive_ = false;
+        pendingBlur_ = false;
         return;
     }
 
@@ -279,19 +294,24 @@ void PathField::Update(Rectangle bounds, Font font, std::string& path, bool enab
 
     const bool controlDown = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
     const bool shiftDown = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-    const auto hasSelection = [&]() {
+    const auto hasSelection = [&]()
+    {
         return cursorIndex_ != selectionAnchor_;
     };
-    const auto selectionStart = [&]() {
+    const auto selectionStart = [&]()
+    {
         return std::min(cursorIndex_, selectionAnchor_);
     };
-    const auto selectionEnd = [&]() {
+    const auto selectionEnd = [&]()
+    {
         return std::max(cursorIndex_, selectionAnchor_);
     };
-    const auto clearSelection = [&]() {
+    const auto clearSelection = [&]()
+    {
         selectionAnchor_ = cursorIndex_;
     };
-    const auto deleteSelection = [&]() {
+    const auto deleteSelection = [&]()
+    {
         if (!hasSelection())
         {
             return false;
@@ -305,14 +325,16 @@ void PathField::Update(Rectangle bounds, Font font, std::string& path, bool enab
         wasEditedManually_ = true;
         return true;
     };
-    const auto insertText = [&](const std::string& text) {
+    const auto insertText = [&](const std::string& text)
+    {
         deleteSelection();
         path.insert(cursorIndex_, text);
         cursorIndex_ += text.size();
         selectionAnchor_ = cursorIndex_;
         wasEditedManually_ = true;
     };
-    const auto shouldRepeatKey = [](KeyboardKey key, double& nextRepeatTime) {
+    const auto shouldRepeatKey = [](KeyboardKey key, double& nextRepeatTime)
+    {
         const double now = GetTime();
         if (IsKeyPressed(key))
         {
@@ -338,12 +360,56 @@ void PathField::Update(Rectangle bounds, Font font, std::string& path, bool enab
         selectionAnchor_ = 0;
     }
 
+    const auto clipboardSlice = [&]() -> std::string
+    {
+        if (hasSelection())
+        {
+            return path.substr(selectionStart(), selectionEnd() - selectionStart());
+        }
+        return path;
+    };
+
+    if (controlDown && IsKeyPressed(KEY_C))
+    {
+        const std::string text = clipboardSlice();
+        if (!text.empty())
+        {
+            SetClipboardText(text.c_str());
+        }
+    }
+
+    if (controlDown && IsKeyPressed(KEY_X))
+    {
+        const std::string text = clipboardSlice();
+        if (!text.empty())
+        {
+            SetClipboardText(text.c_str());
+            if (hasSelection())
+            {
+                deleteSelection();
+            }
+            else
+            {
+                path.clear();
+                cursorIndex_ = 0;
+                selectionAnchor_ = 0;
+                wasEditedManually_ = true;
+            }
+        }
+    }
+
     if (controlDown && IsKeyPressed(KEY_V))
     {
         const char* clipboard = GetClipboardText();
-        if (clipboard != nullptr)
+        if (clipboard != nullptr && clipboard[0] != '\0')
         {
-            insertText(clipboard);
+            std::string text = clipboard;
+            text.erase(std::remove(text.begin(), text.end(), '\r'), text.end());
+            text.erase(std::remove(text.begin(), text.end(), '\n'), text.end());
+            if (!text.empty())
+            {
+                insertText(text);
+            }
         }
     }
 
@@ -434,10 +500,10 @@ void PathField::Update(Rectangle bounds, Font font, std::string& path, bool enab
         }
     }
 
-    if (IsKeyPressed(KEY_ENTER))
+    if (IsKeyPressed(KEY_ENTER) || IsKeyPressed(KEY_ESCAPE))
     {
         CommitPath(path);
-        isActive_ = false;
+        pendingBlur_ = true;
     }
 
     if (CheckCollisionPointRec(GetMousePosition(), textBounds) &&
@@ -500,9 +566,12 @@ void PathField::EnsureScrollVisible(Font font, float textAreaWidth, const std::s
         return;
     }
 
+    // Keep a gap so the caret stays visible and does not sit under the browse button clip edge.
+    constexpr float kCaretPad = 12.0f;
+    const float usableWidth = std::max(1.0f, textAreaWidth - kCaretPad);
     const float textWidth = MeasureTextEx(font, path.c_str(), kFontSize, 0.0f).x;
-    const float maxScroll = std::max(0.0f, textWidth - textAreaWidth);
-    if (textWidth <= textAreaWidth)
+    const float maxScroll = std::max(0.0f, textWidth - usableWidth);
+    if (textWidth <= usableWidth)
     {
         scrollOffset_ = 0.0f;
         return;
@@ -512,26 +581,28 @@ void PathField::EnsureScrollVisible(Font font, float textAreaWidth, const std::s
 
     const std::string beforeCursor = path.substr(0, std::min(cursorIndex_, path.size()));
     const float cursorX = MeasureTextEx(font, beforeCursor.c_str(), kFontSize, 0.0f).x;
-    constexpr float padding = 6.0f;
+    constexpr float leftPadding = 6.0f;
 
-    if (cursorX - scrollOffset_ > textAreaWidth - padding)
+    if (cursorX - scrollOffset_ > usableWidth)
     {
-        scrollOffset_ = cursorX - textAreaWidth + padding;
+        scrollOffset_ = cursorX - usableWidth;
     }
-    if (cursorX - scrollOffset_ < padding)
+    if (cursorX - scrollOffset_ < leftPadding)
     {
-        scrollOffset_ = cursorX - padding;
+        scrollOffset_ = cursorX - leftPadding;
     }
 
     scrollOffset_ = std::max(0.0f, std::min(scrollOffset_, maxScroll));
 }
 
-void PathField::Draw(Rectangle bounds, Font font, const std::string& path, bool enabled) const
+void PathField::Draw(
+    Rectangle bounds, Font font, const std::string& path, bool enabled, const Rectangle* parentScissor) const
 {
     const Color background = enabled ? Color{26, 30, 26, 255} : Color{18, 22, 18, 255};
     const Color border = isActive_ ? Color{106, 144, 106, 255} : Color{64, 76, 64, 255};
     const Color text = enabled ? Color{230, 234, 230, 255} : Color{118, 128, 118, 255};
     const Rectangle browseBounds = {bounds.x + bounds.width - 26.0f, bounds.y + 2.0f, 22.0f, bounds.height - 4.0f};
+    (void)parentScissor;
 
     DrawRectangleRounded(bounds, 0.28f, 10, background);
     DrawRectangleRoundedLines(bounds, 0.28f, 10, border);
@@ -539,11 +610,7 @@ void PathField::Draw(Rectangle bounds, Font font, const std::string& path, bool 
     const Rectangle textBounds = {bounds.x + 8.0f, bounds.y, bounds.width - 40.0f, bounds.height};
     EnsureScrollVisible(font, textBounds.width, path);
     const float textX = textBounds.x - scrollOffset_;
-    BeginScissorMode(
-        static_cast<int>(textBounds.x),
-        static_cast<int>(textBounds.y),
-        static_cast<int>(textBounds.width),
-        static_cast<int>(textBounds.height));
+    UiClip::Push(textBounds);
     if (path.empty())
     {
         DrawTextEx(font, "Enter path...", {textBounds.x, bounds.y + 5.0f}, kFontSize, 0.0f, text);
@@ -558,7 +625,8 @@ void PathField::Draw(Rectangle bounds, Font font, const std::string& path, bool 
             const std::string selectedText = path.substr(start, end - start);
             const float selectionX = textX + MeasureTextEx(font, beforeSelection.c_str(), kFontSize, 0.0f).x;
             const float selectionWidth = MeasureTextEx(font, selectedText.c_str(), kFontSize, 0.0f).x;
-            DrawRectangleRec({selectionX, bounds.y + 4.0f, selectionWidth, bounds.height - 8.0f}, Color{86, 126, 86, 210});
+            DrawRectangleRec({selectionX, bounds.y + 4.0f, selectionWidth, bounds.height - 8.0f},
+                             Color{86, 126, 86, 210});
         }
         DrawTextEx(font, path.c_str(), {textX, bounds.y + 5.0f}, kFontSize, 0.0f, text);
     }
@@ -566,12 +634,18 @@ void PathField::Draw(Rectangle bounds, Font font, const std::string& path, bool 
     {
         const std::string beforeCursor = path.substr(0, std::min(cursorIndex_, path.size()));
         const float cursorX = textX + MeasureTextEx(font, beforeCursor.c_str(), kFontSize, 0.0f).x + 1.0f;
-        DrawLineEx({cursorX, bounds.y + 5.0f}, {cursorX, bounds.y + bounds.height - 5.0f}, 1.0f, Color{220, 238, 220, 255});
+        DrawLineEx(
+            {cursorX, bounds.y + 5.0f}, {cursorX, bounds.y + bounds.height - 5.0f}, 1.0f, Color{220, 238, 220, 255});
     }
-    EndScissorMode();
+    UiClip::Pop();
 
-    DrawRectangleRounded(browseBounds, 0.28f, 8, enabled ? (browseHovered_ ? Color{104, 122, 104, 255} : Color{72, 82, 72, 255}) : Color{40, 46, 40, 255});
-    const Color folderColor = enabled ? (browseHovered_ ? Color{244, 248, 244, 255} : Color{224, 230, 224, 255}) : Color{118, 128, 118, 255};
+    DrawRectangleRounded(browseBounds,
+                         0.28f,
+                         8,
+                         enabled ? (browseHovered_ ? Color{104, 122, 104, 255} : Color{72, 82, 72, 255})
+                                 : Color{40, 46, 40, 255});
+    const Color folderColor =
+        enabled ? (browseHovered_ ? Color{244, 248, 244, 255} : Color{224, 230, 224, 255}) : Color{118, 128, 118, 255};
     DrawRectangleLinesEx({browseBounds.x + 5.0f, browseBounds.y + 8.0f, 12.0f, 8.0f}, 1.0f, folderColor);
     DrawRectangleRec({browseBounds.x + 6.0f, browseBounds.y + 6.0f, 5.0f, 3.0f}, folderColor);
     if (browseHovered_)
@@ -582,19 +656,7 @@ void PathField::Draw(Rectangle bounds, Font font, const std::string& path, bool 
 
 void PathField::CommitPath(std::string& path)
 {
-    if (!wasEditedManually_ || path.empty())
-    {
-        wasEditedManually_ = false;
-        return;
-    }
-
-    std::error_code error;
-    const std::filesystem::path directory = std::filesystem::u8path(path);
-    if (!std::filesystem::exists(directory, error))
-    {
-        std::filesystem::create_directories(directory, error);
-    }
-
+    (void)path;
     wasEditedManually_ = false;
 }
 

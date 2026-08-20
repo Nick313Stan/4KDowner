@@ -1,5 +1,8 @@
 #include "Dropdown.h"
 
+#include "DownloadFormatPredictor.h"
+#include "UiClip.h"
+
 #include <algorithm>
 
 Dropdown::Dropdown(std::vector<std::string> items)
@@ -7,7 +10,7 @@ Dropdown::Dropdown(std::vector<std::string> items)
 {
 }
 
-bool Dropdown::Update(Rectangle bounds, int& selectedIndex)
+bool Dropdown::Update(Rectangle bounds, int& selectedIndex, const Rectangle* hitClip)
 {
     if (items_.empty())
     {
@@ -17,6 +20,19 @@ bool Dropdown::Update(Rectangle bounds, int& selectedIndex)
     const Vector2 mouse = GetMousePosition();
     const Rectangle popupBounds = GetPopupBounds(bounds);
     const float maxScroll = GetMaxScroll(bounds);
+
+    const auto mouseInControl = [&]()
+    {
+        if (!CheckCollisionPointRec(mouse, bounds))
+        {
+            return false;
+        }
+        if (hitClip != nullptr && !CheckCollisionPointRec(mouse, *hitClip))
+        {
+            return false;
+        }
+        return true;
+    };
 
     if (isOpen_ && CheckCollisionPointRec(mouse, popupBounds))
     {
@@ -30,7 +46,7 @@ bool Dropdown::Update(Rectangle bounds, int& selectedIndex)
 
     if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     {
-        if (CheckCollisionPointRec(mouse, bounds))
+        if (mouseInControl())
         {
             isOpen_ = !isOpen_;
             scrollOffset_ = std::clamp(scrollOffset_, 0.0f, maxScroll);
@@ -41,11 +57,10 @@ bool Dropdown::Update(Rectangle bounds, int& selectedIndex)
         {
             for (int index = 0; index < static_cast<int>(items_.size()); ++index)
             {
-                const Rectangle itemBounds = {
-                    bounds.x,
-                    popupBounds.y + bounds.height * static_cast<float>(index) - scrollOffset_,
-                    bounds.width,
-                    bounds.height};
+                const Rectangle itemBounds = {bounds.x,
+                                              popupBounds.y + bounds.height * static_cast<float>(index) - scrollOffset_,
+                                              bounds.width,
+                                              bounds.height};
                 if (CheckCollisionPointRec(mouse, popupBounds) && CheckCollisionPointRec(mouse, itemBounds))
                 {
                     if (IsInactiveItem(items_[index]))
@@ -68,13 +83,38 @@ bool Dropdown::Update(Rectangle bounds, int& selectedIndex)
     return false;
 }
 
+bool Dropdown::CapturesPoint(Rectangle bounds, Vector2 point) const
+{
+    if (!isOpen_)
+    {
+        return false;
+    }
+    return CheckCollisionPointRec(point, GetPopupBounds(bounds)) || CheckCollisionPointRec(point, bounds);
+}
+
+bool Dropdown::AnyCapturesPoint(const Slot* slots, int count, Vector2 point)
+{
+    for (int i = 0; i < count; ++i)
+    {
+        if (!slots[i].enabled || slots[i].dropdown == nullptr || !slots[i].dropdown->IsOpen())
+        {
+            continue;
+        }
+        if (slots[i].dropdown->CapturesPoint(slots[i].bounds, point))
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
 void Dropdown::Draw(Rectangle bounds, Font font, int selectedIndex, bool enabled) const
 {
     DrawControl(bounds, font, selectedIndex, enabled);
     DrawPopup(bounds, font, selectedIndex);
 }
 
-void Dropdown::DrawControl(Rectangle bounds, Font font, int selectedIndex, bool enabled) const
+void Dropdown::DrawControl(Rectangle bounds, Font font, int selectedIndex, bool enabled, bool allowHover) const
 {
     if (items_.empty())
     {
@@ -82,8 +122,9 @@ void Dropdown::DrawControl(Rectangle bounds, Font font, int selectedIndex, bool 
     }
 
     const int safeIndex = std::clamp(selectedIndex, 0, static_cast<int>(items_.size()) - 1);
-    const bool hovered = enabled && CheckCollisionPointRec(GetMousePosition(), bounds);
-    const Color background = enabled ? (hovered ? Color{76, 92, 76, 255} : Color{54, 66, 54, 255}) : Color{24, 28, 24, 255};
+    const bool hovered = enabled && allowHover && CheckCollisionPointRec(GetMousePosition(), bounds);
+    const Color background =
+        enabled ? (hovered ? Color{76, 92, 76, 255} : Color{54, 66, 54, 255}) : Color{24, 28, 24, 255};
     const Color text = enabled ? Color{224, 230, 224, 255} : Color{126, 136, 126, 255};
     const Color aliasColor = enabled ? Color{126, 142, 126, 255} : Color{96, 108, 96, 255};
 
@@ -110,19 +151,14 @@ void Dropdown::DrawPopup(Rectangle bounds, Font font, int selectedIndex) const
 
     DrawRectangleRounded(popupBounds, roundness, 8, Color{42, 50, 42, 255});
 
-    BeginScissorMode(
-        static_cast<int>(popupBounds.x),
-        static_cast<int>(popupBounds.y),
-        static_cast<int>(popupBounds.width),
-        static_cast<int>(popupBounds.height));
+    UiClip::Push(popupBounds);
 
     for (int index = 0; index < static_cast<int>(items_.size()); ++index)
     {
-        const Rectangle itemBounds = {
-            bounds.x,
-            popupBounds.y + bounds.height * static_cast<float>(index) - scrollOffset_,
-            bounds.width,
-            bounds.height};
+        const Rectangle itemBounds = {bounds.x,
+                                      popupBounds.y + bounds.height * static_cast<float>(index) - scrollOffset_,
+                                      bounds.width,
+                                      bounds.height};
         if (itemBounds.y + itemBounds.height < popupBounds.y || itemBounds.y > popupBounds.y + popupBounds.height)
         {
             continue;
@@ -136,20 +172,16 @@ void Dropdown::DrawPopup(Rectangle bounds, Font font, int selectedIndex) const
         DrawRectangleRec(itemBounds, itemBackground);
         if (index > 0)
         {
-            DrawLine(
-                static_cast<int>(itemBounds.x + 8.0f),
-                static_cast<int>(itemBounds.y),
-                static_cast<int>(itemBounds.x + itemBounds.width - 8.0f),
-                static_cast<int>(itemBounds.y),
-                Color{58, 68, 58, 255});
+            DrawLine(static_cast<int>(itemBounds.x + 8.0f),
+                     static_cast<int>(itemBounds.y),
+                     static_cast<int>(itemBounds.x + itemBounds.width - 8.0f),
+                     static_cast<int>(itemBounds.y),
+                     Color{58, 68, 58, 255});
         }
         if (hovered || selected)
         {
             const Rectangle highlightBounds = {
-                itemBounds.x + 4.0f,
-                itemBounds.y + 3.0f,
-                itemBounds.width - 8.0f,
-                itemBounds.height - 6.0f};
+                itemBounds.x + 4.0f, itemBounds.y + 3.0f, itemBounds.width - 8.0f, itemBounds.height - 6.0f};
             DrawRectangleRounded(highlightBounds, 0.22f, 8, highlight);
         }
         const Color textColor = inactive ? Color{108, 118, 108, 255} : Color{232, 236, 232, 255};
@@ -157,7 +189,7 @@ void Dropdown::DrawPopup(Rectangle bounds, Font font, int selectedIndex) const
         DrawItemLabel(font, itemBounds, items_[index], textColor, aliasColor);
     }
 
-    EndScissorMode();
+    UiClip::Pop();
 
     if (maxScroll > 0.0f)
     {
@@ -194,15 +226,99 @@ bool Dropdown::IsOpen() const
     return isOpen_;
 }
 
+void Dropdown::CloseOthers(Slot* slots, int count, const Dropdown* keep)
+{
+    for (int i = 0; i < count; ++i)
+    {
+        if (slots[i].dropdown != nullptr && slots[i].dropdown != keep)
+        {
+            slots[i].dropdown->Close();
+        }
+    }
+}
+
+void Dropdown::CloseDisabled(Slot* slots, int count)
+{
+    for (int i = 0; i < count; ++i)
+    {
+        if (!slots[i].enabled && slots[i].dropdown != nullptr)
+        {
+            slots[i].dropdown->Close();
+        }
+    }
+}
+
+bool Dropdown::AnyOpen(const Slot* slots, int count)
+{
+    for (int i = 0; i < count; ++i)
+    {
+        if (slots[i].enabled && slots[i].dropdown != nullptr && slots[i].dropdown->IsOpen())
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+int Dropdown::UpdateOpenPopups(Slot* slots, int count)
+{
+    CloseDisabled(slots, count);
+    for (int i = 0; i < count; ++i)
+    {
+        Slot& slot = slots[i];
+        if (!slot.enabled || slot.dropdown == nullptr || slot.selectedIndex == nullptr)
+        {
+            continue;
+        }
+        if (!slot.dropdown->IsOpen())
+        {
+            continue;
+        }
+        if (slot.dropdown->Update(slot.bounds, *slot.selectedIndex, slot.hitClip))
+        {
+            CloseOthers(slots, count, slot.dropdown);
+            return i;
+        }
+    }
+    return -1;
+}
+
+int Dropdown::UpdateClosedControls(Slot* slots, int count)
+{
+    CloseDisabled(slots, count);
+    for (int i = 0; i < count; ++i)
+    {
+        Slot& slot = slots[i];
+        if (!slot.enabled || slot.dropdown == nullptr || slot.selectedIndex == nullptr)
+        {
+            continue;
+        }
+        if (slot.dropdown->IsOpen())
+        {
+            continue;
+        }
+        if (slot.dropdown->Update(slot.bounds, *slot.selectedIndex, slot.hitClip))
+        {
+            CloseOthers(slots, count, slot.dropdown);
+            return i;
+        }
+    }
+    return -1;
+}
+
 bool Dropdown::IsInactiveItem(const std::string& label)
 {
-    const std::string suffix = " (Current)";
-    return label.size() >= suffix.size() &&
-        label.compare(label.size() - suffix.size(), suffix.size(), suffix) == 0;
+    return IsInactiveFormatItem(label);
 }
 
 std::string Dropdown::GetQualityAlias(const std::string& label)
 {
+    // Only quality rows like "4320p" — never format rows ("WEBM", "MP4 (Unavailable)").
+    if (label.empty() || label.front() < '0' || label.front() > '9')
+    {
+        return {};
+    }
+
     int height = 0;
     for (const char c : label)
     {
@@ -216,6 +332,10 @@ std::string Dropdown::GetQualityAlias(const std::string& label)
         }
     }
 
+    if (height >= 4320)
+    {
+        return "8K";
+    }
     if (height >= 2160)
     {
         return "4K";
@@ -235,7 +355,8 @@ std::string Dropdown::GetQualityAlias(const std::string& label)
     return {};
 }
 
-void Dropdown::DrawItemLabel(Font font, Rectangle bounds, const std::string& label, Color primary, Color secondary) const
+void Dropdown::DrawItemLabel(
+    Font font, Rectangle bounds, const std::string& label, Color primary, Color secondary) const
 {
     const Vector2 primarySize = MeasureTextEx(font, label.c_str(), 15.0f, 0.0f);
     DrawTextEx(font, label.c_str(), {bounds.x + 8.0f, bounds.y + 5.0f}, 15.0f, 0.0f, primary);
@@ -258,7 +379,7 @@ Rectangle Dropdown::GetPopupBounds(Rectangle bounds) const
 {
     const float contentHeight = bounds.height * static_cast<float>(items_.size());
     const float limitMinY = hasPopupLimitY_ ? popupMinY_ : 8.0f;
-    const float limitMaxY = hasPopupLimitY_ ? popupMaxY_ : static_cast<float>(GetScreenHeight()) - 8.0f;
+    const float limitMaxY = hasPopupLimitY_ ? popupMaxY_ : static_cast<float>(GetRenderHeight()) - 8.0f;
     const float availableBelow = limitMaxY - (bounds.y + bounds.height);
     const float availableAbove = bounds.y - limitMinY;
     const float maxPopupHeight = bounds.height * 7.0f;
@@ -266,11 +387,7 @@ Rectangle Dropdown::GetPopupBounds(Rectangle bounds) const
     const float availableSpace = openAbove ? availableAbove : availableBelow;
     const float popupHeight = std::max(bounds.height, std::min({contentHeight, maxPopupHeight, availableSpace}));
 
-    return {
-        bounds.x,
-        openAbove ? bounds.y - popupHeight : bounds.y + bounds.height,
-        bounds.width,
-        popupHeight};
+    return {bounds.x, openAbove ? bounds.y - popupHeight : bounds.y + bounds.height, bounds.width, popupHeight};
 }
 
 float Dropdown::GetMaxScroll(Rectangle bounds) const

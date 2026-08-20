@@ -1,10 +1,6 @@
 build/
-build-clangd/
-build-portable/
-src/build/
+build-linux/
 out/
-cache/
-dsfa/
 .vs/
 
 compile_commands.json
@@ -18,3 +14,12 @@ compile_commands.json
 *.part
 *.tmp
 *.zip
+
+.readme-github-preview.html
+
+# Generated WiX branding bitmaps
+scripts/Windows/msi/branding/
+
+# Editor / local
+.cursor/
+*.h.new

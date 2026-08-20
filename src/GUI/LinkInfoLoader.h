@@ -8,7 +8,8 @@
 
 #include "DownloadFormatPredictor.h"
 
-struct LinkInfo {
+struct LinkInfo
+{
     bool success = false;
     bool cancelled = false;
     std::string url;
@@ -30,19 +31,31 @@ struct LinkInfo {
     std::vector<LinkFormatStream> formatStreams;
 };
 
-class LinkInfoLoader {
+class LinkInfoLoader
+{
 public:
+    LinkInfoLoader() = default;
+    ~LinkInfoLoader();
+    LinkInfoLoader(const LinkInfoLoader&) = delete;
+    LinkInfoLoader& operator=(const LinkInfoLoader&) = delete;
+    LinkInfoLoader(LinkInfoLoader&& other) noexcept;
+    LinkInfoLoader& operator=(LinkInfoLoader&& other) noexcept;
+
     void Start(std::string url);
     void Cancel();
     void Update();
+    static void ReapAbandoned();
 
     bool IsLoading() const;
     bool HasResult() const;
     const LinkInfo& GetResult() const;
 
+    static LinkInfo LoadVideo(std::string url, std::shared_ptr<std::atomic_bool> cancelRequested);
+    static std::string Quote(const std::string& value);
+
 private:
     static LinkInfo Load(std::string url, std::shared_ptr<std::atomic_bool> cancelRequested);
-    static std::string Quote(const std::string& value);
+    void AbandonRunningWork();
 
     std::future<LinkInfo> future_;
     std::shared_ptr<std::atomic_bool> cancelRequested_;

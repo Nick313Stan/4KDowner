@@ -4,10 +4,17 @@
 
 #include <string>
 
-class PathField {
+class PathField
+{
 public:
     void Update(Rectangle bounds, Font font, std::string& path, bool enabled = true);
-    void Draw(Rectangle bounds, Font font, const std::string& path, bool enabled = true) const;
+    // parentScissor: when drawn inside an outer BeginScissorMode, pass it so text/browse stay clipped
+    // (raylib scissors do not nest — PathField's text clip would otherwise replace the parent).
+    void Draw(Rectangle bounds,
+              Font font,
+              const std::string& path,
+              bool enabled = true,
+              const Rectangle* parentScissor = nullptr) const;
     bool IsActive() const;
 
 private:
@@ -18,6 +25,7 @@ private:
     static constexpr float kFontSize = 15.0f;
 
     bool isActive_ = false;
+    bool pendingBlur_ = false;
     bool wasEditedManually_ = false;
     bool isDraggingSelection_ = false;
     mutable bool browseHovered_ = false;

@@ -1,9 +1,13 @@
 #include "LinkCardNode.h"
 
 #include "BrowserDiagnostics.h"
+#include "CardChrome.h"
 #include "MouseCursor.h"
+#include "Tooltip.h"
+#include "UiClip.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
@@ -11,7 +15,54 @@
 #include <utility>
 #include <vector>
 
-namespace {
+namespace
+{
+std::string SourceSiteName(const std::string& url)
+{
+    std::string host;
+    const auto schemeEnd = url.find("://");
+    const size_t hostStart = schemeEnd == std::string::npos ? 0 : schemeEnd + 3;
+    const size_t hostEnd = url.find_first_of("/?#", hostStart);
+    host = url.substr(hostStart, hostEnd == std::string::npos ? std::string::npos : hostEnd - hostStart);
+    for (char& c : host)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    if (host.rfind("www.", 0) == 0)
+    {
+        host.erase(0, 4);
+    }
+
+    if (host == "youtu.be" || host == "youtube.com" || host == "m.youtube.com" || host == "music.youtube.com" ||
+        host.find("youtube.") == 0)
+    {
+        return "YouTube";
+    }
+    if (host == "vimeo.com" || host.rfind("vimeo.", 0) == 0)
+    {
+        return "Vimeo";
+    }
+    if (host == "twitch.tv" || host.rfind("twitch.", 0) == 0)
+    {
+        return "Twitch";
+    }
+    if (host.empty())
+    {
+        return "Link";
+    }
+
+    if (host[0] >= 'a' && host[0] <= 'z')
+    {
+        host[0] = static_cast<char>(host[0] - 'a' + 'A');
+    }
+    const auto dot = host.find('.');
+    if (dot != std::string::npos)
+    {
+        host.resize(dot);
+    }
+    return host;
+}
+
 std::string FormatElapsed(double seconds)
 {
     const int totalSeconds = static_cast<int>(seconds + 0.5);
@@ -22,6 +73,38 @@ std::string FormatElapsed(double seconds)
     return buffer;
 }
 
+double ParseDurationSeconds(const std::string& text)
+{
+    if (text.empty() || text == "--:--")
+    {
+        return 0.0;
+    }
+
+    int hours = 0;
+    int minutes = 0;
+    int seconds = 0;
+    int matched = 0;
+#ifdef _MSC_VER
+    matched = sscanf_s(text.c_str(), "%d:%d:%d", &hours, &minutes, &seconds);
+#else
+    matched = std::sscanf(text.c_str(), "%d:%d:%d", &hours, &minutes, &seconds);
+#endif
+    if (matched == 3)
+    {
+        return static_cast<double>(hours * 3600 + minutes * 60 + seconds);
+    }
+#ifdef _MSC_VER
+    matched = sscanf_s(text.c_str(), "%d:%d", &minutes, &seconds);
+#else
+    matched = std::sscanf(text.c_str(), "%d:%d", &minutes, &seconds);
+#endif
+    if (matched == 2)
+    {
+        return static_cast<double>(minutes * 60 + seconds);
+    }
+    return 0.0;
+}
+
 constexpr float kThumbnailRoundness = 0.12f;
 constexpr int kThumbnailSegments = 8;
 constexpr float kThumbnailWidth = 82.0f;
@@ -29,13 +112,86 @@ constexpr float kThumbnailHeight = kThumbnailWidth * 9.0f / 16.0f;
 constexpr int kThumbnailPixelWidth = 164;
 constexpr int kThumbnailPixelHeight = 92;
 
+// Clipboard paste can be multiline junk; DrawTextEx treats '\n' as real line breaks.
+std::string SanitizeSingleLineForUi(std::string text)
+{
+    for (char& ch : text)
+    {
+        if (ch == '\n' || ch == '\r' || ch == '\t')
+        {
+            ch = ' ';
+        }
+    }
+
+    std::string collapsed;
+    collapsed.reserve(text.size());
+    bool lastWasSpace = false;
+    for (const char ch : text)
+    {
+        if (ch == ' ')
+        {
+            if (lastWasSpace || collapsed.empty())
+            {
+                continue;
+            }
+            lastWasSpace = true;
+            collapsed.push_back(' ');
+            continue;
+        }
+        lastWasSpace = false;
+        collapsed.push_back(ch);
+    }
+    while (!collapsed.empty() && collapsed.back() == ' ')
+    {
+        collapsed.pop_back();
+    }
+    return collapsed;
+}
+
+std::string TruncateTextToWidth(Font font, const std::string& text, float fontSize, float maxWidth)
+{
+    const std::string singleLine = SanitizeSingleLineForUi(text);
+    if (singleLine.empty() || maxWidth <= 0.0f)
+    {
+        return "...";
+    }
+
+    if (MeasureTextEx(font, singleLine.c_str(), fontSize, 0.0f).x <= maxWidth)
+    {
+        return singleLine;
+    }
+
+    const std::string ellipsis = "...";
+    if (MeasureTextEx(font, ellipsis.c_str(), fontSize, 0.0f).x > maxWidth)
+    {
+        return ellipsis;
+    }
+
+    size_t low = 0;
+    size_t high = singleLine.size();
+    while (low < high)
+    {
+        const size_t mid = (low + high + 1) / 2;
+        const std::string candidate = singleLine.substr(0, mid) + ellipsis;
+        if (MeasureTextEx(font, candidate.c_str(), fontSize, 0.0f).x <= maxWidth)
+        {
+            low = mid;
+        }
+        else
+        {
+            high = mid - 1;
+        }
+    }
+
+    return low == 0 ? ellipsis : singleLine.substr(0, low) + ellipsis;
+}
+
 Rectangle GetThumbnailBounds(Rectangle cardBounds)
 {
-    return {
-        cardBounds.x + 8.0f,
-        cardBounds.y + (cardBounds.height - kThumbnailHeight) * 0.5f,
-        kThumbnailWidth,
-        kThumbnailHeight};
+    return {cardBounds.x + 8.0f,
+            cardBounds.y + (cardBounds.height - kThumbnailHeight) * 0.5f,
+            kThumbnailWidth,
+            kThumbnailHeight};
 }
 
 void PrepareThumbnailImage(Image& image)
@@ -67,11 +223,11 @@ void PrepareThumbnailImage(Image& image)
 
     if (cropW != image.width || cropH != image.height)
     {
-        ImageCrop(&image, {
-            static_cast<float>(cropX),
-            static_cast<float>(cropY),
-            static_cast<float>(cropW),
-            static_cast<float>(cropH)});
+        ImageCrop(&image,
+                  {static_cast<float>(cropX),
+                   static_cast<float>(cropY),
+                   static_cast<float>(cropW),
+                   static_cast<float>(cropH)});
     }
 
     if (image.data == nullptr || image.width <= 0 || image.height <= 0)
@@ -81,11 +237,15 @@ void PrepareThumbnailImage(Image& image)
 
     ImageResize(&image, kThumbnailPixelWidth, kThumbnailPixelHeight);
 }
-}
+} // namespace
 
 LinkCardNode::LinkCardNode(LinkInfo info)
     : info_(std::move(info))
 {
+    if (info_.success && info_.formatStreams.empty())
+    {
+        needsDetailedParse_ = true;
+    }
 }
 
 LinkCardNode::LinkCardNode(std::string url)
@@ -98,7 +258,7 @@ LinkCardNode::LinkCardNode(std::string url)
 
 LinkCardNode::~LinkCardNode()
 {
-    if (isParsing_)
+    if (isParsing_ || isDetailParsing_)
     {
         loader_.Cancel();
     }
@@ -109,6 +269,7 @@ LinkCardNode::LinkCardNode(LinkCardNode&& other) noexcept
     : info_(std::move(other.info_)),
       loader_(std::move(other.loader_)),
       isParsing_(other.isParsing_),
+      dismissedDuringParse_(other.dismissedDuringParse_),
       thumbnailTexture_(other.thumbnailTexture_),
       hasThumbnailTexture_(other.hasThumbnailTexture_),
       triedLoadingThumbnail_(other.triedLoadingThumbnail_),
@@ -116,24 +277,57 @@ LinkCardNode::LinkCardNode(LinkCardNode&& other) noexcept
       isSelected_(other.isSelected_),
       wasClicked_(other.wasClicked_),
       wasDownloadCancelClicked_(other.wasDownloadCancelClicked_),
+      wasConvertCancelClicked_(other.wasConvertCancelClicked_),
       wasRedownloadClicked_(other.wasRedownloadClicked_),
       wasQueueDownloadClicked_(other.wasQueueDownloadClicked_),
-      wasQueueCancelClicked_(other.wasQueueCancelClicked_),
+      wasPrioritizeClicked_(other.wasPrioritizeClicked_),
       wasCopyClicked_(other.wasCopyClicked_),
+      wasOpenPathClicked_(other.wasOpenPathClicked_),
+      wasSourceClicked_(other.wasSourceClicked_),
       shouldClose_(other.shouldClose_),
       pendingParseErrorReport_(other.pendingParseErrorReport_),
       pendingParseSuccessReport_(other.pendingParseSuccessReport_),
       downloadBrowserReport_(std::move(other.downloadBrowserReport_)),
+      lastDownloadedPath_(std::move(other.lastDownloadedPath_)),
+      expectedOutputDirectory_(std::move(other.expectedOutputDirectory_)),
+      expectedFileFormat_(std::move(other.expectedFileFormat_)),
+      expectedNormalizedTitle_(std::move(other.expectedNormalizedTitle_)),
+      finalOutputDirectory_(std::move(other.finalOutputDirectory_)),
+      originalNormalizedTitle_(std::move(other.originalNormalizedTitle_)),
+      autoConvertStagingPath_(std::move(other.autoConvertStagingPath_)),
+      hasAutoConvertDelivery_(other.hasAutoConvertDelivery_),
+      hasAutoConvertSnapshot_(other.hasAutoConvertSnapshot_),
+      excludeFromAutoConvert_(other.excludeFromAutoConvert_),
+      customAutoConvert_(std::move(other.customAutoConvert_)),
+      autoConvertSnapshot_(other.autoConvertSnapshot_),
       options_(std::move(other.options_)),
       downloadElapsedSeconds_(other.downloadElapsedSeconds_),
+      convertElapsedSeconds_(other.convertElapsedSeconds_),
       hasDownloadElapsed_(other.hasDownloadElapsed_),
+      hasConvertElapsed_(other.hasConvertElapsed_),
+      isConverting_(other.isConverting_),
       queueStatus_(other.queueStatus_),
+      busyStatusLabel_(std::move(other.busyStatusLabel_)),
       pulseStartTime_(other.pulseStartTime_),
-      operationProgress_(other.operationProgress_)
+      operationProgress_(other.operationProgress_),
+      busySessionStart_(other.busySessionStart_),
+      needsDetailedParse_(other.needsDetailedParse_),
+      isDetailParsing_(other.isDetailParsing_)
 {
     other.thumbnailTexture_ = {};
     other.hasThumbnailTexture_ = false;
     other.isParsing_ = false;
+    other.isDetailParsing_ = false;
+    other.needsDetailedParse_ = false;
+    other.dismissedDuringParse_ = false;
+    other.isConverting_ = false;
+    other.hasAutoConvertDelivery_ = false;
+    other.hasAutoConvertSnapshot_ = false;
+    other.excludeFromAutoConvert_ = false;
+    other.customAutoConvert_ = {};
+    other.autoConvertStagingPath_.clear();
+    other.autoConvertSnapshot_ = {};
+    other.busySessionStart_ = -1.0;
 }
 
 LinkCardNode& LinkCardNode::operator=(LinkCardNode&& other) noexcept
@@ -144,6 +338,7 @@ LinkCardNode& LinkCardNode::operator=(LinkCardNode&& other) noexcept
         info_ = std::move(other.info_);
         loader_ = std::move(other.loader_);
         isParsing_ = other.isParsing_;
+        dismissedDuringParse_ = other.dismissedDuringParse_;
         thumbnailTexture_ = other.thumbnailTexture_;
         hasThumbnailTexture_ = other.hasThumbnailTexture_;
         triedLoadingThumbnail_ = other.triedLoadingThumbnail_;
@@ -151,46 +346,94 @@ LinkCardNode& LinkCardNode::operator=(LinkCardNode&& other) noexcept
         isSelected_ = other.isSelected_;
         wasClicked_ = other.wasClicked_;
         wasDownloadCancelClicked_ = other.wasDownloadCancelClicked_;
+        wasConvertCancelClicked_ = other.wasConvertCancelClicked_;
         wasRedownloadClicked_ = other.wasRedownloadClicked_;
         wasQueueDownloadClicked_ = other.wasQueueDownloadClicked_;
-        wasQueueCancelClicked_ = other.wasQueueCancelClicked_;
+        wasPrioritizeClicked_ = other.wasPrioritizeClicked_;
         wasCopyClicked_ = other.wasCopyClicked_;
+        wasOpenPathClicked_ = other.wasOpenPathClicked_;
+        wasSourceClicked_ = other.wasSourceClicked_;
         shouldClose_ = other.shouldClose_;
         pendingParseErrorReport_ = other.pendingParseErrorReport_;
         pendingParseSuccessReport_ = other.pendingParseSuccessReport_;
         downloadBrowserReport_ = std::move(other.downloadBrowserReport_);
+        lastDownloadedPath_ = std::move(other.lastDownloadedPath_);
+        expectedOutputDirectory_ = std::move(other.expectedOutputDirectory_);
+        expectedFileFormat_ = std::move(other.expectedFileFormat_);
+        expectedNormalizedTitle_ = std::move(other.expectedNormalizedTitle_);
+        finalOutputDirectory_ = std::move(other.finalOutputDirectory_);
+        originalNormalizedTitle_ = std::move(other.originalNormalizedTitle_);
+        autoConvertStagingPath_ = std::move(other.autoConvertStagingPath_);
+        hasAutoConvertDelivery_ = other.hasAutoConvertDelivery_;
+        hasAutoConvertSnapshot_ = other.hasAutoConvertSnapshot_;
+        excludeFromAutoConvert_ = other.excludeFromAutoConvert_;
+        customAutoConvert_ = std::move(other.customAutoConvert_);
+        autoConvertSnapshot_ = other.autoConvertSnapshot_;
         options_ = std::move(other.options_);
         downloadElapsedSeconds_ = other.downloadElapsedSeconds_;
+        convertElapsedSeconds_ = other.convertElapsedSeconds_;
         hasDownloadElapsed_ = other.hasDownloadElapsed_;
+        hasConvertElapsed_ = other.hasConvertElapsed_;
+        isConverting_ = other.isConverting_;
         queueStatus_ = other.queueStatus_;
+        busyStatusLabel_ = std::move(other.busyStatusLabel_);
         pulseStartTime_ = other.pulseStartTime_;
         operationProgress_ = other.operationProgress_;
+        busySessionStart_ = other.busySessionStart_;
+
+        needsDetailedParse_ = other.needsDetailedParse_;
+        isDetailParsing_ = other.isDetailParsing_;
 
         other.thumbnailTexture_ = {};
         other.hasThumbnailTexture_ = false;
         other.isParsing_ = false;
+        other.isDetailParsing_ = false;
+        other.needsDetailedParse_ = false;
+        other.dismissedDuringParse_ = false;
+        other.isConverting_ = false;
+        other.hasAutoConvertDelivery_ = false;
+        other.hasAutoConvertSnapshot_ = false;
+        other.excludeFromAutoConvert_ = false;
+        other.customAutoConvert_ = {};
+        other.autoConvertStagingPath_.clear();
+        other.autoConvertSnapshot_ = {};
+        other.busySessionStart_ = -1.0;
     }
 
     return *this;
 }
 
-void LinkCardNode::Update(Rectangle bounds)
+void LinkCardNode::Update(Rectangle bounds, Font font)
 {
+    (void)font;
     ApplyParseResultIfReady();
     LoadThumbnail();
     wasClicked_ = false;
     wasDownloadCancelClicked_ = false;
+    wasConvertCancelClicked_ = false;
     wasRedownloadClicked_ = false;
     wasQueueDownloadClicked_ = false;
-    wasQueueCancelClicked_ = false;
+    wasPrioritizeClicked_ = false;
     wasCopyClicked_ = false;
+    wasOpenPathClicked_ = false;
+    wasSourceClicked_ = false;
 
-    const Rectangle closeButton = GetCloseButtonBounds(bounds);
+    const Rectangle closeButton = CardChrome::CloseButtonBounds(bounds);
     isHovered_ = CheckCollisionPointRec(GetMousePosition(), bounds);
-    if (hasDownloadStatusBounds_ &&
-        CheckCollisionPointRec(GetMousePosition(), downloadStatusBounds_) &&
+    if (hasSourceBounds_ && CheckCollisionPointRec(GetMousePosition(), sourceBounds_) &&
+        IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && !info_.url.empty())
+    {
+        wasSourceClicked_ = true;
+        return;
+    }
+    if (hasDownloadStatusBounds_ && CheckCollisionPointRec(GetMousePosition(), downloadStatusBounds_) &&
         IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     {
+        if (isConverting_)
+        {
+            wasConvertCancelClicked_ = true;
+            return;
+        }
         if (queueStatus_ == CardQueueStatus::Downloading)
         {
             wasDownloadCancelClicked_ = true;
@@ -198,7 +441,7 @@ void LinkCardNode::Update(Rectangle bounds)
         }
         if (queueStatus_ == CardQueueStatus::InQueue)
         {
-            wasQueueCancelClicked_ = true;
+            wasPrioritizeClicked_ = true;
             return;
         }
         if (queueStatus_ == CardQueueStatus::Cancelled)
@@ -214,22 +457,30 @@ void LinkCardNode::Update(Rectangle bounds)
     }
     if (CheckCollisionPointRec(GetMousePosition(), closeButton) && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     {
-        if (isParsing_)
-        {
-            loader_.Cancel();
-        }
-        shouldClose_ = true;
+        RequestClose();
         return;
     }
 
-    if (!isParsing_ && HasBrowserDiagnostics())
+    if (!isParsing_ && !IsDownloading() && !IsConverting() && HasBrowserDiagnostics())
     {
-        const Rectangle copyButton = GetCopyButtonBounds(bounds);
-        if (CheckCollisionPointRec(GetMousePosition(), copyButton) &&
-            IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+        const Rectangle copyButton = CardChrome::CopyButtonBounds(bounds);
+        if (CheckCollisionPointRec(GetMousePosition(), copyButton) && IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
         {
             SetClipboardText(BuildBrowserDiagnosticsReport().c_str());
             wasCopyClicked_ = true;
+            return;
+        }
+    }
+
+    if (!isParsing_ && CanRevealOutputPath())
+    {
+        const Rectangle openPathButton = CardChrome::OpenPathButtonBounds(bounds);
+        const Rectangle thumbnailBounds = GetThumbnailBounds(bounds);
+        const Vector2 mouse = GetMousePosition();
+        if ((CheckCollisionPointRec(mouse, openPathButton) || CheckCollisionPointRec(mouse, thumbnailBounds)) &&
+            IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+        {
+            wasOpenPathClicked_ = true;
             return;
         }
     }
@@ -240,11 +491,44 @@ void LinkCardNode::Update(Rectangle bounds)
     }
 }
 
-void LinkCardNode::Draw(Rectangle bounds, Font font) const
+void LinkCardNode::Draw(
+    Rectangle bounds, Font font, bool highlightExcluded, bool highlightCustom, int displayIndex) const
 {
-    const Rectangle animatedBounds = GetAnimatedBounds(bounds);
-    const Color background = isSelected_ ? Color{17, 30, 17, 255} : (isHovered_ ? Color{14, 26, 14, 255} : Color{10, 18, 10, 255});
-    const Color border = isSelected_ ? Color{118, 170, 118, 255} : (isHovered_ ? Color{90, 124, 90, 255} : Color{64, 84, 64, 255});
+    const Rectangle animatedBounds = CardChrome::AnimatedBounds(bounds, pulseStartTime_, kPulseSeconds);
+    const Color background =
+        isSelected_ ? Color{17, 30, 17, 255} : (isHovered_ ? Color{14, 26, 14, 255} : Color{10, 18, 10, 255});
+    Color border =
+        isSelected_ ? Color{118, 170, 118, 255} : (isHovered_ ? Color{90, 124, 90, 255} : Color{64, 84, 64, 255});
+    if (excludeFromAutoConvert_ && highlightExcluded)
+    {
+        if (isSelected_)
+        {
+            border = Color{230, 200, 80, 255};
+        }
+        else if (isHovered_)
+        {
+            border = Color{215, 185, 70, 255};
+        }
+        else
+        {
+            border = Color{200, 170, 60, 255};
+        }
+    }
+    else if (highlightCustom)
+    {
+        if (isSelected_)
+        {
+            border = Color{90, 150, 230, 255};
+        }
+        else if (isHovered_)
+        {
+            border = Color{80, 130, 210, 255};
+        }
+        else
+        {
+            border = Color{70, 115, 190, 255};
+        }
+    }
     const Color titleColor = {240, 244, 240, 255};
     const Color metaColor = {150, 170, 150, 255};
     const float minSide = animatedBounds.width < animatedBounds.height ? animatedBounds.width : animatedBounds.height;
@@ -255,7 +539,13 @@ void LinkCardNode::Draw(Rectangle bounds, Font font) const
     DrawRectangleRoundedLines(animatedBounds, roundness, 16, border);
     if (isSelected_)
     {
-        DrawRectangleRoundedLines({animatedBounds.x + 1.0f, animatedBounds.y + 1.0f, animatedBounds.width - 2.0f, animatedBounds.height - 2.0f}, roundness, 16, border);
+        DrawRectangleRoundedLines({animatedBounds.x + 1.0f,
+                                   animatedBounds.y + 1.0f,
+                                   animatedBounds.width - 2.0f,
+                                   animatedBounds.height - 2.0f},
+                                  roundness,
+                                  16,
+                                  border);
     }
 
     const Rectangle thumbnailBounds = GetThumbnailBounds(animatedBounds);
@@ -264,102 +554,145 @@ void LinkCardNode::Draw(Rectangle bounds, Font font) const
     if (hasThumbnailTexture_)
     {
         const Rectangle source = {
-            0.0f,
-            0.0f,
-            static_cast<float>(thumbnailTexture_.width),
-            static_cast<float>(thumbnailTexture_.height)};
-        BeginScissorMode(
-            static_cast<int>(thumbnailBounds.x),
-            static_cast<int>(thumbnailBounds.y),
-            static_cast<int>(thumbnailBounds.width),
-            static_cast<int>(thumbnailBounds.height));
+            0.0f, 0.0f, static_cast<float>(thumbnailTexture_.width), static_cast<float>(thumbnailTexture_.height)};
         DrawTexturePro(thumbnailTexture_, source, thumbnailBounds, {0.0f, 0.0f}, 0.0f, WHITE);
-        EndScissorMode();
     }
     else if (isParsing_)
     {
-        DrawMiniSpinner({
-            thumbnailBounds.x + thumbnailBounds.width * 0.5f,
-            thumbnailBounds.y + thumbnailBounds.height * 0.5f});
+        DrawMiniSpinner(
+            {thumbnailBounds.x + thumbnailBounds.width * 0.5f, thumbnailBounds.y + thumbnailBounds.height * 0.5f});
     }
     DrawRectangleRoundedLines(thumbnailBounds, kThumbnailRoundness, kThumbnailSegments, {64, 84, 64, 255});
+    if ((IsDownloading() || IsConverting()) && busySessionStart_ >= 0.0)
+    {
+        CardChrome::DrawPreviewElapsedOverlay(font, thumbnailBounds, GetTime() - busySessionStart_);
+    }
+    CardChrome::DrawPreviewIndexBadge(font, thumbnailBounds, displayIndex);
 
     if (isParsing_)
     {
-        const float textX = animatedBounds.x + 104.0f;
-        const float titleMaxWidth = animatedBounds.width - 138.0f;
+        const float textX = animatedBounds.x + CardChrome::kTextXOffset;
+        const float titleMaxWidth = CardChrome::TitleMaxWidth(bounds.width);
+        const std::string truncatedUrl = TruncateTextToWidth(font, info_.url, 14.5f, titleMaxWidth);
         DrawTextEx(font, "Parsing...", {textX, animatedBounds.y + 14.0f}, 18.0f, 0.0f, titleColor);
-        DrawWrappedText(font, info_.url, {textX, animatedBounds.y + 38.0f}, 14.5f, titleMaxWidth, 2, metaColor);
-        DrawCloseButton(animatedBounds);
+        DrawTextEx(font, truncatedUrl.c_str(), {textX, animatedBounds.y + 38.0f}, 14.5f, 0.0f, metaColor);
+        CardChrome::DrawCloseButton(animatedBounds, font);
+        CardChrome::DrawCopyButton(animatedBounds, font, false);
+        CardChrome::DrawOpenPathButton(animatedBounds, font, false);
+        hasSourceBounds_ = false;
+        hasDownloadStatusBounds_ = false;
         return;
     }
 
     if (!info_.success)
     {
-        DrawTextEx(font, "Could not parse link", {animatedBounds.x + 104.0f, animatedBounds.y + 14.0f}, 18.0f, 0.0f, {232, 160, 150, 255});
-        DrawCloseButton(animatedBounds);
-        if (HasBrowserDiagnostics())
-        {
-            DrawCopyButton(animatedBounds);
-        }
+        DrawTextEx(font,
+                   "Could not parse link",
+                   {animatedBounds.x + CardChrome::kTextXOffset, animatedBounds.y + 14.0f},
+                   18.0f,
+                   0.0f,
+                   {232, 160, 150, 255});
+        CardChrome::DrawCloseButton(animatedBounds, font);
+        CardChrome::DrawCopyButton(animatedBounds, font, HasBrowserDiagnostics());
+        CardChrome::DrawOpenPathButton(animatedBounds, font, false);
+        hasSourceBounds_ = false;
+        hasDownloadStatusBounds_ = false;
         return;
     }
 
-    const float textX = animatedBounds.x + 104.0f;
-    const float titleMaxWidth = animatedBounds.width - 138.0f;
-    DrawWrappedText(font, info_.title, {textX, animatedBounds.y + 10.0f}, 16.0f, titleMaxWidth, 2, titleColor);
+    const float textX = animatedBounds.x + CardChrome::kTextXOffset;
+    // Title wrap must use the unscaled card width. Animated width is slightly larger during
+    // pulse and would reflow the last word onto line 1 for a fraction of a second.
+    const float titleMaxWidth = CardChrome::TitleMaxWidth(bounds.width);
+    const bool revealPathAvailable = CanRevealOutputPath();
+    const Rectangle titleHitBounds = {animatedBounds.x, animatedBounds.y, bounds.width, animatedBounds.height};
+    const bool titleHovered = CardChrome::IsTitleTextHovered(titleHitBounds, font, info_.title);
+    const bool thumbnailHovered = revealPathAvailable && CheckCollisionPointRec(GetMousePosition(), thumbnailBounds);
+    const Color drawTitleColor = titleHovered ? Color{210, 255, 210, 255} : titleColor;
+    CardChrome::DrawWrappedText(
+        font, info_.title, {textX, animatedBounds.y + 10.0f}, 16.0f, titleMaxWidth, 2, drawTitleColor);
+    if (thumbnailHovered)
+    {
+        UiCursor::RequestHand();
+    }
+    if (revealPathAvailable)
+    {
+        Tooltip::DrawIfHovered(font, thumbnailBounds, "Open folder");
+    }
 
     const std::string durationText = info_.duration;
-    const std::string details = "Source: YouTube";
+    const std::string details = "Source: " + SourceSiteName(info_.url);
 
+    const bool sourceHovered = hasSourceBounds_ && CheckCollisionPointRec(GetMousePosition(), sourceBounds_);
     const bool statusHovered =
-        (queueStatus_ == CardQueueStatus::Downloading ||
-            queueStatus_ == CardQueueStatus::InQueue ||
-            queueStatus_ == CardQueueStatus::Cancelled ||
-            queueStatus_ == CardQueueStatus::NotInQueue) &&
-        hasDownloadStatusBounds_ &&
-        CheckCollisionPointRec(GetMousePosition(), downloadStatusBounds_);
-    const bool showDownloadSpinner = queueStatus_ == CardQueueStatus::Downloading && !statusHovered;
+        (isConverting_ || queueStatus_ == CardQueueStatus::Downloading || queueStatus_ == CardQueueStatus::InQueue ||
+         queueStatus_ == CardQueueStatus::Cancelled || queueStatus_ == CardQueueStatus::NotInQueue) &&
+        hasDownloadStatusBounds_ && CheckCollisionPointRec(GetMousePosition(), downloadStatusBounds_);
+    const bool showDownloadSpinner =
+        ((isConverting_ || queueStatus_ == CardQueueStatus::Downloading) && !statusHovered);
     std::string statusText;
-    switch (queueStatus_)
+    if (isConverting_)
     {
-    case CardQueueStatus::Downloading:
-        statusText = statusHovered ? "Cancel" : "downloading";
-        break;
-    case CardQueueStatus::InQueue:
-        statusText = statusHovered ? "Cancel" : "in queue";
-        break;
-    case CardQueueStatus::NotInQueue:
-        statusText = statusHovered ? "Download" : "not in queue";
-        break;
-    case CardQueueStatus::Cancelled:
-        statusText = statusHovered ? "Redownload" : "canceled";
-        break;
-    case CardQueueStatus::None:
-        if (hasDownloadElapsed_)
+        statusText = statusHovered ? "Cancel" : busyStatusLabel_;
+    }
+    else
+    {
+        switch (queueStatus_)
         {
-            statusText = "took " + FormatElapsed(downloadElapsedSeconds_);
+        case CardQueueStatus::Downloading:
+            statusText = statusHovered ? "Cancel" : busyStatusLabel_;
+            break;
+        case CardQueueStatus::InQueue:
+            statusText = statusHovered ? "Prioritize" : "in queue";
+            break;
+        case CardQueueStatus::NotInQueue:
+            statusText = statusHovered ? "Download" : "not in queue";
+            break;
+        case CardQueueStatus::Cancelled:
+            statusText = statusHovered ? "Redownload" : "canceled";
+            break;
+        case CardQueueStatus::None:
+            if (hasConvertElapsed_ && hasDownloadElapsed_)
+            {
+                statusText = "took " + FormatElapsed(downloadElapsedSeconds_ + convertElapsedSeconds_);
+            }
+            else if (hasConvertElapsed_)
+            {
+                statusText = "took " + FormatElapsed(convertElapsedSeconds_);
+            }
+            else if (hasDownloadElapsed_)
+            {
+                statusText = "took " + FormatElapsed(downloadElapsedSeconds_);
+            }
+            break;
         }
-        break;
     }
     const bool showStatus = !statusText.empty();
 
-    const float separatorWidth = MeasureTextEx(font, "  |  ", 14.0f, 0.0f).x;
+    const float separatorWidth = MeasureTextEx(font, " | ", 14.0f, 0.0f).x;
     const float durationWidth = MeasureTextEx(font, durationText.c_str(), 14.0f, 0.0f).x;
     const float downloadingTextWidth = MeasureTextEx(font, "downloading", 14.0f, 0.0f).x;
+    const float mergingTextWidth = MeasureTextEx(font, "merging", 14.0f, 0.0f).x;
+    const float convertingTextWidth = MeasureTextEx(font, "converting", 14.0f, 0.0f).x;
     const float cancelTextWidth = MeasureTextEx(font, "Cancel", 14.0f, 0.0f).x;
     const float canceledTextWidth = MeasureTextEx(font, "canceled", 14.0f, 0.0f).x;
     const float redownloadTextWidth = MeasureTextEx(font, "Redownload", 14.0f, 0.0f).x;
     const float notInQueueTextWidth = MeasureTextEx(font, "not in queue", 14.0f, 0.0f).x;
     const float queueDownloadTextWidth = MeasureTextEx(font, "Download", 14.0f, 0.0f).x;
     const float inQueueTextWidth = MeasureTextEx(font, "in queue", 14.0f, 0.0f).x;
-    const float downloadActionSlotWidth = std::max(downloadingTextWidth + 16.0f, cancelTextWidth);
-    const float inQueueActionSlotWidth = std::max(inQueueTextWidth, cancelTextWidth);
+    const float prioritizeTextWidth = MeasureTextEx(font, "Prioritize", 14.0f, 0.0f).x;
+    const float downloadActionSlotWidth = std::max({downloadingTextWidth, mergingTextWidth, cancelTextWidth}) + 16.0f;
+    const float convertActionSlotWidth = std::max(convertingTextWidth + 16.0f, cancelTextWidth);
+    const float inQueueActionSlotWidth = std::max(inQueueTextWidth, prioritizeTextWidth);
     const float cancelledActionSlotWidth = std::max(canceledTextWidth, redownloadTextWidth);
     const float notInQueueActionSlotWidth = std::max(notInQueueTextWidth, queueDownloadTextWidth);
     const float statusTextWidth = showStatus ? MeasureTextEx(font, statusText.c_str(), 14.0f, 0.0f).x : 0.0f;
     float layoutStatusWidth = statusTextWidth;
-    if (queueStatus_ == CardQueueStatus::Downloading)
+    if (isConverting_)
+    {
+        layoutStatusWidth = convertActionSlotWidth;
+    }
+    else if (queueStatus_ == CardQueueStatus::Downloading)
     {
         layoutStatusWidth = downloadActionSlotWidth;
     }
@@ -376,55 +709,71 @@ void LinkCardNode::Draw(Rectangle bounds, Font font) const
         layoutStatusWidth = notInQueueActionSlotWidth;
     }
     const float statusWidth = showStatus ? separatorWidth + layoutStatusWidth : 0.0f;
-    const float durationBlockWidth = separatorWidth + 20.0f + durationWidth;
+    const float durationBlockWidth = separatorWidth + 16.0f + durationWidth;
     const float metaMaxX = animatedBounds.x + animatedBounds.width - 34.0f;
     const float maxDetailsWidth = std::max(0.0f, metaMaxX - textX - durationBlockWidth - statusWidth);
     const float detailsWidth = std::min(MeasureTextEx(font, details.c_str(), 14.0f, 0.0f).x, maxDetailsWidth);
 
-    DrawTextEx(font, details.c_str(), {textX, animatedBounds.y + 49.0f}, 14.0f, 0.0f, metaColor);
+    const Color sourceColor = sourceHovered ? Color{210, 255, 210, 255} : metaColor;
+    DrawTextEx(font, details.c_str(), {textX, animatedBounds.y + 49.0f}, 14.0f, 0.0f, sourceColor);
+    sourceBounds_ = {textX, animatedBounds.y + 45.0f, detailsWidth, 22.0f};
+    hasSourceBounds_ = detailsWidth > 0.0f && !info_.url.empty();
+    if (sourceHovered && hasSourceBounds_)
+    {
+        UiCursor::RequestHand();
+    }
 
     const float durationSeparatorX = textX + detailsWidth;
-    DrawTextEx(font, "  |  ", {durationSeparatorX, animatedBounds.y + 49.0f}, 14.0f, 0.0f, metaColor);
+    DrawTextEx(font, " | ", {durationSeparatorX, animatedBounds.y + 49.0f}, 14.0f, 0.0f, metaColor);
 
-    const Vector2 clockCenter = {durationSeparatorX + separatorWidth + 8.0f, animatedBounds.y + 58.0f};
+    const Vector2 clockCenter = {durationSeparatorX + separatorWidth + 6.0f, animatedBounds.y + 58.0f};
     DrawCircleLines(static_cast<int>(clockCenter.x), static_cast<int>(clockCenter.y), 5.0f, metaColor);
-    DrawLine(static_cast<int>(clockCenter.x), static_cast<int>(clockCenter.y), static_cast<int>(clockCenter.x), static_cast<int>(clockCenter.y - 3.0f), metaColor);
-    DrawLine(static_cast<int>(clockCenter.x), static_cast<int>(clockCenter.y), static_cast<int>(clockCenter.x + 2.0f), static_cast<int>(clockCenter.y + 2.0f), metaColor);
+    DrawLine(static_cast<int>(clockCenter.x),
+             static_cast<int>(clockCenter.y),
+             static_cast<int>(clockCenter.x),
+             static_cast<int>(clockCenter.y - 3.0f),
+             metaColor);
+    DrawLine(static_cast<int>(clockCenter.x),
+             static_cast<int>(clockCenter.y),
+             static_cast<int>(clockCenter.x + 2.0f),
+             static_cast<int>(clockCenter.y + 2.0f),
+             metaColor);
 
-    const Vector2 durationPosition = {clockCenter.x + 12.0f, animatedBounds.y + 49.0f};
+    const Vector2 durationPosition = {clockCenter.x + 10.0f, animatedBounds.y + 49.0f};
     DrawTextEx(font, durationText.c_str(), durationPosition, 14.0f, 0.0f, metaColor);
+
+    const float metaY = animatedBounds.y + 49.0f;
+    const float metaHeight = 18.0f;
+    Tooltip::DrawIfHovered(font, sourceBounds_, "Open Link");
+    Tooltip::DrawIfHovered(
+        font,
+        {clockCenter.x - 6.0f, metaY - 2.0f, (durationPosition.x + durationWidth) - (clockCenter.x - 6.0f), metaHeight},
+        "Duration");
 
     hasDownloadStatusBounds_ = false;
     if (showStatus)
     {
-        const float separatorX = durationPosition.x + durationWidth + 4.0f;
-        DrawTextEx(font, "  |  ", {separatorX, animatedBounds.y + 49.0f}, 14.0f, 0.0f, metaColor);
+        const float separatorX = durationPosition.x + durationWidth + 2.0f;
+        DrawTextEx(font, " | ", {separatorX, animatedBounds.y + 49.0f}, 14.0f, 0.0f, metaColor);
 
-        const float statusSlotStart = separatorX + separatorWidth + 4.0f;
+        const float statusSlotStart = separatorX + separatorWidth + 2.0f;
         const Vector2 statusPosition = {statusSlotStart, animatedBounds.y + 49.0f};
         const Color statusColor =
-            queueStatus_ == CardQueueStatus::Cancelled
+            queueStatus_ == CardQueueStatus::Cancelled && !isConverting_
                 ? (statusHovered ? Color{120, 188, 120, 255} : Color{240, 96, 86, 255})
-                : queueStatus_ == CardQueueStatus::NotInQueue
-                    ? (statusHovered ? Color{120, 188, 120, 255} : metaColor)
-                    : (statusHovered ? Color{240, 96, 86, 255} : metaColor);
-        if (queueStatus_ == CardQueueStatus::Downloading ||
-            queueStatus_ == CardQueueStatus::InQueue ||
-            queueStatus_ == CardQueueStatus::Cancelled ||
-            queueStatus_ == CardQueueStatus::NotInQueue)
+            : (queueStatus_ == CardQueueStatus::NotInQueue || queueStatus_ == CardQueueStatus::InQueue) &&
+                    !isConverting_
+                ? (statusHovered ? Color{120, 188, 120, 255} : metaColor)
+                : (statusHovered ? Color{240, 96, 86, 255} : metaColor);
+        if (isConverting_ || queueStatus_ == CardQueueStatus::Downloading || queueStatus_ == CardQueueStatus::InQueue ||
+            queueStatus_ == CardQueueStatus::Cancelled || queueStatus_ == CardQueueStatus::NotInQueue)
         {
-            const float slotWidth = queueStatus_ == CardQueueStatus::Downloading
-                ? downloadActionSlotWidth
-                : queueStatus_ == CardQueueStatus::InQueue
-                    ? inQueueActionSlotWidth
-                    : queueStatus_ == CardQueueStatus::Cancelled
-                        ? cancelledActionSlotWidth
-                        : notInQueueActionSlotWidth;
-            downloadStatusBounds_ = {
-                statusSlotStart - 3.0f,
-                animatedBounds.y + 45.0f,
-                slotWidth + 6.0f,
-                24.0f};
+            const float slotWidth = isConverting_                                  ? convertActionSlotWidth
+                                    : queueStatus_ == CardQueueStatus::Downloading ? downloadActionSlotWidth
+                                    : queueStatus_ == CardQueueStatus::InQueue     ? inQueueActionSlotWidth
+                                    : queueStatus_ == CardQueueStatus::Cancelled   ? cancelledActionSlotWidth
+                                                                                   : notInQueueActionSlotWidth;
+            downloadStatusBounds_ = {statusSlotStart - 3.0f, animatedBounds.y + 45.0f, slotWidth + 6.0f, 24.0f};
             hasDownloadStatusBounds_ = true;
         }
         DrawTextEx(font, statusText.c_str(), statusPosition, 14.0f, 0.0f, statusColor);
@@ -432,16 +781,20 @@ void LinkCardNode::Draw(Rectangle bounds, Font font) const
         {
             UiCursor::RequestHand();
         }
+        if (queueStatus_ == CardQueueStatus::InQueue && !isConverting_)
+        {
+            Tooltip::DrawIfHovered(font, downloadStatusBounds_, "Start now (pauses lowest-progress download)");
+        }
         if (showDownloadSpinner)
         {
-            DrawMiniSpinner({statusPosition.x + downloadingTextWidth + 8.0f, animatedBounds.y + 58.0f});
+            const float spinnerTextWidth =
+                isConverting_ ? convertingTextWidth : MeasureTextEx(font, busyStatusLabel_.c_str(), 14.0f, 0.0f).x;
+            DrawMiniSpinner({statusPosition.x + spinnerTextWidth + 8.0f, animatedBounds.y + 58.0f});
         }
     }
-    DrawCloseButton(animatedBounds);
-    if (HasBrowserDiagnostics())
-    {
-        DrawCopyButton(animatedBounds);
-    }
+    CardChrome::DrawCloseButton(animatedBounds, font);
+    CardChrome::DrawCopyButton(animatedBounds, font, !IsDownloading() && !IsConverting() && HasBrowserDiagnostics());
+    CardChrome::DrawOpenPathButton(animatedBounds, font, CanRevealOutputPath());
 }
 
 void LinkCardNode::TriggerPulse()
@@ -457,9 +810,11 @@ void LinkCardNode::SetSelected(bool selected)
 void LinkCardNode::SetDownloading()
 {
     queueStatus_ = CardQueueStatus::Downloading;
+    busyStatusLabel_ = "downloading";
     hasDownloadElapsed_ = false;
     downloadElapsedSeconds_ = 0.0;
     operationProgress_ = 0.04f;
+    busySessionStart_ = GetTime();
 }
 
 void LinkCardNode::SetQueued()
@@ -494,7 +849,10 @@ void LinkCardNode::SetDownloadElapsed(double seconds)
     downloadElapsedSeconds_ = seconds;
     hasDownloadElapsed_ = true;
     queueStatus_ = CardQueueStatus::None;
-    operationProgress_ = -1.0f;
+    if (!isConverting_)
+    {
+        operationProgress_ = -1.0f;
+    }
 }
 
 void LinkCardNode::ClearDownloading()
@@ -504,7 +862,132 @@ void LinkCardNode::ClearDownloading()
         queueStatus_ = CardQueueStatus::Cancelled;
         hasDownloadElapsed_ = false;
     }
+    if (!isConverting_)
+    {
+        operationProgress_ = -1.0f;
+        busySessionStart_ = -1.0;
+    }
+}
+
+void LinkCardNode::DemoteDownloadingToQueued()
+{
+    if (queueStatus_ == CardQueueStatus::Downloading)
+    {
+        queueStatus_ = CardQueueStatus::InQueue;
+        hasDownloadElapsed_ = false;
+        downloadElapsedSeconds_ = 0.0;
+    }
+    if (!isConverting_)
+    {
+        operationProgress_ = -1.0f;
+        busySessionStart_ = -1.0;
+    }
+}
+
+void LinkCardNode::SetConverting()
+{
+    isConverting_ = true;
+    busyStatusLabel_ = "converting";
+    hasConvertElapsed_ = false;
+    convertElapsedSeconds_ = 0.0;
+    operationProgress_ = 0.04f;
+    // Keep download session clock when auto-convert follows download.
+    if (busySessionStart_ < 0.0)
+    {
+        busySessionStart_ = GetTime();
+    }
+}
+
+void LinkCardNode::ClearConverting()
+{
+    isConverting_ = false;
     operationProgress_ = -1.0f;
+    if (queueStatus_ != CardQueueStatus::Downloading)
+    {
+        busySessionStart_ = -1.0;
+    }
+}
+
+void LinkCardNode::SetBusyStatusLabel(std::string label)
+{
+    if (label.empty())
+    {
+        return;
+    }
+    busyStatusLabel_ = std::move(label);
+}
+
+const std::string& LinkCardNode::BusyStatusLabel() const
+{
+    return busyStatusLabel_;
+}
+
+void LinkCardNode::SetConvertElapsed(double seconds)
+{
+    isConverting_ = false;
+    hasConvertElapsed_ = true;
+    convertElapsedSeconds_ = seconds;
+    operationProgress_ = -1.0f;
+    busySessionStart_ = -1.0;
+}
+
+void LinkCardNode::SetExpectedDownloadOutput(std::string directory, std::string fileFormat, std::string normalizedTitle)
+{
+    expectedOutputDirectory_ = std::move(directory);
+    expectedFileFormat_ = std::move(fileFormat);
+    expectedNormalizedTitle_ = std::move(normalizedTitle);
+}
+
+void LinkCardNode::SetAutoConvertDelivery(std::string finalDirectory, std::string originalNormalizedTitle)
+{
+    finalOutputDirectory_ = std::move(finalDirectory);
+    originalNormalizedTitle_ = std::move(originalNormalizedTitle);
+    hasAutoConvertDelivery_ = true;
+}
+
+void LinkCardNode::ClearAutoConvertDelivery()
+{
+    finalOutputDirectory_.clear();
+    originalNormalizedTitle_.clear();
+    autoConvertStagingPath_.clear();
+    hasAutoConvertDelivery_ = false;
+}
+
+void LinkCardNode::SetAutoConvertStagingPath(std::string path)
+{
+    autoConvertStagingPath_ = std::move(path);
+}
+
+const std::string& LinkCardNode::AutoConvertStagingPath() const
+{
+    return autoConvertStagingPath_;
+}
+
+void LinkCardNode::SetAutoConvertSnapshot(AutoConvertOptions options)
+{
+    autoConvertSnapshot_ = std::move(options);
+    hasAutoConvertSnapshot_ = true;
+}
+
+void LinkCardNode::ClearAutoConvertSnapshot()
+{
+    autoConvertSnapshot_ = {};
+    hasAutoConvertSnapshot_ = false;
+}
+
+bool LinkCardNode::HasAutoConvertSnapshot() const
+{
+    return hasAutoConvertSnapshot_;
+}
+
+const AutoConvertOptions& LinkCardNode::AutoConvertSnapshot() const
+{
+    return autoConvertSnapshot_;
+}
+
+void LinkCardNode::SetLastDownloadedPath(std::string path)
+{
+    lastDownloadedPath_ = std::move(path);
 }
 
 void LinkCardNode::SetOperationProgress(float progress)
@@ -522,6 +1005,23 @@ bool LinkCardNode::ShouldClose() const
     return shouldClose_;
 }
 
+void LinkCardNode::RequestClose()
+{
+    if (isParsing_ || isDetailParsing_)
+    {
+        dismissedDuringParse_ = isParsing_;
+        loader_.Cancel();
+        isParsing_ = false;
+        isDetailParsing_ = false;
+    }
+    shouldClose_ = true;
+}
+
+bool LinkCardNode::IsHovered() const
+{
+    return isHovered_;
+}
+
 bool LinkCardNode::WasClicked() const
 {
     return wasClicked_;
@@ -530,6 +1030,11 @@ bool LinkCardNode::WasClicked() const
 bool LinkCardNode::WasDownloadCancelClicked() const
 {
     return wasDownloadCancelClicked_;
+}
+
+bool LinkCardNode::WasConvertCancelClicked() const
+{
+    return wasConvertCancelClicked_;
 }
 
 bool LinkCardNode::WasRedownloadClicked() const
@@ -542,9 +1047,9 @@ bool LinkCardNode::WasQueueDownloadClicked() const
     return wasQueueDownloadClicked_;
 }
 
-bool LinkCardNode::WasQueueCancelClicked() const
+bool LinkCardNode::WasPrioritizeClicked() const
 {
-    return wasQueueCancelClicked_;
+    return wasPrioritizeClicked_;
 }
 
 bool LinkCardNode::WasCopyClicked() const
@@ -552,14 +1057,38 @@ bool LinkCardNode::WasCopyClicked() const
     return wasCopyClicked_;
 }
 
+bool LinkCardNode::WasOpenPathClicked() const
+{
+    return wasOpenPathClicked_;
+}
+
+bool LinkCardNode::WasSourceClicked() const
+{
+    return wasSourceClicked_;
+}
+
 bool LinkCardNode::HasUrl(const std::string& url) const
 {
     return info_.url == url;
 }
 
+bool LinkCardNode::HasDownloadedPath(const std::string& path) const
+{
+    if (path.empty())
+    {
+        return false;
+    }
+    return lastDownloadedPath_ == path;
+}
+
 bool LinkCardNode::IsDownloading() const
 {
     return queueStatus_ == CardQueueStatus::Downloading;
+}
+
+bool LinkCardNode::IsConverting() const
+{
+    return isConverting_;
 }
 
 bool LinkCardNode::IsCancelled() const
@@ -582,9 +1111,19 @@ bool LinkCardNode::HasCompletedDownload() const
     return hasDownloadElapsed_;
 }
 
+bool LinkCardNode::HasCompletedConvert() const
+{
+    return hasConvertElapsed_;
+}
+
 double LinkCardNode::DownloadElapsedSeconds() const
 {
     return hasDownloadElapsed_ ? downloadElapsedSeconds_ : 0.0;
+}
+
+double LinkCardNode::ConvertElapsedSeconds() const
+{
+    return hasConvertElapsed_ ? convertElapsedSeconds_ : 0.0;
 }
 
 bool LinkCardNode::IsSelected() const
@@ -599,7 +1138,12 @@ bool LinkCardNode::IsValid() const
 
 bool LinkCardNode::IsParsing() const
 {
-    return isParsing_;
+    return isParsing_ || isDetailParsing_;
+}
+
+bool LinkCardNode::WasDismissedDuringParse() const
+{
+    return dismissedDuringParse_;
 }
 
 bool LinkCardNode::TryConsumeParseFailure(std::string& url, std::string& error)
@@ -655,11 +1199,7 @@ bool LinkCardNode::HasBrowserDiagnostics() const
 
 std::string LinkCardNode::BuildBrowserDiagnosticsReport() const
 {
-    return FormatBrowserSessionReport(
-        info_.url,
-        info_.title,
-        info_.parseBrowserReport,
-        downloadBrowserReport_);
+    return FormatBrowserSessionReport(info_.url, info_.title, info_.parseBrowserReport, downloadBrowserReport_);
 }
 
 const std::string& LinkCardNode::Url() const
@@ -675,6 +1215,66 @@ const std::string& LinkCardNode::Title() const
 const std::string& LinkCardNode::NormalizedTitle() const
 {
     return info_.normalizedTitle;
+}
+
+const std::string& LinkCardNode::LastDownloadedPath() const
+{
+    return lastDownloadedPath_;
+}
+
+const std::string& LinkCardNode::ExpectedOutputDirectory() const
+{
+    return expectedOutputDirectory_;
+}
+
+const std::string& LinkCardNode::ExpectedFileFormat() const
+{
+    return expectedFileFormat_;
+}
+
+const std::string& LinkCardNode::ExpectedNormalizedTitle() const
+{
+    return expectedNormalizedTitle_;
+}
+
+const std::string& LinkCardNode::FinalOutputDirectory() const
+{
+    return finalOutputDirectory_;
+}
+
+const std::string& LinkCardNode::OriginalNormalizedTitle() const
+{
+    return originalNormalizedTitle_;
+}
+
+bool LinkCardNode::HasAutoConvertDelivery() const
+{
+    return hasAutoConvertDelivery_;
+}
+
+bool LinkCardNode::IsExcludedFromAutoConvert() const
+{
+    return excludeFromAutoConvert_;
+}
+
+void LinkCardNode::SetExcludedFromAutoConvert(bool excluded)
+{
+    excludeFromAutoConvert_ = excluded;
+}
+
+const AutoConvertOptions& LinkCardNode::CustomAutoConvert() const
+{
+    return customAutoConvert_;
+}
+
+void LinkCardNode::SetCustomAutoConvert(AutoConvertOptions options)
+{
+    customAutoConvert_ = std::move(options);
+}
+
+double LinkCardNode::DurationSeconds() const
+{
+    return ParseDurationSeconds(info_.duration);
 }
 
 const std::vector<std::string>& LinkCardNode::AvailableFormats() const
@@ -712,82 +1312,146 @@ const DownloadOptions& LinkCardNode::Options() const
     return options_;
 }
 
-Rectangle LinkCardNode::GetAnimatedBounds(Rectangle bounds) const
+const LinkInfo& LinkCardNode::Info() const
 {
-    const double elapsed = GetTime() - pulseStartTime_;
-    if (elapsed < 0.0 || elapsed > kPulseSeconds)
+    return info_;
+}
+
+bool LinkCardNode::CanRevealOutputPath() const
+{
+    // Auto-convert is part of the same job: wait for convert to finish before reveal.
+    if ((hasAutoConvertDelivery_ || isConverting_) && !hasConvertElapsed_)
     {
-        return bounds;
+        return false;
     }
 
-    const float progress = static_cast<float>(elapsed / kPulseSeconds);
-    const float scale = 1.0f + std::sin(progress * 3.14159265f) * 0.035f;
-    const float width = bounds.width * scale;
-    const float height = bounds.height * scale;
-
-    return {
-        bounds.x - (width - bounds.width) * 0.5f,
-        bounds.y - (height - bounds.height) * 0.5f,
-        width,
-        height};
-}
-
-Rectangle LinkCardNode::GetCloseButtonBounds(Rectangle bounds) const
-{
-    return {
-        bounds.x + bounds.width - 28.0f,
-        bounds.y + 9.0f,
-        18.0f,
-        18.0f};
-}
-
-Rectangle LinkCardNode::GetCopyButtonBounds(Rectangle bounds) const
-{
-    return {
-        bounds.x + bounds.width - 28.0f,
-        bounds.y + bounds.height - 27.0f,
-        18.0f,
-        18.0f};
-}
-
-void LinkCardNode::DrawCopyButton(Rectangle bounds) const
-{
-    const Rectangle copyButton = GetCopyButtonBounds(bounds);
-    const bool isHovered = CheckCollisionPointRec(GetMousePosition(), copyButton);
-    const Color iconColor = isHovered ? Color{255, 244, 242, 255} : Color{244, 244, 244, 255};
-
-    const float pad = copyButton.width * 0.24f;
-    const float sheetWidth = copyButton.width - pad * 2.0f - 3.0f;
-    const float sheetHeight = copyButton.height - pad * 2.0f - 3.0f;
-    const Rectangle backSheet = {
-        copyButton.x + pad + 3.0f,
-        copyButton.y + pad + 3.0f,
-        sheetWidth,
-        sheetHeight};
-    const Rectangle frontSheet = {
-        copyButton.x + pad,
-        copyButton.y + pad,
-        sheetWidth,
-        sheetHeight};
-    const float roundness = 0.18f;
-
-    DrawRectangleRounded(backSheet, roundness, 6, Color{iconColor.r, iconColor.g, iconColor.b, 90});
-    DrawRectangleRounded(frontSheet, roundness, 6, Color{iconColor.r, iconColor.g, iconColor.b, 40});
-    DrawRectangleRoundedLines(frontSheet, roundness, 6, iconColor);
-    DrawLineEx(
-        {frontSheet.x + frontSheet.width * 0.28f, frontSheet.y + frontSheet.height * 0.62f},
-        {frontSheet.x + frontSheet.width * 0.72f, frontSheet.y + frontSheet.height * 0.62f},
-        1.5f,
-        iconColor);
-    DrawLineEx(
-        {frontSheet.x + frontSheet.width * 0.28f, frontSheet.y + frontSheet.height * 0.78f},
-        {frontSheet.x + frontSheet.width * 0.72f, frontSheet.y + frontSheet.height * 0.78f},
-        1.5f,
-        iconColor);
-    if (isHovered)
+    if (!hasDownloadElapsed_ && !hasConvertElapsed_ && lastDownloadedPath_.empty())
     {
-        UiCursor::RequestHand();
+        return false;
     }
+    return !ResolveOutputPathForReveal().empty();
+}
+
+std::string LinkCardNode::ResolveOutputPathForReveal() const
+{
+    std::error_code error;
+
+    const auto tryFindByStem = [&](const std::filesystem::path& dir, const std::string& stem) -> std::string
+    {
+        if (stem.empty() || !std::filesystem::is_directory(dir, error))
+        {
+            return {};
+        }
+        std::string underscored = stem;
+        for (char& ch : underscored)
+        {
+            if (ch == ' ')
+            {
+                ch = '_';
+            }
+        }
+        for (const auto& entry : std::filesystem::directory_iterator(dir, error))
+        {
+            if (error || !entry.is_regular_file(error))
+            {
+                continue;
+            }
+            const std::string fileStem = entry.path().stem().u8string();
+            if (fileStem == stem || fileStem == underscored)
+            {
+                return entry.path().u8string();
+            }
+        }
+        return {};
+    };
+
+    // After auto-convert, prefer the final delivery path over staging in Documents.
+    if (hasAutoConvertDelivery_ && hasConvertElapsed_ && !finalOutputDirectory_.empty())
+    {
+        const std::filesystem::path finalDir = std::filesystem::u8path(finalOutputDirectory_);
+        const std::string converted = tryFindByStem(finalDir, originalNormalizedTitle_);
+        if (!converted.empty())
+        {
+            return converted;
+        }
+        if (std::filesystem::is_directory(finalDir, error))
+        {
+            return finalOutputDirectory_;
+        }
+    }
+
+    if (!lastDownloadedPath_.empty())
+    {
+        const std::filesystem::path downloaded = std::filesystem::u8path(lastDownloadedPath_);
+        if (std::filesystem::exists(downloaded, error))
+        {
+            return lastDownloadedPath_;
+        }
+
+        const std::filesystem::path parent = downloaded.parent_path();
+        if (!parent.empty() && std::filesystem::is_directory(parent, error))
+        {
+            // Don't fall back to staging Documents folder after a completed auto-convert.
+            if (!(hasAutoConvertDelivery_ && hasConvertElapsed_))
+            {
+                return parent.u8string();
+            }
+        }
+    }
+
+    // Prefer converted output in the final delivery folder when present (pre-elapsed edge cases).
+    if (hasAutoConvertDelivery_ && !finalOutputDirectory_.empty())
+    {
+        const std::filesystem::path finalDir = std::filesystem::u8path(finalOutputDirectory_);
+        const std::string converted = tryFindByStem(finalDir, originalNormalizedTitle_);
+        if (!converted.empty())
+        {
+            return converted;
+        }
+    }
+
+    // Staging / expected download folder (auto-convert intermediate or normal download).
+    if (!expectedOutputDirectory_.empty())
+    {
+        const std::filesystem::path expectedDir = std::filesystem::u8path(expectedOutputDirectory_);
+        const std::string staged = tryFindByStem(expectedDir, expectedNormalizedTitle_);
+        if (!staged.empty())
+        {
+            return staged;
+        }
+        if (!expectedNormalizedTitle_.empty() && !expectedFileFormat_.empty() &&
+            std::filesystem::is_directory(expectedDir, error))
+        {
+            std::string ext = expectedFileFormat_;
+            for (char& c : ext)
+            {
+                if (c >= 'A' && c <= 'Z')
+                {
+                    c = static_cast<char>(c - 'A' + 'a');
+                }
+            }
+            const std::filesystem::path exact = expectedDir / (expectedNormalizedTitle_ + "." + ext);
+            if (std::filesystem::exists(exact, error))
+            {
+                return exact.u8string();
+            }
+        }
+        if (!(hasAutoConvertDelivery_ && hasConvertElapsed_) && std::filesystem::is_directory(expectedDir, error))
+        {
+            return expectedOutputDirectory_;
+        }
+    }
+
+    if (hasAutoConvertDelivery_ && !finalOutputDirectory_.empty())
+    {
+        const std::filesystem::path finalDir = std::filesystem::u8path(finalOutputDirectory_);
+        if (std::filesystem::is_directory(finalDir, error))
+        {
+            return finalOutputDirectory_;
+        }
+    }
+
+    return {};
 }
 
 void LinkCardNode::LoadThumbnail()
@@ -850,81 +1514,10 @@ void LinkCardNode::UnloadThumbnail()
     }
 }
 
-void LinkCardNode::DrawWrappedText(Font font, const std::string& text, Vector2 position, float fontSize, float maxWidth, int maxLines, Color color) const
-{
-    std::stringstream stream(text);
-    std::vector<std::string> lines;
-    std::string word;
-    std::string currentLine;
-
-    while (stream >> word)
-    {
-        const std::string candidate = currentLine.empty() ? word : currentLine + " " + word;
-        if (MeasureTextEx(font, candidate.c_str(), fontSize, 0.0f).x <= maxWidth)
-        {
-            currentLine = candidate;
-            continue;
-        }
-
-        if (!currentLine.empty())
-        {
-            lines.push_back(currentLine);
-            currentLine = word;
-        }
-        else
-        {
-            lines.push_back(word);
-            currentLine.clear();
-        }
-
-        if (static_cast<int>(lines.size()) >= maxLines)
-        {
-            break;
-        }
-    }
-
-    if (!currentLine.empty() && static_cast<int>(lines.size()) < maxLines)
-    {
-        lines.push_back(currentLine);
-    }
-
-    for (int index = 0; index < static_cast<int>(lines.size()); ++index)
-    {
-        DrawTextEx(font, lines[index].c_str(), {position.x, position.y + static_cast<float>(index) * (fontSize + 3.0f)}, fontSize, 0.0f, color);
-    }
-}
-
-void LinkCardNode::DrawCloseButton(Rectangle bounds) const
-{
-    const Rectangle closeButton = GetCloseButtonBounds(bounds);
-    const bool isHovered = CheckCollisionPointRec(GetMousePosition(), closeButton);
-    const Color color = isHovered ? Color{255, 96, 86, 255} : Color{220, 72, 64, 255};
-    const float padding = 4.0f;
-
-    DrawLineEx(
-        {closeButton.x + padding, closeButton.y + padding},
-        {closeButton.x + closeButton.width - padding, closeButton.y + closeButton.height - padding},
-        2.0f,
-        color);
-    DrawLineEx(
-        {closeButton.x + closeButton.width - padding, closeButton.y + padding},
-        {closeButton.x + padding, closeButton.y + closeButton.height - padding},
-        2.0f,
-        color);
-    if (isHovered)
-    {
-        UiCursor::RequestHand();
-    }
-}
-
 Rectangle LinkCardNode::GetDownloadStatusBounds(Rectangle bounds, Font font, float x, const std::string& label) const
 {
     const float width = MeasureTextEx(font, label.c_str(), 15.0f, 0.0f).x;
-    return {
-        x - 3.0f,
-        bounds.y + 45.0f,
-        width + 6.0f,
-        24.0f};
+    return {x - 3.0f, bounds.y + 45.0f, width + 6.0f, 24.0f};
 }
 
 void LinkCardNode::DrawBackgroundProgress(Rectangle bounds, float roundness) const
@@ -940,13 +1533,19 @@ void LinkCardNode::DrawBackgroundProgress(Rectangle bounds, float roundness) con
         return;
     }
 
-    BeginScissorMode(
-        static_cast<int>(bounds.x),
-        static_cast<int>(bounds.y),
-        static_cast<int>(fillWidth),
-        static_cast<int>(bounds.height));
-    DrawRectangleRounded(bounds, roundness, 16, Color{52, 104, 52, 120});
-    EndScissorMode();
+    Color fillColor = Color{52, 104, 52, 120}; // downloading
+    if (isConverting_ || busyStatusLabel_ == "converting")
+    {
+        fillColor = Color{52, 92, 148, 120}; // converting
+    }
+    else if (busyStatusLabel_ == "merging")
+    {
+        fillColor = Color{168, 140, 48, 120}; // merging
+    }
+
+    UiClip::Push({bounds.x, bounds.y, fillWidth, bounds.height});
+    DrawRectangleRounded(bounds, roundness, 16, fillColor);
+    UiClip::Pop();
 }
 
 void LinkCardNode::DrawMiniSpinner(Vector2 center) const
@@ -957,19 +1556,31 @@ void LinkCardNode::DrawMiniSpinner(Vector2 center) const
     {
         const float angle = static_cast<float>(time * 6.0 + index * (6.2831853 / segments));
         const float alpha = static_cast<float>(index + 1) / static_cast<float>(segments);
-        const Vector2 start = {
-            center.x + std::cos(angle) * 4.0f,
-            center.y + std::sin(angle) * 4.0f};
-        const Vector2 end = {
-            center.x + std::cos(angle) * 7.0f,
-            center.y + std::sin(angle) * 7.0f};
+        const Vector2 start = {center.x + std::cos(angle) * 4.0f, center.y + std::sin(angle) * 4.0f};
+        const Vector2 end = {center.x + std::cos(angle) * 7.0f, center.y + std::sin(angle) * 7.0f};
         DrawLineEx(start, end, 1.5f, Color{160, 178, 160, static_cast<unsigned char>(70 + alpha * 150)});
     }
 }
 
+void LinkCardNode::EnsureDetailedParse()
+{
+    if (!needsDetailedParse_ || isParsing_ || isDetailParsing_ || loader_.IsLoading() || info_.url.empty())
+    {
+        return;
+    }
+    needsDetailedParse_ = false;
+    isDetailParsing_ = true;
+    loader_.Start(info_.url);
+}
+
+bool LinkCardNode::NeedsDetailedParse() const
+{
+    return needsDetailedParse_;
+}
+
 void LinkCardNode::ApplyParseResultIfReady()
 {
-    if (!isParsing_)
+    if (!isParsing_ && !isDetailParsing_)
     {
         return;
     }
@@ -981,6 +1592,33 @@ void LinkCardNode::ApplyParseResultIfReady()
     }
 
     const LinkInfo result = loader_.GetResult();
+
+    if (isDetailParsing_)
+    {
+        isDetailParsing_ = false;
+        if (result.cancelled || !result.success)
+        {
+            return;
+        }
+        // Only update format-related fields; preserve existing title/thumbnail/duration.
+        info_.formatStreams = result.formatStreams;
+        info_.availableFormats = result.availableFormats;
+        info_.availableVideoFormats = result.availableVideoFormats;
+        info_.availableAudioFormats = result.availableAudioFormats;
+        info_.availableQualities = result.availableQualities;
+        if (info_.title.empty() && !result.title.empty())
+            info_.title = result.title;
+        if (info_.duration.empty() && !result.duration.empty())
+            info_.duration = result.duration;
+        if (info_.thumbnailPath.empty() && !result.thumbnailPath.empty())
+        {
+            UnloadThumbnail();
+            triedLoadingThumbnail_ = false;
+            info_.thumbnailPath = result.thumbnailPath;
+        }
+        return;
+    }
+
     isParsing_ = false;
     if (result.cancelled)
     {

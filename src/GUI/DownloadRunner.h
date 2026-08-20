@@ -7,7 +7,8 @@
 #include <mutex>
 #include <string>
 
-struct DownloadRequest {
+struct DownloadRequest
+{
     std::string url;
     std::string title;
     std::string normalizedTitle;
@@ -15,23 +16,35 @@ struct DownloadRequest {
     std::string fileFormat;
     std::string mediaMode;
     std::string quality;
+    std::string finalOutputDirectory;
+    std::string originalNormalizedTitle;
+    bool autoConvertActive = false;
     bool overwriteExisting = false;
 };
 
-struct DownloadSharedState {
+struct DownloadSharedState
+{
     mutable std::mutex mutex;
     std::string status;
     float progress = 0.0f;
+    enum class Phase
+    {
+        Downloading,
+        Merging,
+    };
+    Phase phase = Phase::Downloading;
 };
 
-struct DownloadRunResult {
+struct DownloadRunResult
+{
     std::string status;
     std::string errorLog;
     std::string downloadBrowserReport;
     int exitCode = 0;
 };
 
-class DownloadRunner {
+class DownloadRunner
+{
 public:
     void Start(DownloadRequest request);
     void Cancel();
@@ -41,18 +54,21 @@ public:
     const std::string& Status() const;
     const std::string& CurrentUrl() const;
     float Progress() const;
+    DownloadSharedState::Phase Phase() const;
     double ElapsedSeconds() const;
     bool ConsumeCompletedDownload(std::string& url, double& elapsedSeconds);
     void SetStatus(std::string status);
     const std::string& LastErrorLog() const;
     const std::string& LastDownloadBrowserReport() const;
-    static void SetSharedStatus(const std::shared_ptr<DownloadSharedState>& sharedState, const std::string& status, float progress);
+    static void SetSharedStatus(const std::shared_ptr<DownloadSharedState>& sharedState,
+                                const std::string& status,
+                                float progress,
+                                DownloadSharedState::Phase phase = DownloadSharedState::Phase::Downloading);
 
 private:
-    static DownloadRunResult Run(
-        DownloadRequest request,
-        std::shared_ptr<std::atomic_bool> cancelRequested,
-        std::shared_ptr<DownloadSharedState> sharedState);
+    static DownloadRunResult Run(DownloadRequest request,
+                                 std::shared_ptr<std::atomic_bool> cancelRequested,
+                                 std::shared_ptr<DownloadSharedState> sharedState);
     static std::string Quote(const std::string& value);
 
     std::future<DownloadRunResult> future_;
@@ -67,6 +83,7 @@ private:
     double elapsedSeconds_ = 0.0;
     double completedElapsedSeconds_ = 0.0;
     float progress_ = 0.0f;
+    DownloadSharedState::Phase phase_ = DownloadSharedState::Phase::Downloading;
     bool hasCompletedDownload_ = false;
     bool isRunning_ = false;
 };

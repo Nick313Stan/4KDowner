@@ -2,7 +2,8 @@
 
 #include "raylib.h"
 
-class LoadingSpinner {
+class LoadingSpinner
+{
 public:
     void Draw(Vector2 center, float radius) const;
 };

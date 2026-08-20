@@ -1,0 +1,6 @@
+# Point clangd at the Linux CMake build (compile_commands.json).
+CompileFlags:
+  Add:
+    - "-Wall"
+    - "-Wextra"
+CompilationDatabase: build-linux

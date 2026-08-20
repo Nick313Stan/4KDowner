@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Welcome → Destination Folder → Ready to Install. No License, no Repair/Remove. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Fragment>
+    <UI Id="WixUI_InstallDir_NoLicense">
+      <DialogRef Id="ReinstallReadyDlg" />
+
+      <!-- Skip license -->
+      <Publish Dialog="WelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="5" Condition="1" />
+      <Publish Dialog="InstallDirDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="5" Condition="1" />
+
+      <!-- Reinstall uses its own Ready screen (default VerifyReadyDlg hides Install when Installed=1) -->
+      <Publish
+          Dialog="InstallDirDlg"
+          Control="Next"
+          Event="NewDialog"
+          Value="ReinstallReadyDlg"
+          Order="5"
+          Condition="(WIXUI_DONTVALIDATEPATH OR WIXUI_INSTALLDIR_VALID=&quot;1&quot;) AND Installed" />
+      <Publish Dialog="ReinstallReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="5" Condition="1" />
+
+      <!-- Never navigate into Repair/Remove (default Back from Ready goes to MaintenanceTypeDlg when Installed) -->
+      <Publish Dialog="VerifyReadyDlg" Control="Back" Event="NewDialog" Value="InstallDirDlg" Order="5" Condition="1" />
+
+      <!-- Safety net if maintenance dialogs ever appear -->
+      <Publish Dialog="MaintenanceWelcomeDlg" Control="Next" Event="NewDialog" Value="InstallDirDlg" Order="5" Condition="1" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="ChangeButton" Event="NewDialog" Value="InstallDirDlg" Order="5" Condition="1" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RepairButton" Event="NewDialog" Value="InstallDirDlg" Order="5" Condition="1" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="RemoveButton" Event="NewDialog" Value="InstallDirDlg" Order="5" Condition="1" />
+      <Publish Dialog="MaintenanceTypeDlg" Control="Back" Event="NewDialog" Value="WelcomeDlg" Order="5" Condition="1" />
+    </UI>
+
+    <InstallUISequence>
+      <!-- Match WixUI scheduling (Before ProgressDlg) and disable maintenance -->
+      <Show Dialog="override MaintenanceWelcomeDlg" Before="ProgressDlg" Condition="0" />
+      <!-- Always the first-time wizard; do not require NOT Installed -->
+      <Show Dialog="override WelcomeDlg" Before="ProgressDlg" Condition="NOT REMOVE" />
+      <!-- Do not treat REINSTALL/Preselected as "resume maintenance" -->
+      <Show Dialog="override ResumeDlg" Before="ProgressDlg" Condition="Installed AND RESUME" />
+    </InstallUISequence>
+  </Fragment>
+</Wix>

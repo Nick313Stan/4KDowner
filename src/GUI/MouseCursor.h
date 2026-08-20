@@ -2,7 +2,8 @@
 
 #include "raylib.h"
 
-namespace UiCursor {
+namespace UiCursor
+{
 inline int frameCursor = MOUSE_CURSOR_ARROW;
 
 inline void BeginFrame()
@@ -19,4 +20,4 @@ inline void ApplyFrame()
 {
     SetMouseCursor(frameCursor);
 }
-}
+} // namespace UiCursor

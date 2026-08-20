@@ -3,7 +3,8 @@
 #include <future>
 #include <string>
 
-struct ConverterFileInfo {
+struct ConverterFileInfo
+{
     bool success = false;
     std::string filePath;
     std::string fileName;
@@ -12,16 +13,28 @@ struct ConverterFileInfo {
     std::string container;
     std::string videoCodec;
     std::string audioCodec;
+    int width = 0;
+    int height = 0;
+    std::string resolution;
     std::string previewPath;
     std::string error;
 };
 
-class ConverterInfoLoader {
+class ConverterInfoLoader
+{
 public:
+    ConverterInfoLoader() = default;
+    ~ConverterInfoLoader();
+    ConverterInfoLoader(const ConverterInfoLoader&) = delete;
+    ConverterInfoLoader& operator=(const ConverterInfoLoader&) = delete;
+    ConverterInfoLoader(ConverterInfoLoader&& other) noexcept;
+    ConverterInfoLoader& operator=(ConverterInfoLoader&& other) noexcept;
+
     void Start(std::string filePath);
     void Cancel();
     void Update();
     void ClearResult();
+    static void ReapAbandoned();
 
     bool IsLoading() const;
     bool HasResult() const;
@@ -30,6 +43,7 @@ public:
 private:
     static ConverterFileInfo Load(std::string filePath);
     static std::string Quote(const std::string& value);
+    void AbandonRunningWork();
 
     std::future<ConverterFileInfo> future_;
     ConverterFileInfo result_;
