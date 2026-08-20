@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot Linux release packager:
-#   portable folder + tar.gz archive → ../yCompiled/4KDownerCompiled/Linux/
+#   portable folder + tar.gz archive → ../yCompiled/4KDownerCompiled/
 #
 # Usage:
 #   ./scripts/Linux/main.sh
@@ -49,7 +49,7 @@ done
 
 RELEASE_NAME="4KDowner-${APP_VERSION}-linux-x64"
 if [[ -z "$OUT_ROOT" ]]; then
-  OUT_ROOT="$CODING_ROOT/yCompiled/4KDownerCompiled/Linux"
+  OUT_ROOT="$CODING_ROOT/yCompiled/4KDownerCompiled"
 fi
 PORTABLE_ROOT="$OUT_ROOT/$RELEASE_NAME"
 ARCHIVE_PATH="$OUT_ROOT/${RELEASE_NAME}.tar.gz"

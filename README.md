@@ -111,6 +111,8 @@ Coding/
       4KDowner-1.1.0-windows-x64/          ← portable
       4KDowner-1.1.0-windows-x64.zip
       4KDowner-1.1.0-windows-x64.msi
+      4KDowner-1.1.0-linux-x64/            ← portable (Linux)
+      4KDowner-1.1.0-linux-x64.tar.gz
 ```
 
 ### Windows one-shot (`main.ps1`)
@@ -154,7 +156,7 @@ chmod +x scripts/Linux/main.sh
 ./scripts/Linux/main.sh
 ```
 
-Output under `../yCompiled/4KDownerCompiled/Linux/`:
+Output under `../yCompiled/4KDownerCompiled/` (same root as Windows):
 - `4KDowner-1.1.0-linux-x64/` (portable folder)
 - `4KDowner-1.1.0-linux-x64.tar.gz`
 
