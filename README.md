@@ -108,9 +108,9 @@ Coding/
   4KDowner/
   yCompiled/
     4KDownerCompiled/
-      4KDowner-1.0.0-windows-x64/          ← portable
-      4KDowner-1.0.0-windows-x64.zip
-      4KDowner-1.0.0-windows-x64.msi
+      4KDowner-1.1.0-windows-x64/          ← portable
+      4KDowner-1.1.0-windows-x64.zip
+      4KDowner-1.1.0-windows-x64.msi
 ```
 
 ### Windows one-shot (`main.ps1`)
@@ -155,8 +155,8 @@ chmod +x scripts/Linux/main.sh
 ```
 
 Output under `../yCompiled/4KDownerCompiled/Linux/`:
-- `4KDowner-1.0.0-linux-x64/` (portable folder)
-- `4KDowner-1.0.0-linux-x64.tar.gz`
+- `4KDowner-1.1.0-linux-x64/` (portable folder)
+- `4KDowner-1.1.0-linux-x64.tar.gz`
 
 Optional: `--skip-archive`, `--ensure-ytdown`.
 

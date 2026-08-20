@@ -1,7 +1,7 @@
 param(
     [switch]$RebuildPortable,
     [string]$OutRoot = "",
-    [string]$AppVersion = "1.0.0",
+    [string]$AppVersion = "1.1.0",
     [string]$PortableRoot = "",
     [string]$MsiOut = ""
 )

@@ -6,13 +6,13 @@
 # Optional:
 #   -EnsureYtDown   refresh packages/ytdown portable Python/yt-dlp
 #   -OutRoot        output root (default: ../yCompiled/4KDownerCompiled)
-#   -AppVersion     version segment in folder name (default: 1.0.0)
+#   -AppVersion     version segment in folder name (default: 1.1.0)
 #   -PortableRoot   override full portable folder path
 
 param(
     [switch]$EnsureYtDown,
     [string]$OutRoot = "",
-    [string]$AppVersion = "1.0.0",
+    [string]$AppVersion = "1.1.0",
     [string]$PortableRoot = ""
 )
 

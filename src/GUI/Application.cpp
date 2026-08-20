@@ -10,7 +10,7 @@
 #include <vector>
 
 #ifndef FOURKDOWNER_VERSION
-#define FOURKDOWNER_VERSION "1.0.0"
+#define FOURKDOWNER_VERSION "1.1.0"
 #endif
 
 #ifdef _WIN32
