@@ -1,7 +1,7 @@
 # 4KDowner
 
 <p align="center">
-  <img src="assets/4KDowner_screen.png" alt="4KDowner" width="1024">
+  <img src="assets/4KDowner-Screen-1.1.0.png" alt="4KDowner" width="1024">
 </p>
 
 Desktop app for downloading online video and converting media files on **Windows** and **Linux**.
