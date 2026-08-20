@@ -153,7 +153,7 @@ chmod +x scripts/Linux/main.sh
 ./scripts/Linux/main.sh
 ```
 
-Output under `../yCompiled/4KDownerCompiled/`:
+Output under `../yCompiled/4KDownerCompiled/Linux/`:
 - `4KDowner-1.0.0-linux-x64/` (portable folder)
 - `4KDowner-1.0.0-linux-x64.tar.gz`
 

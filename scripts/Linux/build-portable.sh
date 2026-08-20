@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Build portable folder only → ../yCompiled/4KDownerCompiled/4KDowner-<ver>-linux-x64/
+# Build portable folder only → ../yCompiled/4KDownerCompiled/Linux/4KDowner-<ver>-linux-x64/
 #
 # Usage:
 #   ./scripts/Linux/build-portable.sh
 #
 # Optional:
 #   --ensure-ytdown   refresh packages/ytdown/bin/yt-dlp if missing
-#   --out-root DIR    output root (default: ../yCompiled/4KDownerCompiled)
+#   --out-root DIR    output root (default: ../yCompiled/4KDownerCompiled/Linux)
 #   --app-version VER version segment in folder name (default: 1.0.0)
 #   --portable-root DIR  override full portable folder path
 #   --build-dir DIR   CMake build dir (default: <repo>/build-linux)
@@ -46,7 +46,7 @@ done
 
 RELEASE_NAME="4KDowner-${APP_VERSION}-linux-x64"
 if [[ -z "$OUT_ROOT" ]]; then
-  OUT_ROOT="$CODING_ROOT/yCompiled/4KDownerCompiled"
+  OUT_ROOT="$CODING_ROOT/yCompiled/4KDownerCompiled/Linux"
 fi
 if [[ -z "$PORTABLE_ROOT" ]]; then
   PORTABLE_ROOT="$OUT_ROOT/$RELEASE_NAME"
