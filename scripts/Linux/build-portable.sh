@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
-# Build portable folder only → ../yCompiled/4KDownerCompiled/4KDowner-<ver>-linux-x64/
+# Build portable folder only → ../yCompiled/4KDowner-<ver>-linux-x64/
 #
 # Usage:
 #   ./scripts/Linux/build-portable.sh
 #
 # Optional:
 #   --ensure-ytdown   refresh packages/ytdown/bin/yt-dlp if missing
-#   --out-root DIR    output root (default: ../yCompiled/4KDownerCompiled)
-#   --app-version VER version segment in folder name (default: 1.1.0)
+#   --out-root DIR    output root (default: ../yCompiled)
+#   --app-version VER version segment in folder name (default: from CMakeLists.txt)
 #   --portable-root DIR  override full portable folder path
 #   --build-dir DIR   CMake build dir (default: <repo>/build-linux)
 
@@ -16,13 +16,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_ensure-console.sh
 source "$SCRIPT_DIR/_ensure-console.sh"
+# shellcheck source=project-version.sh
+source "$SCRIPT_DIR/project-version.sh"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CODING_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
 PACKAGES_ROOT="$CODING_ROOT/packages"
 
 ENSURE_YTDOWN=0
 OUT_ROOT=""
-APP_VERSION="1.1.0"
+APP_VERSION=""
 PORTABLE_ROOT=""
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build-linux}"
 
@@ -44,9 +46,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$APP_VERSION" ]]; then
+  APP_VERSION="$(get_project_app_version "$PROJECT_ROOT")"
+fi
+
 RELEASE_NAME="4KDowner-${APP_VERSION}-linux-x64"
 if [[ -z "$OUT_ROOT" ]]; then
-  OUT_ROOT="$CODING_ROOT/yCompiled/4KDownerCompiled"
+  OUT_ROOT="$CODING_ROOT/yCompiled"
 fi
 if [[ -z "$PORTABLE_ROOT" ]]; then
   PORTABLE_ROOT="$OUT_ROOT/$RELEASE_NAME"

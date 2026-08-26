@@ -1,21 +1,28 @@
 param(
     [switch]$RebuildPortable,
     [string]$OutRoot = "",
-    [string]$AppVersion = "1.1.0",
+    [string]$AppVersion = "",
     [string]$PortableRoot = "",
     [string]$MsiOut = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-# Layout: 4KDowner/scripts/Windows → project root, sibling ../yCompiled/4KDownerCompiled
+# Layout: 4KDowner/scripts/Windows → project root, sibling ../yCompiled
 $ScriptsDir = $PSScriptRoot
+. (Join-Path $ScriptsDir "ProjectVersion.ps1")
+
 $ProjectRoot = Split-Path (Split-Path $ScriptsDir -Parent) -Parent
 $CodingRoot = Split-Path $ProjectRoot -Parent
+
+if ([string]::IsNullOrWhiteSpace($AppVersion)) {
+    $AppVersion = Get-ProjectAppVersion -ProjectRoot $ProjectRoot
+}
+
 $ReleaseName = "4KDowner-$AppVersion-windows-x64"
 
 if ([string]::IsNullOrWhiteSpace($OutRoot)) {
-    $OutRoot = Join-Path $CodingRoot "yCompiled\4KDownerCompiled"
+    $OutRoot = Join-Path $CodingRoot "yCompiled"
 }
 if ([string]::IsNullOrWhiteSpace($PortableRoot)) {
     $PortableRoot = Join-Path $OutRoot $ReleaseName
@@ -73,7 +80,7 @@ if (Test-Path $MsiBuild) {
     Remove-Item $MsiBuild -Force
 }
 
-Write-Host "Building MSI from $PortableRoot ..."
+Write-Host "Building MSI (version $AppVersion) from $PortableRoot ..."
 wix build `
     (Join-Path $MsiDir "4KDowner.wxs") `
     (Join-Path $MsiDir "WixUI_InstallDir_NoLicense.wxs") `
@@ -82,6 +89,7 @@ wix build `
     -culture en-us `
     -loc (Join-Path $MsiDir "en-us.wxl") `
     -arch x64 `
+    -d "ProductVersion=$AppVersion" `
     -b "Portable=$PortableRoot" `
     -b "Branding=$BrandingDir" `
     -b "Assets=$AssetsDir" `
@@ -99,6 +107,11 @@ try {
 } catch {
     $MsiOut = $MsiBuild
     Write-Host "Note: could not replace locked MSI, left as $MsiOut"
+}
+
+$WixPdb = [System.IO.Path]::ChangeExtension($MsiBuild, ".wixpdb")
+if (Test-Path $WixPdb) {
+    Remove-Item $WixPdb -Force
 }
 
 $SizeMb = [math]::Round((Get-Item $MsiOut).Length / 1MB, 1)

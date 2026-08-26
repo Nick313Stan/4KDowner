@@ -1,9 +1,11 @@
 #include "Dropdown.h"
 
 #include "DownloadFormatPredictor.h"
+#include "Scrollbar.h"
 #include "UiClip.h"
 
 #include <algorithm>
+#include <cmath>
 
 Dropdown::Dropdown(std::vector<std::string> items)
     : items_(std::move(items))
@@ -34,13 +36,50 @@ bool Dropdown::Update(Rectangle bounds, int& selectedIndex, const Rectangle* hit
         return true;
     };
 
-    if (isOpen_ && CheckCollisionPointRec(mouse, popupBounds))
+    if (isOpen_)
+    {
+        if (maxScroll > 0.0f && (scrollbar_.IsDragging() || CheckCollisionPointRec(mouse, popupBounds)))
+        {
+            if (scrollbar_.Update(popupBounds, scrollOffset_, maxScroll))
+            {
+                return true;
+            }
+        }
+        if (CheckCollisionPointRec(mouse, popupBounds))
+        {
+            const float wheel = GetMouseWheelMove();
+            if (wheel != 0.0f)
+            {
+                scrollOffset_ = std::clamp(scrollOffset_ - wheel * bounds.height * 2.0f, 0.0f, maxScroll);
+                return true;
+            }
+        }
+    }
+
+    // Closed control: Ctrl + wheel steps options without opening the popup (no wrap).
+    if (!isOpen_ && mouseInControl() && (IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)))
     {
         const float wheel = GetMouseWheelMove();
         if (wheel != 0.0f)
         {
-            scrollOffset_ = std::clamp(scrollOffset_ - wheel * bounds.height * 2.0f, 0.0f, maxScroll);
-            return true;
+            const int itemCount = static_cast<int>(items_.size());
+            if (itemCount <= 0)
+            {
+                return false;
+            }
+
+            const int start = std::clamp(selectedIndex, 0, itemCount - 1);
+            const int step = wheel > 0.0f ? -1 : 1;
+            for (int candidate = start + step; candidate >= 0 && candidate < itemCount; candidate += step)
+            {
+                if (IsInactiveItem(items_[static_cast<size_t>(candidate)]))
+                {
+                    continue;
+                }
+                selectedIndex = candidate;
+                return true;
+            }
+            return true; // at end / only inactive beyond — consume wheel, keep selection
         }
     }
 
@@ -69,13 +108,11 @@ bool Dropdown::Update(Rectangle bounds, int& selectedIndex, const Rectangle* hit
                     }
 
                     selectedIndex = index;
-                    isOpen_ = false;
-                    scrollOffset_ = 0.0f;
+                    Close();
                     return true;
                 }
             }
-            isOpen_ = false;
-            scrollOffset_ = 0.0f;
+            Close();
             return true;
         }
     }
@@ -137,6 +174,28 @@ void Dropdown::DrawControl(Rectangle bounds, Font font, int selectedIndex, bool 
     DrawLineEx({chevronCenterX, chevronCenterY + 2.0f}, {chevronCenterX + 4.0f, chevronCenterY - 2.0f}, 2.0f, text);
 }
 
+void Dropdown::DrawBusyControl(Rectangle bounds, Font font, const std::string& label) const
+{
+    const Color background = Color{24, 28, 24, 255};
+    const Color text = Color{126, 136, 126, 255};
+    DrawRectangleRounded(bounds, 0.22f, 10, background);
+
+    const Vector2 labelSize = MeasureTextEx(font, label.c_str(), 15.0f, 0.0f);
+    DrawTextEx(font, label.c_str(), {bounds.x + 8.0f, bounds.y + 5.0f}, 15.0f, 0.0f, text);
+
+    const Vector2 spinnerCenter = {bounds.x + 8.0f + labelSize.x + 14.0f, bounds.y + bounds.height * 0.5f};
+    const double time = GetTime();
+    constexpr int kSegments = 8;
+    for (int index = 0; index < kSegments; ++index)
+    {
+        const float angle = static_cast<float>(time * 6.0 + index * (6.2831853 / kSegments));
+        const float alpha = static_cast<float>(index + 1) / static_cast<float>(kSegments);
+        const Vector2 start = {spinnerCenter.x + std::cos(angle) * 3.5f, spinnerCenter.y + std::sin(angle) * 3.5f};
+        const Vector2 end = {spinnerCenter.x + std::cos(angle) * 6.0f, spinnerCenter.y + std::sin(angle) * 6.0f};
+        DrawLineEx(start, end, 1.5f, Color{160, 178, 160, static_cast<unsigned char>(70 + alpha * 150)});
+    }
+}
+
 void Dropdown::DrawPopup(Rectangle bounds, Font font, int selectedIndex) const
 {
     if (!isOpen_ || items_.empty())
@@ -193,13 +252,7 @@ void Dropdown::DrawPopup(Rectangle bounds, Font font, int selectedIndex) const
 
     if (maxScroll > 0.0f)
     {
-        const float trackHeight = popupBounds.height - 8.0f;
-        const float contentHeight = bounds.height * static_cast<float>(items_.size());
-        const float thumbHeight = std::max(18.0f, trackHeight * popupBounds.height / contentHeight);
-        const float thumbTravel = trackHeight - thumbHeight;
-        const float thumbY = popupBounds.y + 4.0f + (scrollOffset_ / maxScroll) * thumbTravel;
-        const Rectangle thumbBounds = {popupBounds.x + popupBounds.width - 6.0f, thumbY, 3.0f, thumbHeight};
-        DrawRectangleRounded(thumbBounds, 0.8f, 6, Color{118, 142, 118, 210});
+        scrollbar_.Draw(popupBounds, scrollOffset_, maxScroll);
     }
 }
 
@@ -211,14 +264,14 @@ void Dropdown::SetItems(std::vector<std::string> items)
     }
 
     items_ = std::move(items);
-    isOpen_ = false;
-    scrollOffset_ = 0.0f;
+    Close();
 }
 
 void Dropdown::Close()
 {
     isOpen_ = false;
     scrollOffset_ = 0.0f;
+    scrollbar_.Reset();
 }
 
 bool Dropdown::IsOpen() const

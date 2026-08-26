@@ -6,10 +6,13 @@
 #include "ConverterFileCardNode.h"
 #include "DownloaderListItemInclude.h"
 #include "DownloadRunner.h"
+#include "DownloadSpeedHistory.h"
 #include "Dropdown.h"
 #include "FoldoutPanel.h"
+#include "FooterDownloadSpeedMeter.h"
 #include "LinkCardNode.h"
 #include "PathField.h"
+#include "Scrollbar.h"
 #include "ShortcutRouter.h"
 #include "UndoStack.h"
 
@@ -25,6 +28,8 @@
 class DockArea
 {
 public:
+    static constexpr float kFooterMetaFontSize = 13.0f;
+
     DockArea();
 
     void Update(int windowWidth, int windowHeight, Font font);
@@ -79,6 +84,7 @@ private:
     Rectangle GetInsertLinkButtonBounds(Rectangle leftPanel) const;
     Rectangle GetChooseFileButtonBounds(Rectangle leftPanel) const;
     Rectangle GetListActionButtonBounds(Rectangle leftPanel, int index, float scrollOffset) const;
+    void DrawInsertLinkShortcutHints(Rectangle buttonBounds, Font font) const;
     Rectangle GetDownloadButtonBounds(Rectangle settingsPanel) const;
     Rectangle GetSecondaryActionButtonBounds(Rectangle settingsPanel) const;
     struct SettingsActionGrid
@@ -100,15 +106,50 @@ private:
     Rectangle
     GetDownloaderGroupChildBounds(Rectangle leftPanel, int itemIndex, int childIndex, float scrollOffset) const;
     Rectangle GetDownloaderGroupLoadMoreBounds(Rectangle leftPanel, int itemIndex, float scrollOffset) const;
+    Rectangle GetDownloaderGroupCollapseBounds(Rectangle leftPanel, int itemIndex, float scrollOffset) const;
+    Rectangle GetDownloaderGroupPaginationRowBounds(Rectangle leftPanel, int itemIndex, float scrollOffset) const;
+    Rectangle GetDownloaderChannelTabBounds(Rectangle leftPanel, int itemIndex, int tabIndex, float scrollOffset) const;
+    Rectangle GetDownloaderChannelTabChildBounds(
+        Rectangle leftPanel, int itemIndex, int tabIndex, int childIndex, float scrollOffset) const;
+    Rectangle
+    GetDownloaderChannelTabLoadMoreBounds(Rectangle leftPanel, int itemIndex, int tabIndex, float scrollOffset) const;
+    Rectangle
+    GetDownloaderChannelTabCollapseBounds(Rectangle leftPanel, int itemIndex, int tabIndex, float scrollOffset) const;
+    Rectangle GetDownloaderChannelTabPaginationRowBounds(Rectangle leftPanel,
+                                                         int itemIndex,
+                                                         int tabIndex,
+                                                         float scrollOffset) const;
+    Rectangle
+    GetDownloaderPlaylistShelfItemBounds(Rectangle leftPanel, int itemIndex, int shelfIndex, float scrollOffset) const;
+    Rectangle GetDownloaderPlaylistShelfChildBounds(
+        Rectangle leftPanel, int itemIndex, int shelfIndex, int childIndex, float scrollOffset) const;
+    Rectangle GetDownloaderPlaylistShelfLoadMoreBounds(Rectangle leftPanel,
+                                                       int itemIndex,
+                                                       int shelfIndex,
+                                                       float scrollOffset) const;
+    Rectangle GetDownloaderPlaylistShelfCollapseBounds(Rectangle leftPanel,
+                                                       int itemIndex,
+                                                       int shelfIndex,
+                                                       float scrollOffset) const;
+    Rectangle GetDownloaderPlaylistShelfPaginationRowBounds(Rectangle leftPanel,
+                                                            int itemIndex,
+                                                            int shelfIndex,
+                                                            float scrollOffset) const;
     Rectangle GetDownloaderActionSlotBounds(Rectangle leftPanel, float scrollOffset) const;
     LinkCardNode* FindLinkCardByUrl(const std::string& url);
     const LinkCardNode* FindLinkCardByUrl(const std::string& url) const;
+    // Prefer InQueue card whose rebuilt output identity matches the request (not first URL hit).
+    LinkCardNode* FindQueuedLinkCardForRequest(const DownloadRequest& request);
+    // URL + expected dir/stem/format — same key as DownloadRunner::MakeOutputIdentity.
+    static std::string MakeLinkCardOutputIdentity(const LinkCardNode& card);
+    bool CardMatchesDownloadRunner(const LinkCardNode& card, const DownloadRunner& runner) const;
     void ForEachLinkCard(const std::function<void(LinkCardNode&)>& visitor);
     void ForEachLinkCard(const std::function<void(const LinkCardNode&)>& visitor) const;
     int CountDownloaderSelectableUnits() const;
     float GetCardListScrollbarReserve(Rectangle leftPanel, int itemCount) const;
     float GetMaxCardScroll(Rectangle leftPanel, float contentHeight, float reservedBottom = 0.0f) const;
-    void UpdateCardScroll(Rectangle leftPanel, float contentHeight, float reservedBottom, float& scrollOffset) const;
+    void UpdateCardScroll(
+        Rectangle leftPanel, float contentHeight, float reservedBottom, float& scrollOffset, Scrollbar& scrollbar);
 
     void UpdateHeader();
     void UpdateDownloaderWorkspace(Rectangle leftPanel, Rectangle rightPanel, Font font);
@@ -120,7 +161,7 @@ private:
     void NavigateDownloaderSelection(int delta, Rectangle leftPanel, bool allowModifiers = true);
     void NavigateConverterSelection(int delta, Rectangle leftPanel, bool allowModifiers = true);
     void EnsureCardVisibleInList(Rectangle leftPanel, int index, float& scrollOffset) const;
-    void CloseLinkCardAt(int index);
+    void CloseLinkCardAt(int index, bool allowHoverChildDelete = true);
     void CloseConverterCardAt(int index);
     void RecordLinkCardRemoval(int index);
     void RecordConverterCardRemoval(int index);
@@ -167,6 +208,8 @@ private:
     bool CanBuildAnyConvertRequest() const;
     void HandleDownloadRequest();
     void HandleDownloadAllRequest();
+    void RegisterPendingPlaylistShelfDownload(const LinkCardGroupNode& group, int shelfIndex);
+    void TryFlushPlaylistShelfDownloads();
     bool HasDownloadableIdleCards() const;
     bool HasValidDownloadCards() const;
     bool CanDownloadSelected() const;
@@ -185,9 +228,10 @@ private:
     DownloadRunner* FindLowestProgressDownloadRunner();
     void ClearBatchQueueStates();
     bool BuildDownloadRequestForCard(LinkCardNode& card, DownloadRequest& request);
+    void FillBusyDownloadIdentities(std::unordered_set<std::string>& claimed) const;
     bool PrepareDownloadRequest(DownloadRequest& request);
     bool StartNextPendingDownload();
-    void StartDownload(DownloadRequest request);
+    void StartDownload(DownloadRequest request, LinkCardNode* targetCard = nullptr);
     void HandleConvertRequest();
     void HandleConvertAllRequest();
     bool BuildConvertRequestForCard(const ConverterFileCardNode& card, ConvertRequest& request) const;
@@ -236,7 +280,7 @@ private:
     void ProcessPendingStagingCleanup();
     static bool IsFooterErrorStatus(const std::string& status, bool isRunning);
     void DrawFooterCloseIcon(Rectangle bounds, bool hovered) const;
-    void DrawFooterCopyIcon(Rectangle bounds, bool hovered) const;
+    void DrawFooterCopyIcon(Rectangle bounds, bool hovered, bool enabled = true) const;
     void DrawOverwritePrompt(int windowWidth, int windowHeight, Font font) const;
     void DrawCancelConfirmPrompt(int windowWidth, int windowHeight, Font font) const;
     void DrawAboutDialog(int windowWidth, int windowHeight, Font font) const;
@@ -247,6 +291,40 @@ private:
     LinkCardGroupNode* GetSelectedGroupHeader();
     const LinkCardGroupNode* GetSelectedGroupHeader() const;
     void PrepareGroupsForBatchDownload();
+    void SetGroupDurationFillSuspended(bool suspended);
+    bool BuildDownloadRequestForGroupEntry(LinkCardGroupNode& ownerGroup,
+                                           LinkCardGroupNode* shelfParent,
+                                           const LinkGroupEntry& entry,
+                                           int entryIndex,
+                                           int channelTab,
+                                           DownloadRequest& request);
+    struct GroupEntryRef
+    {
+        LinkCardGroupNode* ownerGroup = nullptr;
+        LinkCardGroupNode* shelfParent = nullptr;
+        LinkGroupEntry entry;
+        int entryIndex = -1;
+        int channelTab = -1;
+    };
+    bool FindGroupEntryByUrl(const std::string& url, GroupEntryRef& out);
+    bool TryEnqueueGroupEntry(LinkCardGroupNode& ownerGroup,
+                              LinkCardGroupNode* shelfParent,
+                              const LinkGroupEntry& entry,
+                              int entryIndex,
+                              int channelTab,
+                              std::unordered_set<std::string>& claimedIdentities,
+                              bool& addedAny,
+                              bool& skippedDuplicate);
+    int EnqueueAllEntriesForGroup(LinkCardGroupNode& group,
+                                  std::unordered_set<std::string>& claimedIdentities,
+                                  bool& skippedDuplicate);
+    LinkCardNode* EnsureDownloadHostForRequest(const DownloadRequest& request);
+    bool IsDownloadHostCard(const LinkCardNode* card) const;
+    void MaybeReleaseDownloadHost(LinkCardNode* card);
+    void ReleaseIdleDownloadHosts();
+    void ClearDownloadHostCards();
+    void RemoveDownloadHostsMatchingUrls(const std::unordered_set<std::string>& urls);
+    void SyncGroupLoadedCompletionsFromDisk(LinkCardGroupNode& group, LinkCardGroupNode* shelfParent = nullptr);
     ConverterFileCardNode* GetSelectedConverterCard();
     const ConverterFileCardNode* GetSelectedConverterCard() const;
 
@@ -294,6 +372,7 @@ private:
     Dropdown customAutoConvertAudioDropdown_{{"AAC", "MP3", "Opus", "FLAC"}};
     Checkbox customPathCheckbox_;
     Checkbox keepIndicesCheckbox_;
+    Checkbox inverseNumberingCheckbox_;
     Dropdown cardConvertContainerDropdown_{{"MP4", "MKV", "MOV", "WEBM"}};
     Dropdown cardConvertVideoDropdown_{{"H.264", "H.265", "AV1", "VP9"}};
     Dropdown cardConvertAudioDropdown_{{"AAC", "MP3", "Opus", "FLAC"}};
@@ -334,13 +413,28 @@ private:
     std::vector<LinkCardUndoSnapshot> pendingBatchLinkRemove_;
     std::vector<ConverterCardUndoSnapshot> pendingBatchConverterRemove_;
     std::string globalDownloadPath_;
-    bool keepDownloadIndices_ = false;
     std::string lastChooseFileDirectory_;
     std::vector<DownloadRequest> pendingDownloadQueue_;
+    struct DownloadHostCard
+    {
+        std::string ownerGroupUrl;
+        std::string shelfParentUrl;
+        int channelTab = -1;
+        int entryIndex = -1;
+        std::unique_ptr<LinkCardNode> card;
+    };
+    std::vector<DownloadHostCard> downloadHostCards_;
+    // Channel /playlists shelf: nested playlists parse async — continue enqueue when ready.
+    // shelfIndex < 0 means every playlist under the shelf header.
+    struct PendingPlaylistShelfDownload
+    {
+        std::string groupUrl;
+        int shelfIndex = -1;
+    };
+    std::vector<PendingPlaylistShelfDownload> pendingPlaylistShelfDownloads_;
     std::unordered_set<std::string> softPreemptRequeueUrls_;
     std::vector<ConvertRequest> pendingConvertQueue_;
     std::vector<std::string> pendingStagingCleanupPaths_;
-    double nextStagingCleanupTime_ = 0.0;
     DownloadRequest pendingOverwriteRequest_;
     ConvertRequest pendingOverwriteConvertRequest_;
     std::string pendingOverwriteFileName_;
@@ -350,6 +444,11 @@ private:
     float optionsScrollOffset_ = 0.0f;
     float converterOptionsScrollOffset_ = 0.0f;
     float infoDialogScrollOffset_ = 0.0f;
+    Scrollbar downloaderListScrollbar_;
+    Scrollbar converterListScrollbar_;
+    Scrollbar downloaderOptionsScrollbar_;
+    Scrollbar converterOptionsScrollbar_;
+    Scrollbar infoDialogScrollbar_;
     Workspace activeWorkspace_ = Workspace::Downloader;
     bool isOverwritePromptOpen_ = false;
     bool isCancelConfirmOpen_ = false;
@@ -374,11 +473,36 @@ private:
     int lastDownloaderSelectionAnchor_ = -1;
     int lastConverterSelectionFocus_ = -1;
     int lastDownloaderSelectionFocus_ = -1;
+    // Fine-grained anchor for Shift+click inside channel tabs / playlist children.
+    struct DownloaderSelectionPoint
+    {
+        int itemIndex = -1;
+        int tabIndex = -1;
+        int childIndex = -1;
+        bool isHeader = false;
+    };
+    DownloaderSelectionPoint lastDownloaderSelectionAnchorPoint_{};
+    DownloaderSelectionPoint lastDownloaderSelectionFocusPoint_{};
+    DownloaderSelectionPoint MakeTopLevelSelectionPoint(int itemIndex) const;
+    void RememberDownloaderSelection(const DownloaderSelectionPoint& point, bool updateAnchor);
+    std::vector<DownloaderSelectionPoint> BuildDownloaderSelectionOrder() const;
+    static bool SameDownloaderSelectionPoint(const DownloaderSelectionPoint& a, const DownloaderSelectionPoint& b);
+    int FindDownloaderSelectionIndex(const std::vector<DownloaderSelectionPoint>& order,
+                                     const DownloaderSelectionPoint& point) const;
+    void SelectDownloaderSelectionPoint(const DownloaderSelectionPoint& point, bool selected);
+    void EnsureDownloaderSelectionPointVisible(Rectangle leftPanel,
+                                               const DownloaderSelectionPoint& point,
+                                               float& scrollOffset) const;
+    bool IsDownloaderSelectionPointSelected(const DownloaderSelectionPoint& point) const;
+    int FindSelectedDownloaderOrderIndex(const std::vector<DownloaderSelectionPoint>& order) const;
     bool overwriteAllExisting_ = false;
     bool overlayBlocksActions_ = false;
     mutable int displayFps_ = 0;
     mutable int fpsFrameCounter_ = 0;
     mutable float fpsElapsedSeconds_ = 0.0f;
+    mutable FooterDownloadSpeedMeter footerDownloadSpeedMeter_;
+    DownloadSpeedHistory downloadSpeedHistory_;
+    mutable Rectangle footerSpeedCopyButtonBounds_{};
     bool convertContainer_ = false;
     bool convertVideo_ = false;
     bool convertAudio_ = false;
@@ -412,10 +536,17 @@ private:
     static constexpr float kCornerRadius = 6.5f;
     static constexpr float kLeftPanelRatio = 0.6f;
     static constexpr float kCardHeight = 75.0f;
+    // Insert Link list slot: button + CTRL+V / SHIFT+CTRL+V captions under it.
+    static constexpr float kInsertLinkHintFontSize = 15.0f;
+    static constexpr float kInsertLinkHintLineGap = 2.0f;
+    static constexpr float kInsertLinkButtonHintsGap = 8.0f;
+    static constexpr float kInsertLinkHintsBlockHeight = kInsertLinkHintFontSize * 2.0f + kInsertLinkHintLineGap;
+    static constexpr float kInsertLinkActionSlotExtra = kInsertLinkButtonHintsGap + kInsertLinkHintsBlockHeight;
     static constexpr float kGroupCollapsedExtra = 8.0f;
     static constexpr float kHeaderHeight = 25.0f;
     static constexpr float kFooterHeight = 25.0f;
     static constexpr float kFooterNotificationMargin = 1.0f;
     static constexpr double kFooterNotificationDelaySeconds = 0.15;
-    static constexpr double kFooterNotificationAutoHideSeconds = 10.0;
+    // 0 = sticky until X. Set to e.g. 10.0 to restore auto-hide.
+    static constexpr double kFooterNotificationAutoHideSeconds = 0.0;
 };

@@ -14,6 +14,15 @@ enum class LinkGroupKind
     Channel,
 };
 
+enum class ChannelContentTab
+{
+    Videos = 0,
+    Shorts = 1,
+    Lives = 2,
+};
+
+inline constexpr int kChannelTabCount = 3;
+
 struct LinkGroupEntry
 {
     std::string id;
@@ -41,12 +50,22 @@ struct LinkGroupInfo
     std::string errorLog;
     std::string parseBrowserReport;
     std::vector<LinkGroupEntry> entries;
+    std::vector<LinkGroupEntry> videoEntries;
+    std::vector<LinkGroupEntry> shortEntries;
+    std::vector<LinkGroupEntry> liveEntries;
+    bool hasChannelTabs = false;
+    bool hasPlaylistShelf = false;
     LinkInfo singleVideo;
 };
 
 bool LooksLikeGroupUrl(const std::string& url);
 bool LooksLikeChannelUrl(const std::string& url);
 bool LooksLikePlaylistUrl(const std::string& url);
+bool LooksLikeChannelPlaylistsUrl(const std::string& url);
+// True for playlist/mix/shelf ids (PL…, UU…, LL, …). False for 11-char video ids that
+// merely share a prefix (e.g. LLA3PiBmaQU must stay watch?v=, not playlist?list=).
+bool LooksLikeYoutubePlaylistId(const std::string& id);
+std::string NormalizeYoutubeChannelBaseUrl(std::string url);
 
 class LinkGroupInfoLoader
 {

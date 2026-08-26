@@ -1,32 +1,39 @@
-# Build portable folder only → ../yCompiled/4KDownerCompiled/4KDowner-<ver>-windows-x64/
+# Build portable folder only → ../yCompiled/4KDowner-<ver>-windows-x64/
 #
 # Usage:
 #   powershell -ExecutionPolicy Bypass -File .\scripts\Windows\build-portable.ps1
 #
 # Optional:
 #   -EnsureYtDown   refresh packages/ytdown portable Python/yt-dlp
-#   -OutRoot        output root (default: ../yCompiled/4KDownerCompiled)
-#   -AppVersion     version segment in folder name (default: 1.1.0)
+#   -OutRoot        output root (default: ../yCompiled)
+#   -AppVersion     version segment in folder name (default: from CMakeLists.txt)
 #   -PortableRoot   override full portable folder path
 
 param(
     [switch]$EnsureYtDown,
     [string]$OutRoot = "",
-    [string]$AppVersion = "1.1.0",
+    [string]$AppVersion = "",
     [string]$PortableRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 $ScriptsDir = $PSScriptRoot
+. (Join-Path $ScriptsDir "ProjectVersion.ps1")
+
 $ProjectRoot = Split-Path (Split-Path $ScriptsDir -Parent) -Parent
 $CodingRoot = Split-Path $ProjectRoot -Parent
-$BuildDir = Join-Path $ProjectRoot "build"
+$BuildDir = Join-Path $ProjectRoot "build-windows"
 $PackagesRoot = Join-Path $CodingRoot "packages"
+
+if ([string]::IsNullOrWhiteSpace($AppVersion)) {
+    $AppVersion = Get-ProjectAppVersion -ProjectRoot $ProjectRoot
+}
+
 $ReleaseName = "4KDowner-$AppVersion-windows-x64"
 
 if ([string]::IsNullOrWhiteSpace($OutRoot)) {
-    $OutRoot = Join-Path $CodingRoot "yCompiled\4KDownerCompiled"
+    $OutRoot = Join-Path $CodingRoot "yCompiled"
 }
 if ([string]::IsNullOrWhiteSpace($PortableRoot)) {
     $PortableRoot = Join-Path $OutRoot $ReleaseName
@@ -44,7 +51,7 @@ $env:Path = [System.Environment]::GetEnvironmentVariable("Path", "Machine") + ";
     [System.Environment]::GetEnvironmentVariable("Path", "User")
 
 if (-not (Test-Path (Join-Path $BuildDir "CMakeCache.txt"))) {
-    Write-Host "Configuring CMake build/ ..."
+    Write-Host "Configuring CMake build-windows/ ..."
     cmake -S $ProjectRoot -B $BuildDir
     if ($LASTEXITCODE -ne 0) {
         throw "cmake configure failed."

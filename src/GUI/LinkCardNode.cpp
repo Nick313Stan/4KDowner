@@ -5,6 +5,7 @@
 #include "MouseCursor.h"
 #include "Tooltip.h"
 #include "UiClip.h"
+#include "VideoTitle.h"
 
 #include <algorithm>
 #include <cctype>
@@ -34,7 +35,7 @@ std::string SourceSiteName(const std::string& url)
     }
 
     if (host == "youtu.be" || host == "youtube.com" || host == "m.youtube.com" || host == "music.youtube.com" ||
-        host.find("youtube.") == 0)
+        host.find("youtube.") == 0 || host == "i.ytimg.com" || host.rfind("ytimg.", 0) == 0)
     {
         return "YouTube";
     }
@@ -65,17 +66,31 @@ std::string SourceSiteName(const std::string& url)
 
 std::string FormatElapsed(double seconds)
 {
+    if (seconds <= 0.0)
+    {
+        return "0:00";
+    }
+
     const int totalSeconds = static_cast<int>(seconds + 0.5);
-    const int minutes = totalSeconds / 60;
-    const int secs = totalSeconds % 60;
+    const int hours = totalSeconds / 3600;
+    const int remainder = totalSeconds % 3600;
+    const int minutes = remainder / 60;
+    const int secs = remainder % 60;
     char buffer[32]{};
-    std::snprintf(buffer, sizeof(buffer), "%d:%02d", minutes, secs);
+    if (hours > 0)
+    {
+        std::snprintf(buffer, sizeof(buffer), "%d:%02d:%02d", hours, minutes, secs);
+    }
+    else
+    {
+        std::snprintf(buffer, sizeof(buffer), "%d:%02d", minutes, secs);
+    }
     return buffer;
 }
 
 double ParseDurationSeconds(const std::string& text)
 {
-    if (text.empty() || text == "--:--")
+    if (text.empty() || text == "--:--" || text == "NA" || text == "N/A" || text == "na" || text == "n/a")
     {
         return 0.0;
     }
@@ -102,7 +117,16 @@ double ParseDurationSeconds(const std::string& text)
     {
         return static_cast<double>(minutes * 60 + seconds);
     }
-    return 0.0;
+
+    try
+    {
+        const double parsed = std::stod(text);
+        return parsed > 0.0 ? parsed : 0.0;
+    }
+    catch (...)
+    {
+        return 0.0;
+    }
 }
 
 constexpr float kThumbnailRoundness = 0.12f;
@@ -237,11 +261,60 @@ void PrepareThumbnailImage(Image& image)
 
     ImageResize(&image, kThumbnailPixelWidth, kThumbnailPixelHeight);
 }
+
+// Flat Shorts entries sometimes store i.ytimg.com/vi_webp/<id>/... as url — rebuild a watch URL.
+void RepairYoutubeThumbnailUrl(LinkInfo& info)
+{
+    if (info.url.find("ytimg.com/") == std::string::npos && info.url.find("ggpht.com/") == std::string::npos)
+    {
+        return;
+    }
+
+    const auto isLikelyYoutubeVideoId = [](const std::string& id)
+    {
+        if (id.size() != 11)
+        {
+            return false;
+        }
+        for (const char ch : id)
+        {
+            if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' ||
+                  ch == '_'))
+            {
+                return false;
+            }
+        }
+        return true;
+    };
+
+    std::string videoId;
+    static constexpr const char* kMarkers[] = {"/vi_webp/", "/vi/"};
+    for (const char* marker : kMarkers)
+    {
+        const size_t markerPos = info.url.find(marker);
+        if (markerPos == std::string::npos)
+        {
+            continue;
+        }
+        const size_t idStart = markerPos + std::char_traits<char>::length(marker);
+        const size_t idEnd = info.url.find_first_of("/?&", idStart);
+        videoId = idEnd == std::string::npos ? info.url.substr(idStart) : info.url.substr(idStart, idEnd - idStart);
+        break;
+    }
+
+    if (!isLikelyYoutubeVideoId(videoId))
+    {
+        return;
+    }
+
+    info.url = "https://www.youtube.com/watch?v=" + videoId;
+}
 } // namespace
 
 LinkCardNode::LinkCardNode(LinkInfo info)
     : info_(std::move(info))
 {
+    RepairYoutubeThumbnailUrl(info_);
     if (info_.success && info_.formatStreams.empty())
     {
         needsDetailedParse_ = true;
@@ -252,6 +325,7 @@ LinkCardNode::LinkCardNode(std::string url)
     : info_()
 {
     info_.url = std::move(url);
+    RepairYoutubeThumbnailUrl(info_);
     isParsing_ = true;
     loader_.Start(info_.url);
 }
@@ -310,15 +384,20 @@ LinkCardNode::LinkCardNode(LinkCardNode&& other) noexcept
       busyStatusLabel_(std::move(other.busyStatusLabel_)),
       pulseStartTime_(other.pulseStartTime_),
       operationProgress_(other.operationProgress_),
+      diskProgress_(other.diskProgress_),
       busySessionStart_(other.busySessionStart_),
       needsDetailedParse_(other.needsDetailedParse_),
-      isDetailParsing_(other.isDetailParsing_)
+      isDetailParsing_(other.isDetailParsing_),
+      durationLookupStarted_(other.durationLookupStarted_),
+      durationLookupAttempts_(other.durationLookupAttempts_)
 {
     other.thumbnailTexture_ = {};
     other.hasThumbnailTexture_ = false;
     other.isParsing_ = false;
     other.isDetailParsing_ = false;
     other.needsDetailedParse_ = false;
+    other.durationLookupStarted_ = false;
+    other.durationLookupAttempts_ = 0;
     other.dismissedDuringParse_ = false;
     other.isConverting_ = false;
     other.hasAutoConvertDelivery_ = false;
@@ -379,16 +458,21 @@ LinkCardNode& LinkCardNode::operator=(LinkCardNode&& other) noexcept
         busyStatusLabel_ = std::move(other.busyStatusLabel_);
         pulseStartTime_ = other.pulseStartTime_;
         operationProgress_ = other.operationProgress_;
+        diskProgress_ = other.diskProgress_;
         busySessionStart_ = other.busySessionStart_;
 
         needsDetailedParse_ = other.needsDetailedParse_;
         isDetailParsing_ = other.isDetailParsing_;
+        durationLookupStarted_ = other.durationLookupStarted_;
+        durationLookupAttempts_ = other.durationLookupAttempts_;
 
         other.thumbnailTexture_ = {};
         other.hasThumbnailTexture_ = false;
         other.isParsing_ = false;
         other.isDetailParsing_ = false;
         other.needsDetailedParse_ = false;
+        other.durationLookupStarted_ = false;
+        other.durationLookupAttempts_ = 0;
         other.dismissedDuringParse_ = false;
         other.isConverting_ = false;
         other.hasAutoConvertDelivery_ = false;
@@ -406,6 +490,12 @@ LinkCardNode& LinkCardNode::operator=(LinkCardNode&& other) noexcept
 void LinkCardNode::Update(Rectangle bounds, Font font)
 {
     (void)font;
+    const std::string urlBefore = info_.url;
+    RepairYoutubeThumbnailUrl(info_);
+    if (info_.url != urlBefore && info_.success && info_.formatStreams.empty())
+    {
+        needsDetailedParse_ = true;
+    }
     ApplyParseResultIfReady();
     LoadThumbnail();
     wasClicked_ = false;
@@ -536,6 +626,10 @@ void LinkCardNode::Draw(
 
     DrawRectangleRounded(animatedBounds, roundness, 16, background);
     DrawBackgroundProgress(animatedBounds, roundness);
+    if (HasCompletedDownload() && !IsDownloading())
+    {
+        CardChrome::DrawCompletedCheckmarkBackdrop(animatedBounds);
+    }
     DrawRectangleRoundedLines(animatedBounds, roundness, 16, border);
     if (isSelected_)
     {
@@ -621,6 +715,13 @@ void LinkCardNode::Draw(
     }
 
     const std::string durationText = info_.duration;
+    const bool durationMissing = ParseDurationSeconds(info_.duration) <= 0.0;
+    const bool durationFillParsing =
+        durationMissing && !info_.url.empty() && (IsDurationLookupPending() || NeedsDurationLookup());
+    // Detail/full parse (qualities etc.) — show parsing near duration even when duration is already known.
+    const bool detailParsing = isParsing_ || isDetailParsing_;
+    const bool durationSlotParsing = durationFillParsing && !detailParsing;
+    const bool showParsingStatus = detailParsing || durationFillParsing;
     const std::string details = "Source: " + SourceSiteName(info_.url);
 
     const bool sourceHovered = hasSourceBounds_ && CheckCollisionPointRec(GetMousePosition(), sourceBounds_);
@@ -670,7 +771,12 @@ void LinkCardNode::Draw(
     const bool showStatus = !statusText.empty();
 
     const float separatorWidth = MeasureTextEx(font, " | ", 14.0f, 0.0f).x;
-    const float durationWidth = MeasureTextEx(font, durationText.c_str(), 14.0f, 0.0f).x;
+    const float parsingTextWidth = MeasureTextEx(font, "parsing", 14.0f, 0.0f).x;
+    const float durationWidth =
+        durationSlotParsing ? (parsingTextWidth + 16.0f) : MeasureTextEx(font, durationText.c_str(), 14.0f, 0.0f).x;
+    // When duration is already shown, append "| parsing" + spinner during detail parse.
+    const float parsingStatusWidth =
+        (showParsingStatus && !durationSlotParsing) ? (separatorWidth + parsingTextWidth + 16.0f) : 0.0f;
     const float downloadingTextWidth = MeasureTextEx(font, "downloading", 14.0f, 0.0f).x;
     const float mergingTextWidth = MeasureTextEx(font, "merging", 14.0f, 0.0f).x;
     const float convertingTextWidth = MeasureTextEx(font, "converting", 14.0f, 0.0f).x;
@@ -709,7 +815,7 @@ void LinkCardNode::Draw(
         layoutStatusWidth = notInQueueActionSlotWidth;
     }
     const float statusWidth = showStatus ? separatorWidth + layoutStatusWidth : 0.0f;
-    const float durationBlockWidth = separatorWidth + 16.0f + durationWidth;
+    const float durationBlockWidth = separatorWidth + 16.0f + durationWidth + parsingStatusWidth;
     const float metaMaxX = animatedBounds.x + animatedBounds.width - 34.0f;
     const float maxDetailsWidth = std::max(0.0f, metaMaxX - textX - durationBlockWidth - statusWidth);
     const float detailsWidth = std::min(MeasureTextEx(font, details.c_str(), 14.0f, 0.0f).x, maxDetailsWidth);
@@ -740,20 +846,37 @@ void LinkCardNode::Draw(
              metaColor);
 
     const Vector2 durationPosition = {clockCenter.x + 10.0f, animatedBounds.y + 49.0f};
-    DrawTextEx(font, durationText.c_str(), durationPosition, 14.0f, 0.0f, metaColor);
+    if (durationSlotParsing)
+    {
+        DrawTextEx(font, "parsing", durationPosition, 14.0f, 0.0f, metaColor);
+        DrawMiniSpinner({durationPosition.x + parsingTextWidth + 8.0f, animatedBounds.y + 58.0f});
+    }
+    else
+    {
+        DrawTextEx(font, durationText.c_str(), durationPosition, 14.0f, 0.0f, metaColor);
+    }
+
+    float afterDurationX = durationPosition.x + durationWidth;
+    if (showParsingStatus && !durationSlotParsing)
+    {
+        DrawTextEx(font, " | ", {afterDurationX + 2.0f, animatedBounds.y + 49.0f}, 14.0f, 0.0f, metaColor);
+        const Vector2 parsingPosition = {afterDurationX + 2.0f + separatorWidth, animatedBounds.y + 49.0f};
+        DrawTextEx(font, "parsing", parsingPosition, 14.0f, 0.0f, metaColor);
+        DrawMiniSpinner({parsingPosition.x + parsingTextWidth + 8.0f, animatedBounds.y + 58.0f});
+        afterDurationX = parsingPosition.x + parsingTextWidth + 16.0f;
+    }
 
     const float metaY = animatedBounds.y + 49.0f;
     const float metaHeight = 18.0f;
     Tooltip::DrawIfHovered(font, sourceBounds_, "Open Link");
-    Tooltip::DrawIfHovered(
-        font,
-        {clockCenter.x - 6.0f, metaY - 2.0f, (durationPosition.x + durationWidth) - (clockCenter.x - 6.0f), metaHeight},
-        "Duration");
+    Tooltip::DrawIfHovered(font,
+                           {clockCenter.x - 6.0f, metaY - 2.0f, afterDurationX - (clockCenter.x - 6.0f), metaHeight},
+                           showParsingStatus ? "Parsing video info" : "Duration");
 
     hasDownloadStatusBounds_ = false;
     if (showStatus)
     {
-        const float separatorX = durationPosition.x + durationWidth + 2.0f;
+        const float separatorX = afterDurationX + 2.0f;
         DrawTextEx(font, " | ", {separatorX, animatedBounds.y + 49.0f}, 14.0f, 0.0f, metaColor);
 
         const float statusSlotStart = separatorX + separatorWidth + 2.0f;
@@ -787,8 +910,7 @@ void LinkCardNode::Draw(
         }
         if (showDownloadSpinner)
         {
-            const float spinnerTextWidth =
-                isConverting_ ? convertingTextWidth : MeasureTextEx(font, busyStatusLabel_.c_str(), 14.0f, 0.0f).x;
+            const float spinnerTextWidth = MeasureTextEx(font, statusText.c_str(), 14.0f, 0.0f).x;
             DrawMiniSpinner({statusPosition.x + spinnerTextWidth + 8.0f, animatedBounds.y + 58.0f});
         }
     }
@@ -865,6 +987,7 @@ void LinkCardNode::ClearDownloading()
     if (!isConverting_)
     {
         operationProgress_ = -1.0f;
+        diskProgress_ = -1.0f;
         busySessionStart_ = -1.0;
     }
 }
@@ -880,6 +1003,7 @@ void LinkCardNode::DemoteDownloadingToQueued()
     if (!isConverting_)
     {
         operationProgress_ = -1.0f;
+        diskProgress_ = -1.0f;
         busySessionStart_ = -1.0;
     }
 }
@@ -990,14 +1114,40 @@ void LinkCardNode::SetLastDownloadedPath(std::string path)
     lastDownloadedPath_ = std::move(path);
 }
 
+void LinkCardNode::ApplyOriginalTitle(std::string title)
+{
+    if (title.empty())
+    {
+        return;
+    }
+    info_.title = std::move(title);
+    info_.normalizedTitle = NormalizeVideoTitle(info_.title);
+}
+
 void LinkCardNode::SetOperationProgress(float progress)
 {
     operationProgress_ = std::clamp(progress, 0.0f, 1.0f);
 }
 
+void LinkCardNode::SetDiskProgress(float progress)
+{
+    if (progress < 0.0f)
+    {
+        diskProgress_ = -1.0f;
+        return;
+    }
+    diskProgress_ = std::clamp(progress, 0.0f, 1.0f);
+}
+
 void LinkCardNode::ClearOperationProgress()
 {
     operationProgress_ = -1.0f;
+    diskProgress_ = -1.0f;
+}
+
+float LinkCardNode::OperationProgress() const
+{
+    return operationProgress_;
 }
 
 bool LinkCardNode::ShouldClose() const
@@ -1108,10 +1258,22 @@ bool LinkCardNode::IsNotInQueue() const
 
 bool LinkCardNode::HasCompletedDownload() const
 {
-    return hasDownloadElapsed_;
+    // Elapsed is set when a download finishes in-session. Path alone covers Load more
+    // rematerialization / disk restore after ephemeral host cards were released.
+    return hasDownloadElapsed_ || !lastDownloadedPath_.empty();
 }
 
 bool LinkCardNode::HasCompletedConvert() const
+{
+    return hasConvertElapsed_;
+}
+
+bool LinkCardNode::HasDownloadElapsedTime() const
+{
+    return hasDownloadElapsed_;
+}
+
+bool LinkCardNode::HasConvertElapsedTime() const
 {
     return hasConvertElapsed_;
 }
@@ -1522,30 +1684,52 @@ Rectangle LinkCardNode::GetDownloadStatusBounds(Rectangle bounds, Font font, flo
 
 void LinkCardNode::DrawBackgroundProgress(Rectangle bounds, float roundness) const
 {
-    if (operationProgress_ < 0.0f)
+    if (operationProgress_ < 0.0f && diskProgress_ < 0.0f)
     {
         return;
     }
 
-    const float fillWidth = bounds.width * operationProgress_;
-    if (fillWidth <= 0.5f)
+    const auto drawFill = [&](float progress, Color fillColor)
     {
-        return;
+        if (progress < 0.0f)
+        {
+            return;
+        }
+
+        float fillWidth = bounds.width * progress;
+        if (progress > 0.0f && fillWidth < 2.0f)
+        {
+            fillWidth = 2.0f;
+        }
+        if (fillWidth <= 0.5f)
+        {
+            return;
+        }
+
+        UiClip::Push({bounds.x, bounds.y, fillWidth, bounds.height});
+        DrawRectangleRounded(bounds, roundness, 16, fillColor);
+        UiClip::Pop();
+    };
+
+    // Underlay: bytes on disk vs estimate (weight).
+    if (diskProgress_ >= 0.0f && !isConverting_ && busyStatusLabel_ != "converting")
+    {
+        drawFill(diskProgress_, Color{54, 74, 54, 255});
     }
 
-    Color fillColor = Color{52, 104, 52, 120}; // downloading
-    if (isConverting_ || busyStatusLabel_ == "converting")
+    // yt-dlp % overlay disabled for downloads. Convert + merge fills kept.
+    if (operationProgress_ >= 0.0f)
     {
-        fillColor = Color{52, 92, 148, 120}; // converting
+        if (isConverting_ || busyStatusLabel_ == "converting")
+        {
+            drawFill(operationProgress_, Color{70, 120, 180, 180});
+        }
+        else if (busyStatusLabel_ == "merging")
+        {
+            // Dark muted mustard (same weight as download forest green).
+            drawFill(operationProgress_, Color{74, 68, 40, 255});
+        }
     }
-    else if (busyStatusLabel_ == "merging")
-    {
-        fillColor = Color{168, 140, 48, 120}; // merging
-    }
-
-    UiClip::Push({bounds.x, bounds.y, fillWidth, bounds.height});
-    DrawRectangleRounded(bounds, roundness, 16, fillColor);
-    UiClip::Pop();
 }
 
 void LinkCardNode::DrawMiniSpinner(Vector2 center) const
@@ -1564,7 +1748,13 @@ void LinkCardNode::DrawMiniSpinner(Vector2 center) const
 
 void LinkCardNode::EnsureDetailedParse()
 {
-    if (!needsDetailedParse_ || isParsing_ || isDetailParsing_ || loader_.IsLoading() || info_.url.empty())
+    RepairYoutubeThumbnailUrl(info_);
+    if (info_.url.empty())
+    {
+        needsDetailedParse_ = false;
+        return;
+    }
+    if (!needsDetailedParse_ || isParsing_ || isDetailParsing_ || loader_.IsLoading())
     {
         return;
     }
@@ -1576,6 +1766,48 @@ void LinkCardNode::EnsureDetailedParse()
 bool LinkCardNode::NeedsDetailedParse() const
 {
     return needsDetailedParse_;
+}
+
+void LinkCardNode::FillDurationIfMissing(const std::string& duration)
+{
+    if (ParseDurationSeconds(info_.duration) > 0.0 || ParseDurationSeconds(duration) <= 0.0)
+    {
+        return;
+    }
+    info_.duration = duration;
+    durationLookupStarted_ = false;
+    durationLookupAttempts_ = 0;
+}
+
+bool LinkCardNode::NeedsDurationLookup() const
+{
+    return !durationLookupStarted_ && durationLookupAttempts_ < 3 && ParseDurationSeconds(info_.duration) <= 0.0 &&
+           !info_.url.empty();
+}
+
+bool LinkCardNode::IsDurationLookupPending() const
+{
+    return durationLookupStarted_ && durationLookupAttempts_ < 3 && ParseDurationSeconds(info_.duration) <= 0.0;
+}
+
+void LinkCardNode::MarkDurationLookupStarted()
+{
+    durationLookupStarted_ = true;
+}
+
+void LinkCardNode::ClearDurationLookupStarted()
+{
+    durationLookupStarted_ = false;
+}
+
+void LinkCardNode::NoteDurationLookupFailure()
+{
+    ++durationLookupAttempts_;
+    if (durationLookupAttempts_ < 3)
+    {
+        durationLookupStarted_ = false;
+    }
+    // After 3 failures keep started=true so we stop spinning and leave "--:--".
 }
 
 void LinkCardNode::ApplyParseResultIfReady()
@@ -1600,16 +1832,21 @@ void LinkCardNode::ApplyParseResultIfReady()
         {
             return;
         }
-        // Only update format-related fields; preserve existing title/thumbnail/duration.
+        // Flat playlist listings often return translated titles (account language).
+        // Full video extract prefers the uploader's original title — use that when present.
+        // Keep the flat thumbnail unless the listing had none.
         info_.formatStreams = result.formatStreams;
         info_.availableFormats = result.availableFormats;
         info_.availableVideoFormats = result.availableVideoFormats;
         info_.availableAudioFormats = result.availableAudioFormats;
         info_.availableQualities = result.availableQualities;
-        if (info_.title.empty() && !result.title.empty())
+        if (!result.title.empty())
+        {
             info_.title = result.title;
-        if (info_.duration.empty() && !result.duration.empty())
-            info_.duration = result.duration;
+            info_.normalizedTitle =
+                result.normalizedTitle.empty() ? NormalizeVideoTitle(result.title) : result.normalizedTitle;
+        }
+        FillDurationIfMissing(result.duration);
         if (info_.thumbnailPath.empty() && !result.thumbnailPath.empty())
         {
             UnloadThumbnail();

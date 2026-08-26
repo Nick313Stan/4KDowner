@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # One-shot Linux release packager:
-#   portable folder + tar.gz archive → ../yCompiled/4KDownerCompiled/
+#   portable folder + tar.gz archive → ../yCompiled/
 #
 # Usage:
 #   ./scripts/Linux/main.sh
@@ -9,7 +9,7 @@
 #   --skip-archive     skip tar.gz
 #   --ensure-ytdown    run setup-ytdown-portable.sh if yt-dlp missing
 #   --out-root DIR
-#   --app-version VER
+#   --app-version VER  version segment (default: from CMakeLists.txt)
 #   --build-dir DIR
 #
 # Single stage:
@@ -20,13 +20,15 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck source=_ensure-console.sh
 source "$SCRIPT_DIR/_ensure-console.sh"
+# shellcheck source=project-version.sh
+source "$SCRIPT_DIR/project-version.sh"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 CODING_ROOT="$(cd "$PROJECT_ROOT/.." && pwd)"
 
 SKIP_ARCHIVE=0
 ENSURE_YTDOWN=0
 OUT_ROOT=""
-APP_VERSION="1.1.0"
+APP_VERSION=""
 BUILD_DIR="${BUILD_DIR:-$PROJECT_ROOT/build-linux}"
 
 while [[ $# -gt 0 ]]; do
@@ -47,9 +49,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+if [[ -z "$APP_VERSION" ]]; then
+  APP_VERSION="$(get_project_app_version "$PROJECT_ROOT")"
+fi
+
 RELEASE_NAME="4KDowner-${APP_VERSION}-linux-x64"
 if [[ -z "$OUT_ROOT" ]]; then
-  OUT_ROOT="$CODING_ROOT/yCompiled/4KDownerCompiled"
+  OUT_ROOT="$CODING_ROOT/yCompiled"
 fi
 PORTABLE_ROOT="$OUT_ROOT/$RELEASE_NAME"
 ARCHIVE_PATH="$OUT_ROOT/${RELEASE_NAME}.tar.gz"
@@ -79,7 +85,8 @@ if [[ "$SKIP_ARCHIVE" -eq 0 ]]; then
     "-D4KDOWNER_ARCHIVE_PATH=$ARCHIVE_PATH"
 
   echo "Building portable archive..."
-  cmake --build "$BUILD_DIR" --config Release --target package-archive
+  cmake --build "$BUILD_DIR" --target package-archive -j"$(nproc 2>/dev/null || echo 4)"
+
   if [[ ! -f "$ARCHIVE_PATH" ]]; then
     echo "Archive missing: $ARCHIVE_PATH" >&2
     exit 1
@@ -88,7 +95,7 @@ fi
 
 echo ""
 echo "=== Done ==="
-echo "Portable:  $PORTABLE_ROOT"
-if [[ "$SKIP_ARCHIVE" -eq 0 && -f "$ARCHIVE_PATH" ]]; then
-  echo "Archive:   $ARCHIVE_PATH ($(du -m "$ARCHIVE_PATH" | awk '{print $1}') MB)"
+echo "Portable: $PORTABLE_ROOT"
+if [[ "$SKIP_ARCHIVE" -eq 0 ]]; then
+  echo "Archive:  $ARCHIVE_PATH"
 fi

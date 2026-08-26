@@ -1,5 +1,5 @@
 # One-shot Windows release packager:
-#   portable folder + zip archive + MSI → ../yCompiled/4KDownerCompiled/
+#   portable folder + zip archive + MSI → ../yCompiled/
 #
 # Usage (from repo root or anywhere):
 #   powershell -ExecutionPolicy Bypass -File .\scripts\Windows\main.ps1
@@ -18,20 +18,26 @@ param(
     [switch]$SkipArchive,
     [switch]$EnsureYtDown,
     [string]$OutRoot = "",
-    [string]$AppVersion = "1.1.0"
+    [string]$AppVersion = ""
 )
 
 $ErrorActionPreference = "Stop"
 
 $ScriptsDir = $PSScriptRoot
+. (Join-Path $ScriptsDir "ProjectVersion.ps1")
+
 $ProjectRoot = Split-Path (Split-Path $ScriptsDir -Parent) -Parent
 $CodingRoot = Split-Path $ProjectRoot -Parent
-$BuildDir = Join-Path $ProjectRoot "build"
+$BuildDir = Join-Path $ProjectRoot "build-windows"
+
+if ([string]::IsNullOrWhiteSpace($AppVersion)) {
+    $AppVersion = Get-ProjectAppVersion -ProjectRoot $ProjectRoot
+}
 
 $ReleaseName = "4KDowner-$AppVersion-windows-x64"
 
 if ([string]::IsNullOrWhiteSpace($OutRoot)) {
-    $OutRoot = Join-Path $CodingRoot "yCompiled\4KDownerCompiled"
+    $OutRoot = Join-Path $CodingRoot "yCompiled"
 }
 
 $PortableRoot = Join-Path $OutRoot $ReleaseName

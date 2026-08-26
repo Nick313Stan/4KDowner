@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Scrollbar.h"
+
 #include "raylib.h"
 
 #include <string>
@@ -13,6 +15,8 @@ public:
     bool Update(Rectangle bounds, int& selectedIndex, const Rectangle* hitClip = nullptr);
     void Draw(Rectangle bounds, Font font, int selectedIndex, bool enabled = true) const;
     void DrawControl(Rectangle bounds, Font font, int selectedIndex, bool enabled = true, bool allowHover = true) const;
+    // Disabled control with a custom label and spinner (e.g. while formats are loading).
+    void DrawBusyControl(Rectangle bounds, Font font, const std::string& label) const;
     void DrawPopup(Rectangle bounds, Font font, int selectedIndex) const;
     void SetPopupLimitY(float minY, float maxY);
     void ClearPopupLimitY();
@@ -52,6 +56,7 @@ private:
     std::vector<std::string> items_;
     bool isOpen_ = false;
     float scrollOffset_ = 0.0f;
+    Scrollbar scrollbar_;
     bool hasPopupLimitY_ = false;
     float popupMinY_ = 0.0f;
     float popupMaxY_ = 0.0f;

@@ -798,6 +798,25 @@ void ConvertRunner::Cancel()
     }
 }
 
+void ConvertRunner::Shutdown()
+{
+    Cancel();
+    if (future_.valid())
+    {
+        try
+        {
+            future_.wait();
+            (void)future_.get();
+        }
+        catch (...)
+        {
+        }
+    }
+    isRunning_ = false;
+    cancelRequested_.reset();
+    sharedState_.reset();
+}
+
 void ConvertRunner::Update()
 {
     if (!future_.valid())
@@ -894,6 +913,11 @@ float ConvertRunner::Progress() const
 double ConvertRunner::ElapsedSeconds() const
 {
     return elapsedSeconds_;
+}
+
+double ConvertRunner::SourceDurationSeconds() const
+{
+    return sourceDurationSeconds_;
 }
 
 bool ConvertRunner::ConsumeCompletedConvert(std::string& inputPath,

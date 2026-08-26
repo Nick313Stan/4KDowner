@@ -53,8 +53,14 @@ public:
     bool HasAutoConvertSnapshot() const;
     const AutoConvertOptions& AutoConvertSnapshot() const;
     void SetLastDownloadedPath(std::string path);
+    // Prefer uploader original title over flat-playlist translated titles.
+    void ApplyOriginalTitle(std::string title);
     void SetOperationProgress(float progress);
+    // Disk-based underlay; <0 hides it.
+    void SetDiskProgress(float progress);
     void ClearOperationProgress();
+    // <0 means no active operation bar.
+    float OperationProgress() const;
     bool ShouldClose() const;
     void RequestClose();
     bool IsHovered() const;
@@ -77,6 +83,8 @@ public:
     bool IsNotInQueue() const;
     bool HasCompletedDownload() const;
     bool HasCompletedConvert() const;
+    bool HasDownloadElapsedTime() const;
+    bool HasConvertElapsedTime() const;
     double DownloadElapsedSeconds() const;
     double ConvertElapsedSeconds() const;
     bool IsSelected() const;
@@ -117,6 +125,14 @@ public:
 
     void EnsureDetailedParse();
     bool NeedsDetailedParse() const;
+    void FillDurationIfMissing(const std::string& duration);
+    bool NeedsDurationLookup() const;
+    bool IsDurationLookupPending() const;
+    void MarkDurationLookupStarted();
+    void ClearDurationLookupStarted();
+    void NoteDurationLookupFailure();
+    // Poll async parse/detail-parse; safe to call when the card is not on-screen.
+    void ApplyParseResultIfReady();
 
 private:
     bool CanRevealOutputPath() const;
@@ -125,10 +141,11 @@ private:
     Rectangle GetDownloadStatusBounds(Rectangle bounds, Font font, float x, const std::string& label) const;
     void DrawMiniSpinner(Vector2 center) const;
     void DrawBackgroundProgress(Rectangle bounds, float roundness) const;
-    void ApplyParseResultIfReady();
 
     bool needsDetailedParse_ = false;
     bool isDetailParsing_ = false;
+    bool durationLookupStarted_ = false;
+    int durationLookupAttempts_ = 0;
     LinkInfo info_;
     LinkInfoLoader loader_;
     bool isParsing_ = false;
@@ -177,6 +194,7 @@ private:
     mutable bool hasSourceBounds_ = false;
     double pulseStartTime_ = -10.0;
     float operationProgress_ = -1.0f;
+    float diskProgress_ = -1.0f;
     // GetTime() when download/convert session began; kept across download→auto-convert.
     double busySessionStart_ = -1.0;
 

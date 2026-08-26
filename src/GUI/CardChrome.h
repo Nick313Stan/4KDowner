@@ -28,6 +28,9 @@ void DrawCloseButton(Rectangle bounds, Font font);
 void DrawCopyButton(Rectangle bounds, Font font, bool enabled = true);
 void DrawOpenPathButton(Rectangle bounds, Font font, bool enabled = true);
 
+// Soft green checkmark watermark centered in the text area (draw under title/meta).
+void DrawCompletedCheckmarkBackdrop(Rectangle cardBounds);
+
 // "m:ss" (or "h:mm:ss") over the preview; uses the main UI font.
 void DrawPreviewElapsedOverlay(Font font, Rectangle previewBounds, double elapsedSeconds);
 // 1-based index badge in the preview top-left; only the bottom-right corner is rounded.

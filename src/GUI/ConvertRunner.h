@@ -45,6 +45,8 @@ class ConvertRunner
 public:
     void Start(ConvertRequest request);
     void Cancel();
+    // Cancel if running, then block until the worker finishes.
+    void Shutdown();
     void Update();
     void SetStatus(std::string status);
 
@@ -54,6 +56,7 @@ public:
     const std::string& CurrentInputPath() const;
     float Progress() const;
     double ElapsedSeconds() const;
+    double SourceDurationSeconds() const;
     bool ConsumeCompletedConvert(std::string& inputPath,
                                  std::string& outputPath,
                                  double& elapsedSeconds,

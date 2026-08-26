@@ -15,6 +15,7 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -127,6 +128,20 @@ bool IsJpegFile(const std::filesystem::path& path)
     return file.gcount() == 3 && header[0] == 0xFF && header[1] == 0xD8 && header[2] == 0xFF;
 }
 
+bool IsPngFile(const std::filesystem::path& path)
+{
+    std::ifstream file(path, std::ios::binary);
+    if (!file)
+    {
+        return false;
+    }
+
+    unsigned char header[8]{};
+    file.read(reinterpret_cast<char*>(header), 8);
+    static constexpr unsigned char kPngMagic[8] = {0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A};
+    return file.gcount() == 8 && std::memcmp(header, kPngMagic, 8) == 0;
+}
+
 #ifdef _WIN32
 bool DownloadHttpToFile(const std::string& url, const std::filesystem::path& destination)
 {
@@ -228,20 +243,31 @@ bool DownloadHttpToFile(const std::string& url, const std::filesystem::path& des
         return false;
     }
 
-    if (!IsJpegFile(tempPath))
+    // Channel avatars often come back as PNG (=s0 / uncropped); accept JPEG or PNG.
+    std::filesystem::path finalPath = destination;
+    if (IsJpegFile(tempPath))
+    {
+        finalPath.replace_extension(".jpg");
+    }
+    else if (IsPngFile(tempPath))
+    {
+        finalPath.replace_extension(".png");
+    }
+    else
     {
         std::filesystem::remove(tempPath, existsError);
         return false;
     }
 
-    std::filesystem::rename(tempPath, destination, existsError);
+    std::filesystem::remove(finalPath, existsError);
+    std::filesystem::rename(tempPath, finalPath, existsError);
     if (existsError)
     {
         std::filesystem::remove(tempPath, existsError);
         return false;
     }
 
-    return std::filesystem::exists(destination, existsError) && IsLoadableImagePath(destination);
+    return std::filesystem::exists(finalPath, existsError) && IsLoadableImagePath(finalPath);
 }
 #else
 bool DownloadHttpToFile(const std::string& url, const std::filesystem::path& destination)
@@ -366,21 +392,44 @@ std::string ToUpper(std::string value)
     return value;
 }
 
+bool IsMissingDurationToken(const std::string& value)
+{
+    const std::string trimmed = Trim(value);
+    if (trimmed.empty() || trimmed == "--:--")
+    {
+        return true;
+    }
+
+    std::string lower = trimmed;
+    for (char& c : lower)
+    {
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+    return lower == "na" || lower == "n/a" || lower == "none" || lower == "null" || lower == "nan";
+}
+
 std::string NormalizeDurationString(const std::string& value)
 {
-    if (value.empty())
+    if (IsMissingDurationToken(value))
     {
         return "--:--";
     }
 
-    if (value.find(':') != std::string::npos)
+    const std::string trimmed = Trim(value);
+    if (trimmed.find(':') != std::string::npos)
     {
-        return value;
+        return trimmed;
     }
 
     try
     {
-        const int totalSeconds = std::stoi(value);
+        const double parsed = std::stod(trimmed);
+        if (parsed <= 0.0)
+        {
+            return "--:--";
+        }
+
+        const int totalSeconds = static_cast<int>(parsed + 0.5);
         if (totalSeconds >= 3600)
         {
             const int hours = totalSeconds / 3600;
@@ -401,7 +450,7 @@ std::string NormalizeDurationString(const std::string& value)
     }
     catch (...)
     {
-        return value;
+        return "--:--";
     }
 }
 
@@ -1043,9 +1092,11 @@ LinkInfo LinkInfoLoader::Load(std::string url, std::shared_ptr<std::atomic_bool>
         " --no-playlist --skip-download --no-warnings --write-thumbnail --convert-thumbnails jpg -P " +
         Quote(cacheDirectory.string()) +
         " -o \"%(id)s.%(ext)s\" --print \"YTINFO_TITLE:%(title)s\" --print \"YTINFO_UPLOADER:%(uploader)s\" --print "
-        "\"YTINFO_DURATION:%(duration_string)s\" --print \"YTINFO_EXT:%(ext)s\" --print \"YTINFO_VCODEC:%(vcodec)s\" "
+        "\"YTINFO_DURATION:%(duration_string)s\" --print \"YTINFO_DURATION_SEC:%(duration)s\" --print "
+        "\"YTINFO_EXT:%(ext)s\" --print \"YTINFO_VCODEC:%(vcodec)s\" "
         "--print \"YTINFO_ACODEC:%(acodec)s\" --print \"YTINFO_ID:%(id)s\" --print \"YTINFO_THUMB:%(thumbnail)s\" "
-        "--print \"YTINFO_FORMATS:%(formats.:.{format_id,ext,height,width,resolution,format_note,vcodec,acodec})j\" " +
+        "--print \"YTINFO_FORMATS:%(formats.:.{format_id,ext,height,width,resolution,format_note,filesize,filesize_"
+        "approx,vcodec,acodec,protocol})j\" " +
         Quote(normalizedUrl) + " 2>&1";
 
     std::string output;
@@ -1055,6 +1106,12 @@ LinkInfo LinkInfoLoader::Load(std::string url, std::shared_ptr<std::atomic_bool>
 
     BrowserAttemptLog parseLog;
     std::string successfulBrowser;
+    std::string bestOutput;
+    int bestExitCode = 1;
+    std::string bestBrowser;
+    int bestMaxQualityHeight = -1;
+    bool bestHasTitle = false;
+
     for (size_t browserIndex = 0; browserIndex < browsersToTry.size(); ++browserIndex)
     {
         if (cancelRequested != nullptr && cancelRequested->load())
@@ -1084,14 +1141,59 @@ LinkInfo LinkInfoLoader::Load(std::string url, std::shared_ptr<std::atomic_bool>
 
         const std::vector<std::string> lines = SplitLines(output);
         const std::string title = ValueAfterPrefix(lines, "YTINFO_TITLE:");
-        const bool success = exitCode == 0 && !title.empty();
+        const std::string formatsJson = ValueAfterPrefix(lines, "YTINFO_FORMATS:");
+        const bool gotTitle = exitCode == 0 && !title.empty();
+        int maxQualityHeight = 0;
+        if (gotTitle)
+        {
+            const std::vector<std::string> qualities = QualitiesFromStreams(ParseLinkFormatStreamsJson(formatsJson));
+            if (!qualities.empty())
+            {
+                maxQualityHeight = ParseQualityHeight(qualities.front());
+            }
+        }
+
+        // Cookie/client combos can return a title with only storyboards or SABR-capped ≤1080p
+        // while no-cookies (+ visionos HLS) still has 2K/4K. Keep searching when the ladder looks weak.
+        const bool weakLadder = gotTitle && maxQualityHeight > 0 && maxQualityHeight <= 1080 && !browser.empty();
+        const bool emptyLadder = gotTitle && maxQualityHeight <= 0 && !browser.empty();
+        const bool success = gotTitle && !weakLadder && !emptyLadder;
 
         BrowserAttempt attempt;
         attempt.browserSpec = browser;
         attempt.success = success;
-        attempt.summary = success ? "Parsed link metadata." : SummarizeBrowserAttemptOutput(output, true);
-        attempt.nextAction = DescribeBrowserRetryAction(output, hasMoreBrowsers, success);
+        if (success)
+        {
+            attempt.summary = "Parsed link metadata.";
+        }
+        else if (gotTitle && (weakLadder || emptyLadder))
+        {
+            attempt.summary = emptyLadder ? "Title OK but no video formats (trying next auth)."
+                                          : ("Title OK but quality ladder capped at " +
+                                             std::to_string(maxQualityHeight) + "p (trying fuller DASH).");
+            attempt.success = false;
+        }
+        else
+        {
+            attempt.summary = SummarizeBrowserAttemptOutput(output, true);
+        }
+        attempt.nextAction =
+            DescribeBrowserRetryAction(output, hasMoreBrowsers, success || (gotTitle && !hasMoreBrowsers));
+        if (!success && gotTitle && hasMoreBrowsers)
+        {
+            attempt.nextAction = "Trying next browser option for a fuller format ladder.";
+        }
         parseLog.AddAttempt(attempt);
+
+        if (gotTitle &&
+            (maxQualityHeight > bestMaxQualityHeight || (maxQualityHeight == bestMaxQualityHeight && !bestHasTitle)))
+        {
+            bestOutput = output;
+            bestExitCode = exitCode;
+            bestBrowser = browser;
+            bestMaxQualityHeight = maxQualityHeight;
+            bestHasTitle = true;
+        }
 
         if (success)
         {
@@ -1099,9 +1201,106 @@ LinkInfo LinkInfoLoader::Load(std::string url, std::shared_ptr<std::atomic_bool>
             break;
         }
 
-        if (!browser.empty() && !ShouldRetryYoutubeWithDifferentCookies(output))
+        if (gotTitle && (weakLadder || emptyLadder) && hasMoreBrowsers)
+        {
+            // Cookie browsers often share the same capped/blocked ladder; jump to bare extract.
+            for (size_t j = browserIndex + 1; j < browsersToTry.size(); ++j)
+            {
+                if (browsersToTry[j].empty())
+                {
+                    browserIndex = j - 1; // loop ++ lands on no-cookies
+                    break;
+                }
+            }
+            continue;
+        }
+
+        if (gotTitle && !hasMoreBrowsers)
+        {
+            // Last option — accept the best title parse we have (even if ladder is thin).
+            successfulBrowser = bestHasTitle ? bestBrowser : browser;
+            if (bestHasTitle)
+            {
+                output = bestOutput;
+                exitCode = bestExitCode;
+            }
+            break;
+        }
+
+        if (!gotTitle && !browser.empty() && !ShouldRetryYoutubeWithDifferentCookies(output))
         {
             break;
+        }
+    }
+
+    if (bestHasTitle && successfulBrowser.empty())
+    {
+        output = bestOutput;
+        exitCode = bestExitCode;
+        successfulBrowser = bestBrowser;
+    }
+
+    // When the ladder is still ≤1080p, re-probe with visionos-only (HLS). android_vr on yt-dlp ≥2026.08
+    // often omits PO-token https 4K from the merged list even with visionos in the client ladder.
+    if (bestHasTitle && bestMaxQualityHeight >= 0 && bestMaxQualityHeight <= 1080 &&
+        (cancelRequested == nullptr || !cancelRequested->load()))
+    {
+        const std::string visionCommand =
+            ytDlpInvocation + ffmpegArgs + BuildYoutubeVisionOsJsRuntimeArgs() + printArgs;
+#ifdef _WIN32
+        const std::string command =
+            "cmd /S /C \"chcp 65001>nul && set PYTHONIOENCODING=utf-8 && " + visionCommand + "\"";
+#else
+        const std::string command = "env PYTHONIOENCODING=utf-8 PYTHONUNBUFFERED=1 " + visionCommand;
+#endif
+        const CommandResult visionResult = RunCommand(command, cancelRequested);
+        if (!visionResult.cancelled && visionResult.exitCode == 0)
+        {
+            const std::vector<std::string> visionLines = SplitLines(visionResult.output);
+            const std::string visionTitle = ValueAfterPrefix(visionLines, "YTINFO_TITLE:");
+            const std::string visionFormats = ValueAfterPrefix(visionLines, "YTINFO_FORMATS:");
+            int visionMax = 0;
+            if (!visionTitle.empty())
+            {
+                const std::vector<std::string> visionQualities =
+                    QualitiesFromStreams(ParseLinkFormatStreamsJson(visionFormats));
+                if (!visionQualities.empty())
+                {
+                    visionMax = ParseQualityHeight(visionQualities.front());
+                }
+            }
+
+            BrowserAttempt visionAttempt;
+            visionAttempt.browserSpec = "visionos HLS (no cookies)";
+            if (!visionTitle.empty() && visionMax > bestMaxQualityHeight)
+            {
+                visionAttempt.success = true;
+                visionAttempt.summary = "Fuller quality ladder via visionos HLS (" + std::to_string(visionMax) + "p).";
+                visionAttempt.nextAction = "Used for format / quality listing.";
+                output = visionResult.output;
+                exitCode = visionResult.exitCode;
+                bestMaxQualityHeight = visionMax;
+                bestOutput = visionResult.output;
+                bestExitCode = visionResult.exitCode;
+                successfulBrowser = "";
+            }
+            else
+            {
+                visionAttempt.success = false;
+                visionAttempt.summary = visionTitle.empty()
+                                            ? SummarizeBrowserAttemptOutput(visionResult.output, true)
+                                            : ("visionos ladder still ≤" +
+                                               std::to_string(std::max(visionMax, bestMaxQualityHeight)) + "p.");
+                visionAttempt.nextAction = "Kept previous parse result.";
+            }
+            parseLog.AddAttempt(visionAttempt);
+        }
+        if (visionResult.cancelled)
+        {
+            info.cancelled = true;
+            info.error = "Parsing cancelled.";
+            info.parseBrowserReport = parseLog.FormatSection("Parse");
+            return info;
         }
     }
 
@@ -1118,7 +1317,11 @@ LinkInfo LinkInfoLoader::Load(std::string url, std::shared_ptr<std::atomic_bool>
 
     const std::string title = ValueAfterPrefix(lines, "YTINFO_TITLE:");
     const std::string uploader = ValueAfterPrefix(lines, "YTINFO_UPLOADER:");
-    const std::string duration = ValueAfterPrefix(lines, "YTINFO_DURATION:");
+    std::string duration = ValueAfterPrefix(lines, "YTINFO_DURATION:");
+    if (IsMissingDurationToken(duration))
+    {
+        duration = ValueAfterPrefix(lines, "YTINFO_DURATION_SEC:");
+    }
     const std::string container = ValueAfterPrefix(lines, "YTINFO_EXT:");
     const std::string videoCodec = ValueAfterPrefix(lines, "YTINFO_VCODEC:");
     const std::string audioCodec = ValueAfterPrefix(lines, "YTINFO_ACODEC:");
@@ -1166,6 +1369,110 @@ LinkInfo LinkInfoLoader::LoadVideo(std::string url, std::shared_ptr<std::atomic_
     return Load(std::move(url), cancelRequested);
 }
 
+std::vector<std::pair<std::string, std::string>>
+LinkInfoLoader::LoadDurationsByUrl(const std::vector<std::string>& urls,
+                                   std::shared_ptr<std::atomic_bool> cancelRequested)
+{
+    std::vector<std::pair<std::string, std::string>> results;
+    if (urls.empty())
+    {
+        return results;
+    }
+
+    const std::string ytDlpInvocation = BuildYtDlpCommandPrefix();
+    if (ytDlpInvocation.empty())
+    {
+        return results;
+    }
+
+    // Same JS / player stack as full parse — duration-only without it often fails for Shorts.
+    // Still skip thumbnails + formats JSON for speed.
+    const std::string jsArgs = BuildYoutubeDurationLookupArgs();
+    std::string printArgs = jsArgs + " --skip-download --no-warnings --no-playlist --ignore-errors --print "
+                                     "\"%(id)s\t%(duration)s\"";
+    for (const std::string& url : urls)
+    {
+        if (url.empty())
+        {
+            continue;
+        }
+        printArgs += " " + Quote(NormalizeYoutubeUrl(url));
+    }
+
+    std::vector<std::string> browsersToTry;
+    const std::string preferredBrowser = GetPreferredYoutubeCookieBrowser();
+    if (!preferredBrowser.empty())
+    {
+        browsersToTry.push_back(preferredBrowser);
+    }
+    browsersToTry.push_back(""); // always allow a cookieless attempt
+
+    std::string output;
+    for (size_t browserIndex = 0; browserIndex < browsersToTry.size(); ++browserIndex)
+    {
+        if (cancelRequested != nullptr && cancelRequested->load())
+        {
+            return results;
+        }
+
+        const std::string& browser = browsersToTry[browserIndex];
+        const std::string cookieArgs = BuildYoutubeCookiesArgs(browser);
+        const std::string ytDlpCommand = ytDlpInvocation + cookieArgs + printArgs;
+#ifdef _WIN32
+        const std::string command =
+            "cmd /S /C \"chcp 65001>nul && set PYTHONIOENCODING=utf-8 && " + ytDlpCommand + "\"";
+#else
+        const std::string command = "env PYTHONIOENCODING=utf-8 PYTHONUNBUFFERED=1 " + ytDlpCommand;
+#endif
+        const CommandResult commandResult = RunCommand(command, cancelRequested);
+        output = commandResult.output;
+        if (commandResult.cancelled)
+        {
+            break;
+        }
+
+        results.clear();
+        const std::vector<std::string> lines = SplitLines(output);
+        for (const std::string& line : lines)
+        {
+            const size_t tab = line.find('\t');
+            if (tab == std::string::npos || tab == 0)
+            {
+                continue;
+            }
+            const std::string videoId = line.substr(0, tab);
+            const std::string duration = NormalizeDurationString(line.substr(tab + 1));
+            if (videoId.empty() || IsMissingDurationToken(duration) || duration == "--:--")
+            {
+                continue;
+            }
+            // Skip obvious non-id noise from stderr mixed into stdout.
+            if (videoId.size() != 11)
+            {
+                continue;
+            }
+            results.emplace_back(videoId, duration);
+        }
+
+        if (!results.empty())
+        {
+            if (!browser.empty())
+            {
+                SetPreferredYoutubeCookieBrowser(browser);
+            }
+            break;
+        }
+
+        if (!browser.empty() && !ShouldRetryYoutubeWithDifferentCookies(output))
+        {
+            // Preferred cookies failed for a non-cookie reason; still try cookieless once.
+            continue;
+        }
+    }
+
+    return results;
+}
+
 std::string LinkInfoLoader::Quote(const std::string& value)
 {
     std::string escaped;
@@ -1200,15 +1507,179 @@ bool LooksLikeChannelUrl(const std::string& url)
            lower.find("/c/") != std::string::npos || lower.find("/user/") != std::string::npos;
 }
 
-bool LooksLikePlaylistUrl(const std::string& url)
+// True when the URL already targets one video (Favorites / "Copy link" often append ?list=…).
+// Those must stay Single cards — only bare playlist/channel URLs become groups.
+bool HasExplicitYoutubeVideoId(const std::string& url)
 {
     const std::string lower = ToLowerAsciiCopy(url);
-    return lower.find("list=") != std::string::npos || lower.find("/playlist") != std::string::npos;
+    const auto pathIdAfter = [&](const char* marker) -> bool
+    {
+        const size_t pos = lower.find(marker);
+        if (pos == std::string::npos)
+        {
+            return false;
+        }
+        const size_t idStart = pos + std::char_traits<char>::length(marker);
+        size_t idEnd = idStart;
+        while (idEnd < lower.size())
+        {
+            const char c = lower[idEnd];
+            if (c == '?' || c == '/' || c == '&' || c == '#' || c == ' ')
+            {
+                break;
+            }
+            ++idEnd;
+        }
+        return idEnd > idStart;
+    };
+
+    if (pathIdAfter("youtu.be/") || pathIdAfter("/shorts/") || pathIdAfter("/embed/") || pathIdAfter("/live/"))
+    {
+        return true;
+    }
+
+    size_t vPos = lower.find("?v=");
+    if (vPos == std::string::npos)
+    {
+        vPos = lower.find("&v=");
+    }
+    if (vPos != std::string::npos)
+    {
+        const size_t idStart = vPos + 3;
+        size_t idEnd = idStart;
+        while (idEnd < lower.size())
+        {
+            const char c = lower[idEnd];
+            if (c == '&' || c == '#' || c == '/' || c == ' ')
+            {
+                break;
+            }
+            ++idEnd;
+        }
+        if (idEnd > idStart)
+        {
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool LooksLikePlaylistUrl(const std::string& url)
+{
+    if (HasExplicitYoutubeVideoId(url))
+    {
+        return false;
+    }
+
+    const std::string lower = ToLowerAsciiCopy(url);
+    if (lower.find("list=") != std::string::npos)
+    {
+        return true;
+    }
+
+    // /playlist or /playlist/... — but not /playlists (channel "Playlists" tab).
+    const size_t pos = lower.find("/playlist");
+    if (pos == std::string::npos)
+    {
+        return false;
+    }
+    const size_t after = pos + 9; // strlen("/playlist")
+    if (after < lower.size() && (lower[after] == 's' || lower[after] == 'S'))
+    {
+        return false;
+    }
+    return true;
+}
+
+bool LooksLikeYoutubePlaylistId(const std::string& id)
+{
+    if (id.empty())
+    {
+        return false;
+    }
+    // Watch video ids are always exactly 11 chars. Prefixes like LL/PL/UU/FL/RD also appear
+    // on real videos (e.g. LLA3PiBmaQU); those must not become playlist?list=<videoId>.
+    if (id.size() == 11)
+    {
+        return false;
+    }
+    return id.rfind("PL", 0) == 0 || id.rfind("UU", 0) == 0 || id.rfind("LL", 0) == 0 || id.rfind("FL", 0) == 0 ||
+           id.rfind("OLAK5uy_", 0) == 0 || id.rfind("RD", 0) == 0 || id == "WL";
 }
 
 bool LooksLikeGroupUrl(const std::string& url)
 {
     return LooksLikePlaylistUrl(url) || LooksLikeChannelUrl(url);
+}
+
+bool LooksLikeChannelPlaylistsUrl(const std::string& url)
+{
+    if (!LooksLikeChannelUrl(url) || HasExplicitYoutubeVideoId(url))
+    {
+        return false;
+    }
+
+    std::string path = url;
+    const size_t cut = path.find_first_of("?#");
+    if (cut != std::string::npos)
+    {
+        path.resize(cut);
+    }
+    while (!path.empty() && (path.back() == '/' || path.back() == '\\'))
+    {
+        path.pop_back();
+    }
+
+    const std::string lower = ToLowerAsciiCopy(path);
+    static constexpr const char kSuffix[] = "/playlists";
+    static constexpr size_t kSuffixLen = sizeof(kSuffix) - 1;
+    return lower.size() > kSuffixLen && lower.compare(lower.size() - kSuffixLen, kSuffixLen, kSuffix) == 0;
+}
+
+std::string NormalizeYoutubeChannelBaseUrl(std::string url)
+{
+    const size_t cut = url.find_first_of("?#");
+    if (cut != std::string::npos)
+    {
+        url.resize(cut);
+    }
+    while (!url.empty() && (url.back() == '/' || url.back() == '\\'))
+    {
+        url.pop_back();
+    }
+
+    const std::string lower = ToLowerAsciiCopy(url);
+    static constexpr const char* kTabSuffixes[] = {"/videos",
+                                                   "/shorts",
+                                                   "/streams",
+                                                   "/live",
+                                                   "/featured",
+                                                   "/playlists",
+                                                   "/community",
+                                                   "/posts",
+                                                   "/about",
+                                                   "/channels",
+                                                   "/podcasts",
+                                                   "/releases",
+                                                   "/store",
+                                                   "/shop",
+                                                   "/membership",
+                                                   "/join"};
+    for (const char* suffix : kTabSuffixes)
+    {
+        const size_t suffixLen = std::char_traits<char>::length(suffix);
+        if (lower.size() > suffixLen && lower.compare(lower.size() - suffixLen, suffixLen, suffix) == 0)
+        {
+            url.resize(url.size() - suffixLen);
+            break;
+        }
+    }
+    while (!url.empty() && (url.back() == '/' || url.back() == '\\'))
+    {
+        url.pop_back();
+    }
+    return url;
 }
 
 void AppendUtf8Codepoint(std::string& out, unsigned int codepoint)
@@ -1456,6 +1927,232 @@ std::vector<std::string> ExtractJsonObjectsFromArray(const std::string& json, co
     return objects;
 }
 
+bool LooksLikeChannelAvatarUrl(const std::string& url)
+{
+    if (url.empty())
+    {
+        return false;
+    }
+    const std::string lower = ToLowerAsciiCopy(url);
+    return lower.find("yt3.ggpht.com") != std::string::npos ||
+           lower.find("yt3.googleusercontent.com") != std::string::npos ||
+           lower.find("googleusercontent.com/ytc/") != std::string::npos;
+}
+
+bool LooksLikeChannelBannerThumbnail(const std::string& thumbId, const std::string& url, int width, int height)
+{
+    const std::string idLower = ToLowerAsciiCopy(thumbId);
+    if (idLower.find("banner") != std::string::npos)
+    {
+        return true;
+    }
+    // Channel banners are very wide; avatars are ~square.
+    if (width > 0 && height > 0 && width >= height * 2)
+    {
+        return true;
+    }
+    const std::string lower = ToLowerAsciiCopy(url);
+    return lower.find("banner") != std::string::npos;
+}
+
+std::string ChannelMetaJsonPrefix(const std::string& json)
+{
+    // Channel avatar lives in the root object; ignore per-entry thumbnails under "entries".
+    const size_t entriesPos = json.find("\"entries\"");
+    if (entriesPos == std::string::npos)
+    {
+        return json;
+    }
+    return json.substr(0, entriesPos);
+}
+
+std::string ExtractChannelIdFromJson(const std::string& json)
+{
+    const std::string meta = ChannelMetaJsonPrefix(json);
+    const auto preferUc = [](std::string id) -> std::string
+    {
+        if (id.rfind("UC", 0) == 0)
+        {
+            return id;
+        }
+        // Uploads playlist id UU… maps to channel UC…
+        if (id.rfind("UU", 0) == 0 && id.size() > 2)
+        {
+            return "UC" + id.substr(2);
+        }
+        return {};
+    };
+
+    std::string id = preferUc(ExtractJsonStringValue(meta, "channel_id"));
+    if (!id.empty())
+    {
+        return id;
+    }
+    id = preferUc(ExtractJsonStringValue(meta, "uploader_id"));
+    if (!id.empty())
+    {
+        return id;
+    }
+    return preferUc(ExtractJsonStringValue(meta, "id"));
+}
+
+std::string ExtractChannelAvatarUrlFromJson(const std::string& json)
+{
+    const std::string meta = ChannelMetaJsonPrefix(json);
+
+    struct Candidate
+    {
+        std::string url;
+        int preference = 0;
+        int area = 0;
+        bool avatarId = false;
+        bool square = false;
+        bool avatarHost = false;
+    };
+
+    std::vector<Candidate> candidates;
+    for (const std::string& objectJson : ExtractJsonObjectsFromArray(meta, "thumbnails"))
+    {
+        const std::string url = ExtractJsonStringValue(objectJson, "url");
+        if (url.empty())
+        {
+            continue;
+        }
+        const std::string thumbId = ExtractJsonStringValue(objectJson, "id");
+        const int width = std::max(0, ExtractJsonIntValue(objectJson, "width"));
+        const int height = std::max(0, ExtractJsonIntValue(objectJson, "height"));
+        if (LooksLikeChannelBannerThumbnail(thumbId, url, width, height))
+        {
+            continue;
+        }
+
+        Candidate c;
+        c.url = url;
+        c.preference = ExtractJsonIntValue(objectJson, "preference");
+        c.area = width * height;
+        c.avatarId = ToLowerAsciiCopy(thumbId).find("avatar") != std::string::npos;
+        c.avatarHost = LooksLikeChannelAvatarUrl(url);
+        if (width > 0 && height > 0)
+        {
+            const int maxSide = std::max(width, height);
+            const int minSide = std::min(width, height);
+            c.square = minSide * 4 >= maxSide * 3; // within ~4:3 of square
+        }
+        // Keep only plausible avatar candidates (yt-dlp marks avatar_* or host is yt3…).
+        if (!c.avatarId && !c.avatarHost)
+        {
+            continue;
+        }
+        candidates.push_back(std::move(c));
+    }
+
+    auto better = [](const Candidate& a, const Candidate& b) -> bool
+    {
+        // Prefer known pixel size (s900 JPEG) over bare =s0 uncropped PNG.
+        const bool aSized = a.area > 0;
+        const bool bSized = b.area > 0;
+        if (aSized != bSized)
+        {
+            return aSized;
+        }
+        if (a.square != b.square)
+        {
+            return a.square;
+        }
+        if (a.avatarId != b.avatarId)
+        {
+            return a.avatarId;
+        }
+        if (a.preference != b.preference)
+        {
+            return a.preference > b.preference;
+        }
+        if (a.area != b.area)
+        {
+            return a.area > b.area;
+        }
+        return false;
+    };
+
+    const Candidate* best = nullptr;
+    for (const Candidate& c : candidates)
+    {
+        if (best == nullptr || better(c, *best))
+        {
+            best = &c;
+        }
+    }
+    if (best != nullptr)
+    {
+        return best->url;
+    }
+
+    // Last resort: top-level thumbnail only if it looks like an avatar host (not a banner).
+    const std::string top = ExtractJsonStringValue(meta, "thumbnail");
+    if (LooksLikeChannelAvatarUrl(top) && !LooksLikeChannelBannerThumbnail("", top, 0, 0))
+    {
+        return top;
+    }
+    return {};
+}
+
+// Channel avatars are not video ids — download the JSON thumbnail URL only (no i.ytimg.com/vi/…).
+std::filesystem::path ResolveChannelAvatarPath(const std::filesystem::path& cacheDirectory,
+                                               const std::string& channelId,
+                                               const std::string& avatarUrl)
+{
+    if (channelId.empty() && avatarUrl.empty())
+    {
+        return {};
+    }
+
+    // New key prefix so earlier mistaken banner downloads (avatar_UC…) are not reused.
+    const std::string cacheKey = !channelId.empty() ? ("chavatar_" + channelId) : "chavatar_unknown";
+    std::filesystem::path existing = FindThumbnailPath(cacheDirectory, cacheKey);
+    if (!existing.empty() && IsLoadableImagePath(existing))
+    {
+        return existing;
+    }
+
+    if (avatarUrl.empty())
+    {
+        return {};
+    }
+
+    // Prefer a JPEG-friendly sized URL. Bare =s0 often returns PNG and used to be rejected.
+    std::string downloadUrl = avatarUrl;
+    if (downloadUrl.size() >= 3 && downloadUrl.compare(downloadUrl.size() - 3, 3, "=s0") == 0)
+    {
+        downloadUrl.replace(downloadUrl.size() - 3, 3, "=s240-c-k-c0x00ffffff-no-rj");
+    }
+    else
+    {
+        const size_t sPos = downloadUrl.find("=s");
+        if (sPos != std::string::npos && sPos + 2 < downloadUrl.size() &&
+            std::isdigit(static_cast<unsigned char>(downloadUrl[sPos + 2])) != 0)
+        {
+            size_t end = sPos + 2;
+            while (end < downloadUrl.size() && std::isdigit(static_cast<unsigned char>(downloadUrl[end])) != 0)
+            {
+                ++end;
+            }
+            downloadUrl.replace(sPos, end - sPos, "=s240");
+        }
+    }
+
+    const std::filesystem::path jpgPath = cacheDirectory / (cacheKey + ".jpg");
+    if (DownloadHttpToFile(downloadUrl, jpgPath) ||
+        (downloadUrl != avatarUrl && DownloadHttpToFile(avatarUrl, jpgPath)))
+    {
+        std::filesystem::path found = FindThumbnailPath(cacheDirectory, cacheKey);
+        if (!found.empty() && IsLoadableImagePath(found))
+        {
+            return found;
+        }
+    }
+    return {};
+}
+
 LinkGroupEntry ParseFlatEntryObject(const std::string& objectJson, const std::filesystem::path& cacheDirectory)
 {
     LinkGroupEntry entry;
@@ -1471,38 +2168,101 @@ LinkGroupEntry ParseFlatEntryObject(const std::string& objectJson, const std::fi
         entry.url = ExtractJsonStringValue(objectJson, "url");
     }
 
-    // Sometimes yt-dlp flat-playlist returns thumbnail URLs (e.g. .../vi/<videoId>/hqdefault.jpg)
-    // instead of a stable watch URL. If we see a thumbnail URL, extract <videoId> and rebuild watch URL.
-    if (!entry.url.empty() && entry.url.find("i.ytimg.com/vi/") != std::string::npos)
+    const auto isLikelyYoutubeVideoId = [](const std::string& id)
     {
-        const size_t viPos = entry.url.find("/vi/");
-        if (viPos != std::string::npos)
+        if (id.size() != 11)
         {
-            const size_t idStart = viPos + 4;
-            const size_t idEnd = entry.url.find('/', idStart);
-            if (idEnd != std::string::npos && idEnd > idStart)
+            return false;
+        }
+        for (const char ch : id)
+        {
+            if (!((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '-' ||
+                  ch == '_'))
             {
-                const std::string videoId = entry.url.substr(idStart, idEnd - idStart);
-                if (!videoId.empty())
-                {
-                    entry.id = entry.id.empty() || entry.id == "hqdefault" ? videoId : entry.id;
-                    entry.url = "https://www.youtube.com/watch?v=" + videoId;
-                }
+                return false;
+            }
+        }
+        return true;
+    };
+
+    const auto extractIdFromYtimgUrl = [](const std::string& url) -> std::string
+    {
+        // i.ytimg.com/vi/<id>/... and i.ytimg.com/vi_webp/<id>/...
+        static constexpr const char* kMarkers[] = {"/vi_webp/", "/vi/"};
+        for (const char* marker : kMarkers)
+        {
+            const size_t markerPos = url.find(marker);
+            if (markerPos == std::string::npos)
+            {
+                continue;
+            }
+            const size_t idStart = markerPos + std::char_traits<char>::length(marker);
+            const size_t idEnd = url.find_first_of("/?&", idStart);
+            const std::string videoId =
+                idEnd == std::string::npos ? url.substr(idStart) : url.substr(idStart, idEnd - idStart);
+            if (!videoId.empty())
+            {
+                return videoId;
+            }
+        }
+        return {};
+    };
+
+    // /playlists shelf rows: flat JSON often puts a thumbnail URL in "url" before the real
+    // playlist link. Never rewrite a playlist id into watch?v=<first video> — that made every
+    // nested prefetch load a single video.
+    if (LooksLikeYoutubePlaylistId(entry.id))
+    {
+        entry.url = "https://www.youtube.com/playlist?list=" + entry.id;
+    }
+    else
+    {
+        const bool urlLooksLikeYtimg =
+            entry.url.find("ytimg.com/") != std::string::npos || entry.url.find("ggpht.com/") != std::string::npos;
+        if (urlLooksLikeYtimg)
+        {
+            std::string videoId = isLikelyYoutubeVideoId(entry.id) ? entry.id : std::string{};
+            if (videoId.empty())
+            {
+                videoId = extractIdFromYtimgUrl(entry.url);
+            }
+            if (isLikelyYoutubeVideoId(videoId))
+            {
+                entry.id = videoId;
+                // watch?v= works for Shorts too; keeps download/parse paths consistent.
+                entry.url = "https://www.youtube.com/watch?v=" + videoId;
             }
         }
     }
 
-    if (entry.url.empty() && !entry.id.empty())
+    if (entry.url.empty() && isLikelyYoutubeVideoId(entry.id))
     {
         entry.url = "https://www.youtube.com/watch?v=" + entry.id;
     }
     entry.duration = NormalizeDurationString(ExtractJsonStringValue(objectJson, "duration_string"));
-    if (entry.duration == "--:--")
+    if (IsMissingDurationToken(entry.duration))
     {
-        const int seconds = ExtractJsonIntValue(objectJson, "duration");
-        if (seconds > 0)
+        std::string rawSeconds = ExtractJsonStringValue(objectJson, "duration");
+        if (IsMissingDurationToken(rawSeconds))
         {
-            entry.duration = NormalizeDurationString(std::to_string(seconds));
+            rawSeconds = ExtractJsonStringValue(objectJson, "length_seconds");
+        }
+        if (IsMissingDurationToken(rawSeconds))
+        {
+            const int seconds = ExtractJsonIntValue(objectJson, "duration");
+            if (seconds <= 0)
+            {
+                const int lengthSeconds = ExtractJsonIntValue(objectJson, "length_seconds");
+                rawSeconds = lengthSeconds > 0 ? std::to_string(lengthSeconds) : std::string{};
+            }
+            else
+            {
+                rawSeconds = std::to_string(seconds);
+            }
+        }
+        if (!IsMissingDurationToken(rawSeconds))
+        {
+            entry.duration = NormalizeDurationString(rawSeconds);
         }
     }
     if (!entry.id.empty())
@@ -1511,6 +2271,329 @@ LinkGroupEntry ParseFlatEntryObject(const std::string& objectJson, const std::fi
     }
     entry.metadataLoaded = !entry.url.empty();
     return entry;
+}
+
+std::vector<LinkGroupEntry> CollectFlatEntries(const std::string& output, const std::filesystem::path& cacheDirectory)
+{
+    std::vector<LinkGroupEntry> entries;
+    for (const std::string& objectJson : ExtractJsonObjectsFromArray(output, "entries"))
+    {
+        LinkGroupEntry entry = ParseFlatEntryObject(objectJson, cacheDirectory);
+        if (entry.id == "NA" || (entry.url.empty() && entry.id.empty()))
+        {
+            continue;
+        }
+        if (entry.title == "[Private video]" || entry.title == "[Deleted video]" ||
+            entry.title == "[Unavailable video]")
+        {
+            continue;
+        }
+        if (entry.url.empty() && !entry.id.empty())
+        {
+            // Playlist shelf rows are playlist ids, not 11-char watch ids.
+            if (LooksLikeYoutubePlaylistId(entry.id))
+            {
+                entry.url = "https://www.youtube.com/playlist?list=" + entry.id;
+            }
+            else
+            {
+                entry.url = "https://www.youtube.com/watch?v=" + entry.id;
+            }
+        }
+        else if (LooksLikeYoutubePlaylistId(entry.id) && entry.url.find("list=") == std::string::npos &&
+                 entry.url.find("/playlist") == std::string::npos)
+        {
+            // Prefer a stable playlist URL over watch?v=<playlistId> mistakes.
+            entry.url = "https://www.youtube.com/playlist?list=" + entry.id;
+        }
+        entries.push_back(std::move(entry));
+    }
+    return entries;
+}
+
+std::string StripChannelTabTitleSuffix(std::string title)
+{
+    static constexpr const char* kSuffixes[] = {
+        " - Videos", " - Shorts", " - Live", " - Lives", " - Home", " - Featured", " - Playlists"};
+    for (const char* suffix : kSuffixes)
+    {
+        const size_t suffixLen = std::char_traits<char>::length(suffix);
+        if (title.size() > suffixLen && title.compare(title.size() - suffixLen, suffixLen, suffix) == 0)
+        {
+            title.resize(title.size() - suffixLen);
+            break;
+        }
+    }
+    return title;
+}
+
+struct FlatTabFetch
+{
+    bool success = false;
+    bool cancelled = false;
+    std::string title;
+    std::string thumbnailUrl;
+    std::string playlistId;
+    std::string channelId;
+    std::string uploader;
+    std::string output;
+    std::vector<LinkGroupEntry> entries;
+};
+
+FlatTabFetch FetchFlatTab(const std::string& url,
+                          const std::string& ytDlpInvocation,
+                          const std::string& ffmpegArgs,
+                          const std::string& jsArgs,
+                          const std::filesystem::path& cacheDirectory,
+                          const std::shared_ptr<std::atomic_bool>& cancelRequested,
+                          const std::string& preferredBrowser)
+{
+    FlatTabFetch result;
+    const std::string normalizedUrl = NormalizeYoutubeUrl(url);
+    // Match YouTube UI: omit private/deleted/unavailable playlist slots from flat entries.
+    const std::string flatArgs = " --flat-playlist --dump-single-json --skip-download --no-warnings "
+                                 "--compat-options no-youtube-unavailable-videos " +
+                                 LinkInfoLoader::Quote(normalizedUrl) + " 2>&1";
+
+    // Public playlist/channel tabs list without cookies (~1s). Cookie browsers are a
+    // fallback only: a locked Firefox/Chrome profile can fail in a way that used to
+    // abort the ladder before the cookieless attempt.
+    (void)preferredBrowser;
+    std::vector<std::string> browsersToTry;
+    browsersToTry.push_back("");
+    for (const std::string& browser : BuildYoutubeCookieBrowsersToTryList())
+    {
+        if (browser.empty())
+        {
+            continue;
+        }
+        if (std::find(browsersToTry.begin(), browsersToTry.end(), browser) == browsersToTry.end())
+        {
+            browsersToTry.push_back(browser);
+        }
+    }
+
+    for (size_t browserIndex = 0; browserIndex < browsersToTry.size(); ++browserIndex)
+    {
+        if (cancelRequested != nullptr && cancelRequested->load())
+        {
+            result.cancelled = true;
+            return result;
+        }
+
+        const std::string& browser = browsersToTry[browserIndex];
+        const std::string cookieArgs = BuildYoutubeCookiesArgs(browser);
+        const std::string ytDlpCommand = ytDlpInvocation + ffmpegArgs + jsArgs + cookieArgs + flatArgs;
+#ifdef _WIN32
+        const std::string command =
+            "cmd /S /C \"chcp 65001>nul && set PYTHONIOENCODING=utf-8 && " + ytDlpCommand + "\"";
+#else
+        const std::string command = "env PYTHONIOENCODING=utf-8 PYTHONUNBUFFERED=1 " + ytDlpCommand;
+#endif
+        const CommandResult commandResult = RunCommand(command, cancelRequested);
+        if (commandResult.cancelled)
+        {
+            result.cancelled = true;
+            return result;
+        }
+
+        result.output = commandResult.output;
+        result.title = ExtractJsonStringValue(result.output, "title");
+        const bool hasEntries = !ExtractJsonObjectsFromArray(result.output, "entries").empty();
+        result.success = commandResult.exitCode == 0 && (!result.title.empty() || hasEntries);
+        if (result.success)
+        {
+            result.channelId = ExtractChannelIdFromJson(result.output);
+            // Prefer avatar_* / square yt3 thumbs — never fall back to channel banner.
+            result.thumbnailUrl = ExtractChannelAvatarUrlFromJson(result.output);
+            result.playlistId = ExtractJsonStringValue(result.output, "id");
+            result.uploader = ExtractJsonStringValue(result.output, "uploader");
+            if (result.uploader.empty())
+            {
+                result.uploader = ExtractJsonStringValue(result.output, "channel");
+            }
+            result.entries = CollectFlatEntries(result.output, cacheDirectory);
+            if (!browser.empty())
+            {
+                SetPreferredYoutubeCookieBrowser(browser);
+            }
+            return result;
+        }
+        if (!browser.empty() && !ShouldRetryYoutubeWithDifferentCookies(result.output))
+        {
+            break;
+        }
+    }
+    return result;
+}
+
+LinkGroupInfo LoadChannelTabs(const std::string& originalUrl,
+                              const std::shared_ptr<std::atomic_bool>& cancelRequested,
+                              const std::string& ytDlpInvocation,
+                              const std::filesystem::path& cacheDirectory)
+{
+    LinkGroupInfo info;
+    info.url = NormalizeYoutubeChannelBaseUrl(originalUrl);
+    info.kind = LinkGroupKind::Channel;
+    info.hasChannelTabs = true;
+
+    const std::string ffmpegPath = ::FindFfmpegExecutable().string();
+    const std::string ffmpegArgs = ffmpegPath.empty() ? "" : " --ffmpeg-location " + LinkInfoLoader::Quote(ffmpegPath);
+    const std::string jsArgs = BuildYoutubeFlatPlaylistArgs();
+    const std::string preferred = {};
+
+    const FlatTabFetch videos = FetchFlatTab(
+        info.url + "/videos", ytDlpInvocation, ffmpegArgs, jsArgs, cacheDirectory, cancelRequested, preferred);
+    if (videos.cancelled)
+    {
+        info.cancelled = true;
+        info.error = "Parsing cancelled.";
+        return info;
+    }
+
+    const std::string cookieBrowser = GetPreferredYoutubeCookieBrowser();
+    const FlatTabFetch shorts = FetchFlatTab(
+        info.url + "/shorts", ytDlpInvocation, ffmpegArgs, jsArgs, cacheDirectory, cancelRequested, cookieBrowser);
+    if (shorts.cancelled)
+    {
+        info.cancelled = true;
+        info.error = "Parsing cancelled.";
+        return info;
+    }
+
+    const FlatTabFetch lives = FetchFlatTab(
+        info.url + "/streams", ytDlpInvocation, ffmpegArgs, jsArgs, cacheDirectory, cancelRequested, cookieBrowser);
+    if (lives.cancelled)
+    {
+        info.cancelled = true;
+        info.error = "Parsing cancelled.";
+        return info;
+    }
+
+    if (!videos.success && !shorts.success && !lives.success)
+    {
+        info.error = SimplifyYtDlpError(videos.output.empty() ? shorts.output : videos.output);
+        info.errorLog = videos.output;
+        return info;
+    }
+
+    info.success = true;
+    info.isGroup = true;
+    info.videoEntries = videos.entries;
+    info.shortEntries = shorts.entries;
+    info.liveEntries = lives.entries;
+    info.entries = info.videoEntries;
+    info.entries.insert(info.entries.end(), info.shortEntries.begin(), info.shortEntries.end());
+    info.entries.insert(info.entries.end(), info.liveEntries.begin(), info.liveEntries.end());
+    info.entryCount = static_cast<int>(info.entries.size());
+
+    info.title = StripChannelTabTitleSuffix(
+        !videos.title.empty() ? videos.title : (!shorts.title.empty() ? shorts.title : lives.title));
+    info.normalizedTitle = NormalizeVideoTitle(info.title);
+    info.uploader =
+        !videos.uploader.empty() ? videos.uploader : (!shorts.uploader.empty() ? shorts.uploader : lives.uploader);
+
+    // Prefer channel avatar (avatar_* / square yt3), never the wide channel banner.
+    std::string channelId =
+        !videos.channelId.empty() ? videos.channelId : (!shorts.channelId.empty() ? shorts.channelId : lives.channelId);
+    std::string avatarUrl = videos.thumbnailUrl;
+    if (avatarUrl.empty())
+    {
+        avatarUrl = shorts.thumbnailUrl;
+    }
+    if (avatarUrl.empty())
+    {
+        avatarUrl = lives.thumbnailUrl;
+    }
+    info.thumbnailPath = ResolveChannelAvatarPath(cacheDirectory, channelId, avatarUrl).string();
+    return info;
+}
+
+LinkGroupInfo LoadChannelPlaylistsShelf(const std::string& originalUrl,
+                                        const std::shared_ptr<std::atomic_bool>& cancelRequested,
+                                        const std::string& ytDlpInvocation,
+                                        const std::filesystem::path& cacheDirectory)
+{
+    LinkGroupInfo info;
+    const std::string channelBase = NormalizeYoutubeChannelBaseUrl(originalUrl);
+    info.url = channelBase + "/playlists";
+    info.kind = LinkGroupKind::Channel;
+    info.hasPlaylistShelf = true;
+    info.hasChannelTabs = false;
+
+    const std::string ffmpegPath = ::FindFfmpegExecutable().string();
+    const std::string ffmpegArgs = ffmpegPath.empty() ? "" : " --ffmpeg-location " + LinkInfoLoader::Quote(ffmpegPath);
+    const std::string jsArgs = BuildYoutubeFlatPlaylistArgs();
+
+    const FlatTabFetch shelf =
+        FetchFlatTab(info.url, ytDlpInvocation, ffmpegArgs, jsArgs, cacheDirectory, cancelRequested, {});
+    if (shelf.cancelled)
+    {
+        info.cancelled = true;
+        info.error = "Parsing cancelled.";
+        return info;
+    }
+    if (!shelf.success)
+    {
+        info.error = SimplifyYtDlpError(shelf.output);
+        info.errorLog = shelf.output;
+        return info;
+    }
+
+    info.success = true;
+    info.isGroup = true;
+    info.entries = shelf.entries;
+    // Flat /playlists rows sometimes expose only a playlist id — force a watchable playlist URL.
+    for (LinkGroupEntry& entry : info.entries)
+    {
+        const bool hasPlaylistUrl =
+            entry.url.find("list=") != std::string::npos || entry.url.find("/playlist") != std::string::npos;
+        if (hasPlaylistUrl)
+        {
+            continue;
+        }
+        if (LooksLikeYoutubePlaylistId(entry.id))
+        {
+            entry.url = "https://www.youtube.com/playlist?list=" + entry.id;
+        }
+    }
+    info.entryCount = static_cast<int>(info.entries.size());
+    info.title = StripChannelTabTitleSuffix(shelf.title);
+    info.normalizedTitle = NormalizeVideoTitle(info.title);
+    info.uploader = shelf.uploader;
+
+    info.thumbnailPath = ResolveChannelAvatarPath(cacheDirectory, shelf.channelId, shelf.thumbnailUrl).string();
+    return info;
+}
+
+LinkGroupInfo BuildLinkGroupInfoFromFlatTab(const std::string& url,
+                                            const FlatTabFetch& fetch,
+                                            const std::filesystem::path& cacheDirectory)
+{
+    LinkGroupInfo info;
+    info.url = url;
+    info.success = true;
+    info.isGroup = true;
+    info.kind = LinkGroupKind::Playlist;
+    info.title = fetch.title;
+    info.normalizedTitle = NormalizeVideoTitle(fetch.title);
+    info.uploader = fetch.uploader;
+    info.entries = fetch.entries;
+    info.entryCount = static_cast<int>(fetch.entries.size());
+    if (!fetch.entries.empty())
+    {
+        info.thumbnailPath = fetch.entries.front().thumbnailPath;
+        if (info.thumbnailPath.empty() && !fetch.entries.front().id.empty())
+        {
+            info.thumbnailPath =
+                ResolveThumbnailPath(cacheDirectory, fetch.entries.front().id, fetch.thumbnailUrl).string();
+        }
+    }
+    else if (!fetch.thumbnailUrl.empty())
+    {
+        info.thumbnailPath = ResolveThumbnailPath(cacheDirectory, fetch.playlistId, fetch.thumbnailUrl).string();
+    }
+    return info;
 }
 
 LinkGroupInfo LinkGroupInfoLoader::Load(std::string url, std::shared_ptr<std::atomic_bool> cancelRequested)
@@ -1539,11 +2622,56 @@ LinkGroupInfo LinkGroupInfoLoader::Load(std::string url, std::shared_ptr<std::at
         return info;
     }
 
+    // @channel/playlists → shelf of playlists only (not Videos/Shorts/Lives).
+    if (LooksLikeChannelPlaylistsUrl(url))
+    {
+        return LoadChannelPlaylistsShelf(url, cancelRequested, ytDlpInvocation, cacheDirectory);
+    }
+
+    // Nested playlist shelf rows and bare playlist URLs: same flat path as /playlists tab.
+    if (LooksLikePlaylistUrl(url))
+    {
+        const std::string ffmpegPath = ::FindFfmpegExecutable().string();
+        const std::string ffmpegArgs =
+            ffmpegPath.empty() ? "" : " --ffmpeg-location " + LinkInfoLoader::Quote(ffmpegPath);
+        const std::string jsArgs = BuildYoutubeFlatPlaylistArgs();
+        const FlatTabFetch fetch =
+            FetchFlatTab(url, ytDlpInvocation, ffmpegArgs, jsArgs, cacheDirectory, cancelRequested, std::string{});
+        if (fetch.cancelled)
+        {
+            info.cancelled = true;
+            info.error = "Parsing cancelled.";
+            return info;
+        }
+        if (!fetch.success)
+        {
+            info.isGroup = true;
+            info.error = SimplifyYtDlpError(fetch.output);
+            if (info.error.empty())
+            {
+                info.error = "Could not parse playlist.";
+            }
+            info.errorLog = fetch.output;
+            return info;
+        }
+        return BuildLinkGroupInfoFromFlatTab(url, fetch, cacheDirectory);
+    }
+
+    // Channel tab URLs (/@handle/videos, …) must load as a channel, not one playlist.
+    // NormalizeYoutubeChannelBaseUrl strips those suffixes before the playlist check.
+    if (LooksLikeChannelUrl(url) && !HasExplicitYoutubeVideoId(url) &&
+        !LooksLikePlaylistUrl(NormalizeYoutubeChannelBaseUrl(url)))
+    {
+        return LoadChannelTabs(url, cancelRequested, ytDlpInvocation, cacheDirectory);
+    }
+
     const std::string normalizedUrl = NormalizeYoutubeUrl(url);
     const std::string ffmpegPath = ::FindFfmpegExecutable().string();
     const std::string ffmpegArgs = ffmpegPath.empty() ? "" : " --ffmpeg-location " + LinkInfoLoader::Quote(ffmpegPath);
-    const std::string jsArgs = BuildYoutubeJsRuntimeArgs();
-    const std::string flatArgs = " --flat-playlist --dump-single-json --skip-download --no-warnings " +
+    const std::string jsArgs = BuildYoutubeFlatPlaylistArgs();
+    // Match YouTube UI: omit private/deleted/unavailable playlist slots from flat entries.
+    const std::string flatArgs = " --flat-playlist --dump-single-json --skip-download --no-warnings "
+                                 "--compat-options no-youtube-unavailable-videos " +
                                  LinkInfoLoader::Quote(normalizedUrl) + " 2>&1";
 
     std::string output;
@@ -1579,8 +2707,14 @@ LinkGroupInfo LinkGroupInfoLoader::Load(std::string url, std::shared_ptr<std::at
             break;
         }
 
-        const std::string title = ExtractJsonStringValue(output, "title");
-        const bool success = exitCode == 0 && !title.empty();
+        const std::string rootForSuccess = ChannelMetaJsonPrefix(output);
+        std::string title = ExtractJsonStringValue(rootForSuccess, "title");
+        if (title.empty())
+        {
+            title = ExtractJsonStringValue(output, "title");
+        }
+        const bool success =
+            exitCode == 0 && (!title.empty() || !ExtractJsonObjectsFromArray(output, "entries").empty());
         BrowserAttempt attempt;
         attempt.browserSpec = browser;
         attempt.success = success;
@@ -1606,20 +2740,51 @@ LinkGroupInfo LinkGroupInfoLoader::Load(std::string url, std::shared_ptr<std::at
         return info;
     }
 
-    const std::string contentType = ExtractJsonStringValue(output, "_type");
+    // Root metadata only — entry objects also contain "_type"/"title" and would confuse checks.
+    const std::string rootMeta = ChannelMetaJsonPrefix(output);
+    const std::string contentType = ExtractJsonStringValue(rootMeta, "_type");
     const std::vector<std::string> entryObjects = ExtractJsonObjectsFromArray(output, "entries");
     const bool isExplicitGroupType =
         contentType == "playlist" || contentType == "channel" || contentType == "multi_video";
+    // watch?v=…&list=… / youtu.be/…?list=… must stay Single even if flat-playlist returns entries.
+    // One-video playlists must stay groups (entryObjects.size() == 1 is common).
     const bool treatAsGroup =
-        entryObjects.size() > 1 || ((isExplicitGroupType || LooksLikeGroupUrl(url)) && !entryObjects.empty());
+        !HasExplicitYoutubeVideoId(url) &&
+        (entryObjects.size() > 1 || ((isExplicitGroupType || LooksLikeGroupUrl(url)) && !entryObjects.empty()));
 
     if (!treatAsGroup || entryObjects.empty())
     {
+        // Bare playlist/channel-tab URLs must not fall through to LoadVideo (that yields a
+        // promote/Unavailable dead-end for nested shelf rows).
+        if (LooksLikePlaylistUrl(url) || LooksLikeChannelPlaylistsUrl(url) ||
+            (LooksLikeChannelUrl(url) && !HasExplicitYoutubeVideoId(url)))
+        {
+            info.isGroup = true;
+            info.success = false;
+            if (exitCode != 0)
+            {
+                info.error = SimplifyYtDlpError(output);
+            }
+            else if (entryObjects.empty())
+            {
+                info.error = "Playlist has no videos.";
+            }
+            else
+            {
+                info.error = "Could not parse playlist.";
+            }
+            info.errorLog = output;
+            return info;
+        }
         info.isGroup = false;
         info.singleVideo = LinkInfoLoader::LoadVideo(url, cancelRequested);
         if (!info.singleVideo.parseBrowserReport.empty())
         {
             info.parseBrowserReport = info.singleVideo.parseBrowserReport;
+        }
+        if (!info.singleVideo.success)
+        {
+            info.error = info.singleVideo.error.empty() ? "Could not parse playlist." : info.singleVideo.error;
         }
         return info;
     }
@@ -1636,20 +2801,21 @@ LinkGroupInfo LinkGroupInfoLoader::Load(std::string url, std::shared_ptr<std::at
     parseLog.SetWinner(successfulBrowser);
     info.parseBrowserReport = parseLog.FormatSection("Parse");
     SetPreferredYoutubeCookieBrowser(successfulBrowser);
-    info.title = ExtractJsonStringValue(output, "title");
+    info.title = ExtractJsonStringValue(rootMeta, "title");
     info.normalizedTitle = NormalizeVideoTitle(info.title);
-    info.uploader = ExtractJsonStringValue(output, "uploader");
+    info.uploader = ExtractJsonStringValue(rootMeta, "uploader");
     if (info.uploader.empty())
     {
-        info.uploader = ExtractJsonStringValue(output, "channel");
+        info.uploader = ExtractJsonStringValue(rootMeta, "channel");
     }
-    info.duration = NormalizeDurationString(ExtractJsonStringValue(output, "duration_string"));
-    const std::string playlistId = ExtractJsonStringValue(output, "id");
-    const std::string thumbnailUrl = ExtractJsonStringValue(output, "thumbnail");
+    info.duration = NormalizeDurationString(ExtractJsonStringValue(rootMeta, "duration_string"));
+    const std::string playlistId = ExtractJsonStringValue(rootMeta, "id");
+    const std::string thumbnailUrl = ExtractJsonStringValue(rootMeta, "thumbnail");
 
     // Channel tabs (/@handle/videos, /channel/UC…/videos) often come back as _type=playlist
     // from yt-dlp (YoutubeTab). Prefer the URL shape over extractor _type.
-    if ((LooksLikeChannelUrl(url) && !LooksLikePlaylistUrl(url)) || contentType == "channel")
+    if ((LooksLikeChannelUrl(url) && !LooksLikePlaylistUrl(NormalizeYoutubeChannelBaseUrl(url))) ||
+        contentType == "channel")
     {
         info.kind = LinkGroupKind::Channel;
     }
@@ -1661,6 +2827,11 @@ LinkGroupInfo LinkGroupInfoLoader::Load(std::string url, std::shared_ptr<std::at
     for (const std::string& objectJson : entryObjects)
     {
         LinkGroupEntry entry = ParseFlatEntryObject(objectJson, cacheDirectory);
+        if (entry.title == "[Private video]" || entry.title == "[Deleted video]" ||
+            entry.title == "[Unavailable video]")
+        {
+            continue;
+        }
         if (!entry.url.empty() || !entry.id.empty())
         {
             if (entry.url.empty() && !entry.id.empty())
@@ -1687,12 +2858,8 @@ LinkGroupInfo LinkGroupInfoLoader::Load(std::string url, std::shared_ptr<std::at
         info.thumbnailPath = info.entries.front().thumbnailPath;
     }
 
-    const int playlistCount = ExtractJsonIntValue(output, "playlist_count");
-    info.entryCount = playlistCount > 0 ? playlistCount : static_cast<int>(info.entries.size());
-    if (info.entryCount == 0)
-    {
-        info.entryCount = static_cast<int>(info.entries.size());
-    }
+    // Count what we actually kept (compat-options may shrink entries vs playlist_count).
+    info.entryCount = static_cast<int>(info.entries.size());
     return info;
 }
 
@@ -1703,7 +2870,7 @@ LinkInfo BuildPartialLinkInfoFromEntry(const LinkGroupEntry& entry)
     info.url = entry.url;
     info.title = entry.title.empty() ? entry.url : entry.title;
     info.normalizedTitle = NormalizeVideoTitle(info.title);
-    info.duration = entry.duration.empty() ? "--:--" : entry.duration;
+    info.duration = IsMissingDurationToken(entry.duration) ? "--:--" : entry.duration;
     info.thumbnailPath = entry.thumbnailPath;
     info.container = "Unknown";
     info.videoCodec = "None";

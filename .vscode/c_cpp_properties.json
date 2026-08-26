@@ -8,7 +8,6 @@
         "${workspaceFolder}/../packages/tinyfiledialogs"
       ],
       "defines": [
-        "FOURKDOWNER_VERSION=\"1.1.0\"",
         "PLATFORM_DESKTOP",
         "GRAPHICS_API_OPENGL_33"
       ],

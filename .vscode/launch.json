@@ -5,7 +5,7 @@
       "name": "4KDowner",
       "type": "lldb",
       "request": "launch",
-      "program": "${workspaceFolder}/build/Debug/4KDowner.exe",
+      "program": "${workspaceFolder}/build-windows/Debug/4KDowner.exe",
       "args": [],
       "cwd": "${workspaceFolder}",
       "preLaunchTask": "Build 4KDowner (Debug)",

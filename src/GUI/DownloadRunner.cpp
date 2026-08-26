@@ -1,6 +1,7 @@
 #include "DownloadRunner.h"
 
 #include "BrowserDiagnostics.h"
+#include "DownloadFormatPredictor.h"
 #include "ToolPaths.h"
 #include "VideoTitle.h"
 #include "WinProcess.h"
@@ -9,7 +10,9 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
@@ -152,8 +155,8 @@ std::string QualityFilter(const std::string& quality)
         return "[height>=144]";
     }
 
-    // Cap semantics: best available at or below the selected height.
-    return "[height>=144][height<=" + std::to_string(height) + "]";
+    // Cap by YouTube quality label (short side). Landscape uses height<=N; Shorts/portrait use width<=N.
+    return "[height>=144][height<=" + std::to_string(height) + "]/[width>=144][width<=" + std::to_string(height) + "]";
 }
 
 bool IsAudioOnlyExtension(const std::string& extension)
@@ -165,8 +168,33 @@ bool IsAudioOnlyExtension(const std::string& extension)
 std::string BuildFormatSelector(const DownloadRequest& request)
 {
     const std::string ext = ToLower(request.fileFormat);
-    const std::string height = QualityFilter(request.quality);
+    const std::string qualityFilter = QualityFilter(request.quality);
     const std::string skipUpscaled = "[format_id!*=sr]";
+
+    // qualityFilter may contain "/" alternatives (landscape height / portrait width). Expand so each
+    // bestvideo… branch tries both.
+    const auto withQuality = [&](const std::string& prefix, const std::string& suffix = "") -> std::string
+    {
+        std::string result;
+        size_t start = 0;
+        while (start <= qualityFilter.size())
+        {
+            const size_t slash = qualityFilter.find('/', start);
+            const std::string part =
+                qualityFilter.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+            if (!result.empty())
+            {
+                result += '/';
+            }
+            result += prefix + part + suffix;
+            if (slash == std::string::npos)
+            {
+                break;
+            }
+            start = slash + 1;
+        }
+        return result;
+    };
 
     if (request.mediaMode == "Audio only")
     {
@@ -192,25 +220,27 @@ std::string BuildFormatSelector(const DownloadRequest& request)
     {
         if (ext == "mp4")
         {
-            return "bestvideo" + height + "[ext=mp4]" + skipUpscaled + "/bestvideo" + height + skipUpscaled +
-                   "/bestvideo" + height;
+            return withQuality("bestvideo", "[ext=mp4]" + skipUpscaled) + "/" + withQuality("bestvideo", skipUpscaled) +
+                   "/" + withQuality("bestvideo");
         }
-        return "bestvideo" + height + "[ext=" + ext + "]" + "/bestvideo" + height;
+        return withQuality("bestvideo", "[ext=" + ext + "]") + "/" + withQuality("bestvideo");
     }
 
     if (ext == "mp4")
     {
-        return "bestvideo" + height + "[ext=mp4]" + skipUpscaled + "+bestaudio[ext=m4a]" + "/bestvideo" + height +
-               skipUpscaled + "+bestaudio" + "/bestvideo" + height + "+bestaudio";
+        // +audio must be inside each quality alternative. Appending after withQuality()
+        // yields bestvideo[h]/bestvideo[w]+ba — yt-dlp then picks the video-only first branch.
+        return withQuality("bestvideo", "[ext=mp4]" + skipUpscaled + "+bestaudio[ext=m4a]") + "/" +
+               withQuality("bestvideo", skipUpscaled + "+bestaudio") + "/" + withQuality("bestvideo", "+bestaudio");
     }
 
     if (ext == "webm")
     {
-        return "bestvideo" + height + "[ext=webm]+bestaudio[ext=webm]" + "/bestvideo" + height +
-               "[ext=webm]+bestaudio" + "/bestvideo" + height + "+bestaudio";
+        return withQuality("bestvideo", "[ext=webm]+bestaudio[ext=webm]") + "/" +
+               withQuality("bestvideo", "[ext=webm]+bestaudio") + "/" + withQuality("bestvideo", "+bestaudio");
     }
 
-    return "bestvideo" + height + "+bestaudio";
+    return withQuality("bestvideo", "+bestaudio");
 }
 
 std::string BuildRelaxedFormatSelector(const DownloadRequest& request)
@@ -218,16 +248,86 @@ std::string BuildRelaxedFormatSelector(const DownloadRequest& request)
     // Loosen container/codec constraints, but NEVER drop the quality cap — otherwise a
     // "format not available" retry silently upgrades 360p to best/1080p+.
     const std::string ext = ToLower(request.fileFormat);
-    const std::string height = QualityFilter(request.quality);
+    const std::string qualityFilter = QualityFilter(request.quality);
     if (request.mediaMode == "Audio only" || IsAudioOnlyExtension(ext))
     {
         return "bestaudio/best";
     }
+
+    const auto withQuality = [&](const std::string& prefix, const std::string& suffix = "") -> std::string
+    {
+        std::string result;
+        size_t start = 0;
+        while (start <= qualityFilter.size())
+        {
+            const size_t slash = qualityFilter.find('/', start);
+            const std::string part =
+                qualityFilter.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+            if (!result.empty())
+            {
+                result += '/';
+            }
+            result += prefix + part + suffix;
+            if (slash == std::string::npos)
+            {
+                break;
+            }
+            start = slash + 1;
+        }
+        return result;
+    };
+
     if (request.mediaMode == "Video only")
     {
-        return "bestvideo" + height + "/bestvideo" + height + "/best" + height;
+        return withQuality("bestvideo") + "/" + withQuality("best");
     }
-    return "bestvideo" + height + "+bestaudio/bestvideo" + height + "+bestaudio/best" + height;
+    // Never fall back to bare `best` — on YouTube that is often video-only DASH.
+    // +audio must be inside each quality alternative (same as BuildFormatSelector).
+    return withQuality("bestvideo", "+bestaudio") + "/" + withQuality("bv*", "+ba") + "/b";
+}
+
+// HLS-only (m3u8) at the same quality cap — used after https DASH CDN 403.
+// Never fall back to https DASH here: that reselects itag 401/315 and hits the same 403.
+// OutputBelowRequestedQuality still rejects undersized files.
+std::string BuildHlsFormatSelector(const DownloadRequest& request)
+{
+    const std::string ext = ToLower(request.fileFormat);
+    const std::string qualityFilter = QualityFilter(request.quality);
+
+    const auto withQuality = [&](const std::string& prefix, const std::string& suffix = "") -> std::string
+    {
+        std::string result;
+        size_t start = 0;
+        while (start <= qualityFilter.size())
+        {
+            const size_t slash = qualityFilter.find('/', start);
+            const std::string part =
+                qualityFilter.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+            if (!result.empty())
+            {
+                result += '/';
+            }
+            result += prefix + part + suffix;
+            if (slash == std::string::npos)
+            {
+                break;
+            }
+            start = slash + 1;
+        }
+        return result;
+    };
+
+    if (request.mediaMode == "Audio only" || IsAudioOnlyExtension(ext))
+    {
+        return "bestaudio/best";
+    }
+
+    if (request.mediaMode == "Video only")
+    {
+        return withQuality("bestvideo", "[protocol^=m3u8]");
+    }
+
+    return withQuality("bestvideo", "[protocol^=m3u8]+bestaudio") + "/" + withQuality("bv*", "[protocol^=m3u8]+ba");
 }
 
 std::string TrimLine(std::string value)
@@ -243,31 +343,16 @@ std::string TrimLine(std::string value)
     return value;
 }
 
-std::string ExtractLastOutputLine(const std::string& output)
-{
-    size_t end = output.size();
-    while (end > 0 && (output[end - 1] == '\r' || output[end - 1] == '\n' || output[end - 1] == ' '))
-    {
-        --end;
-    }
-    size_t start = end;
-    while (start > 0 && output[start - 1] != '\r' && output[start - 1] != '\n')
-    {
-        --start;
-    }
-    return TrimLine(output.substr(start, end - start));
-}
-
 std::string BuildDownloadFailureStatus(const std::string& lastLine, const std::string& fullOutput, int exitCode)
 {
-    std::string message = lastLine;
+    std::string message = IsYtDlpDownloadProgressLine(lastLine) ? std::string{} : lastLine;
     if (message.empty() && !fullOutput.empty())
     {
         message = SimplifyYtDlpError(fullOutput);
     }
     if (message.empty())
     {
-        message = ExtractLastOutputLine(fullOutput);
+        message = ExtractLastMeaningfulYtDlpOutputLine(fullOutput);
     }
     if (message.empty())
     {
@@ -295,7 +380,7 @@ std::string BuildDownloadErrorLog(const DownloadRequest& request,
     stream << "Exit code: " << exitCode << "\n";
     if (!fullOutput.empty())
     {
-        stream << "\n--- yt-dlp output ---\n" << fullOutput;
+        stream << "\n--- yt-dlp output ---\n" << FilterYtDlpProgressLinesFromOutput(fullOutput);
     }
     else
     {
@@ -359,9 +444,1013 @@ bool ParseLastDownloadProgress(const std::string& text, float& progress)
     return ParseDownloadProgressAt(text, percent, progress);
 }
 
+bool ParseYtdlpSpeedBps(const std::string& line, double& outBytesPerSecond)
+{
+    const size_t at = line.find(" at ");
+    if (at == std::string::npos)
+    {
+        return false;
+    }
+
+    const size_t speedStart = at + 4;
+    const size_t eta = line.find(" ETA ", speedStart);
+    const size_t speedEnd = eta == std::string::npos ? line.size() : eta;
+    const std::string token = TrimLine(line.substr(speedStart, speedEnd - speedStart));
+    if (token.size() < 4 || token.back() != 's')
+    {
+        return false;
+    }
+
+    const size_t slash = token.rfind('/');
+    if (slash == std::string::npos || slash == 0)
+    {
+        return false;
+    }
+
+    size_t valueEnd = 0;
+    while (valueEnd < slash && ((token[valueEnd] >= '0' && token[valueEnd] <= '9') || token[valueEnd] == '.'))
+    {
+        ++valueEnd;
+    }
+    if (valueEnd == 0)
+    {
+        return false;
+    }
+
+    double value = 0.0;
+    try
+    {
+        value = std::stod(token.substr(0, valueEnd));
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    const std::string unit = token.substr(valueEnd, slash - valueEnd);
+    double multiplier = 0.0;
+    if (unit == "B")
+    {
+        multiplier = 1.0;
+    }
+    else if (unit == "KiB")
+    {
+        multiplier = 1024.0;
+    }
+    else if (unit == "MiB")
+    {
+        multiplier = 1024.0 * 1024.0;
+    }
+    else if (unit == "GiB")
+    {
+        multiplier = 1024.0 * 1024.0 * 1024.0;
+    }
+    else
+    {
+        return false;
+    }
+
+    if (value < 0.0)
+    {
+        return false;
+    }
+
+    outBytesPerSecond = value * multiplier;
+    return true;
+}
+
+// Parses totals from lines like: "[download] 12.3% of ~245.67GiB at ..."
+bool ParseYtDlpTotalBytes(const std::string& line, std::int64_t& outBytes)
+{
+    const size_t ofPos = line.find(" of ");
+    if (ofPos == std::string::npos)
+    {
+        return false;
+    }
+
+    size_t cursor = ofPos + 4;
+    while (cursor < line.size() && (line[cursor] == ' ' || line[cursor] == '~'))
+    {
+        ++cursor;
+    }
+
+    size_t valueEnd = cursor;
+    while (valueEnd < line.size() && ((line[valueEnd] >= '0' && line[valueEnd] <= '9') || line[valueEnd] == '.'))
+    {
+        ++valueEnd;
+    }
+    if (valueEnd == cursor)
+    {
+        return false;
+    }
+
+    double value = 0.0;
+    try
+    {
+        value = std::stod(line.substr(cursor, valueEnd - cursor));
+    }
+    catch (...)
+    {
+        return false;
+    }
+
+    size_t unitEnd = valueEnd;
+    while (unitEnd < line.size() && std::isalpha(static_cast<unsigned char>(line[unitEnd])))
+    {
+        ++unitEnd;
+    }
+    const std::string unit = line.substr(valueEnd, unitEnd - valueEnd);
+    double multiplier = 0.0;
+    if (unit == "B")
+    {
+        multiplier = 1.0;
+    }
+    else if (unit == "KiB")
+    {
+        multiplier = 1024.0;
+    }
+    else if (unit == "MiB")
+    {
+        multiplier = 1024.0 * 1024.0;
+    }
+    else if (unit == "GiB")
+    {
+        multiplier = 1024.0 * 1024.0 * 1024.0;
+    }
+    else if (unit == "TiB")
+    {
+        multiplier = 1024.0 * 1024.0 * 1024.0 * 1024.0;
+    }
+    else
+    {
+        return false;
+    }
+
+    if (value <= 0.0)
+    {
+        return false;
+    }
+
+    outBytes = static_cast<std::int64_t>(value * multiplier + 0.5);
+    return outBytes > 0;
+}
+
+// "[download] Downloading fragment 4377 of 50000" → ratio for estimate / yt progress.
+bool ParseYtDlpFragmentProgress(const std::string& line, float& outRatio)
+{
+    const size_t frag = line.find("fragment ");
+    if (frag == std::string::npos)
+    {
+        return false;
+    }
+
+    size_t cursor = frag + 9;
+    while (cursor < line.size() && line[cursor] == ' ')
+    {
+        ++cursor;
+    }
+
+    size_t numEnd = cursor;
+    while (numEnd < line.size() && line[numEnd] >= '0' && line[numEnd] <= '9')
+    {
+        ++numEnd;
+    }
+    if (numEnd == cursor)
+    {
+        return false;
+    }
+
+    size_t ofPos = line.find(" of ", numEnd);
+    if (ofPos == std::string::npos)
+    {
+        return false;
+    }
+
+    size_t denStart = ofPos + 4;
+    while (denStart < line.size() && line[denStart] == ' ')
+    {
+        ++denStart;
+    }
+    size_t denEnd = denStart;
+    while (denEnd < line.size() && line[denEnd] >= '0' && line[denEnd] <= '9')
+    {
+        ++denEnd;
+    }
+    if (denEnd == denStart)
+    {
+        return false;
+    }
+
+    try
+    {
+        const double current = std::stod(line.substr(cursor, numEnd - cursor));
+        const double total = std::stod(line.substr(denStart, denEnd - denStart));
+        if (current <= 0.0 || total <= 0.0 || current > total * 1.01)
+        {
+            return false;
+        }
+        outRatio = static_cast<float>(std::clamp(current / total, 0.0, 1.0));
+        return true;
+    }
+    catch (...)
+    {
+        return false;
+    }
+}
+
 int CountDownloadStreams(const std::string& mediaMode)
 {
     return mediaMode == "Both" ? 2 : 1;
+}
+
+bool FilenameEndsWithIgnoreCase(const std::string& value, const std::string& suffix)
+{
+    if (suffix.empty() || value.size() < suffix.size())
+    {
+        return false;
+    }
+    for (size_t i = 0; i < suffix.size(); ++i)
+    {
+        const unsigned char a = static_cast<unsigned char>(value[value.size() - suffix.size() + i]);
+        const unsigned char b = static_cast<unsigned char>(suffix[i]);
+        if (std::tolower(a) != std::tolower(b))
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Extensions that belong to one UI container job (video + typical audio sidecar).
+std::vector<std::string> CompanionExtensionsForFileFormat(const std::string& fileFormat)
+{
+    const std::string ext = ToLower(fileFormat);
+    if (ext.empty())
+    {
+        return {};
+    }
+    if (ext == "mp4" || ext == "m4v")
+    {
+        return {"mp4", "m4v", "m4a"};
+    }
+    if (ext == "m4a")
+    {
+        return {"m4a"};
+    }
+    if (ext == "webm")
+    {
+        return {"webm", "opus", "ogg"};
+    }
+    if (ext == "mkv")
+    {
+        return {"mkv", "webm", "m4a", "opus", "ogg", "mp4"};
+    }
+    if (ext == "mp3" || ext == "opus" || ext == "ogg" || ext == "flac" || ext == "wav" || ext == "aac")
+    {
+        return {ext};
+    }
+    return {ext};
+}
+
+bool ArtifactMatchesFileFormat(const std::string& filename, const std::string& titleStem, const std::string& fileFormat)
+{
+    const std::vector<std::string> allowed = CompanionExtensionsForFileFormat(fileFormat);
+    if (allowed.empty())
+    {
+        return true;
+    }
+    if (titleStem.empty() || filename.size() <= titleStem.size() ||
+        filename.compare(0, titleStem.size(), titleStem) != 0 || filename[titleStem.size()] != '.')
+    {
+        return false;
+    }
+
+    std::string rest = ToLower(filename.substr(titleStem.size()));
+    while (FilenameEndsWithIgnoreCase(rest, ".part"))
+    {
+        rest.resize(rest.size() - 5);
+    }
+    while (FilenameEndsWithIgnoreCase(rest, ".ytdl"))
+    {
+        rest.resize(rest.size() - 5);
+    }
+    const size_t frag = rest.find("-frag");
+    if (frag != std::string::npos)
+    {
+        rest.resize(frag);
+    }
+
+    const size_t lastDot = rest.rfind('.');
+    if (lastDot == std::string::npos || lastDot + 1 >= rest.size())
+    {
+        return false;
+    }
+    const std::string fileExt = rest.substr(lastDot + 1);
+    for (const std::string& allowedExt : allowed)
+    {
+        if (fileExt == allowedExt)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsYtDlpDownloadArtifactName(const std::string& filename, const std::string& titleStem)
+{
+    if (titleStem.empty() || filename.size() <= titleStem.size() ||
+        filename.compare(0, titleStem.size(), titleStem) != 0 || filename[titleStem.size()] != '.')
+    {
+        return false;
+    }
+
+    if (filename.find(".part") != std::string::npos)
+    {
+        return true;
+    }
+
+    // yt-dlp resume/control sidecar (e.g. Title.mp4.ytdl)
+    if (filename.size() >= 5 && filename.compare(filename.size() - 5, 5, ".ytdl") == 0)
+    {
+        return true;
+    }
+
+    // yt-dlp format fragments: Title.f398.mp4 / Title.f140.m4a
+    const size_t formatMark = titleStem.size() + 1;
+    if (formatMark + 1 < filename.size() && filename[formatMark] == 'f' &&
+        std::isdigit(static_cast<unsigned char>(filename[formatMark + 1])))
+    {
+        return true;
+    }
+    return false;
+}
+
+// HLS main accumulator: Title.ext.part without transient -Frag* or DASH Title.fNNN.* side files.
+bool IsMainDownloadPartFile(const std::string& filename, const std::string& titleStem)
+{
+    if (titleStem.empty() || filename.size() <= titleStem.size() ||
+        filename.compare(0, titleStem.size(), titleStem) != 0 || filename[titleStem.size()] != '.')
+    {
+        return false;
+    }
+
+    if (filename.find(".part") == std::string::npos)
+    {
+        return false;
+    }
+
+    if (filename.find("-Frag") != std::string::npos)
+    {
+        return false;
+    }
+
+    const size_t formatMark = titleStem.size() + 1;
+    if (formatMark + 1 < filename.size() && filename[formatMark] == 'f' &&
+        std::isdigit(static_cast<unsigned char>(filename[formatMark + 1])))
+    {
+        return false;
+    }
+
+    return true;
+}
+
+// directory_entry::file_size() on Windows uses FindFirstFile cache and often stays
+// stale while yt-dlp still has the .part open. Open+GetFileSizeEx sees live EOF.
+std::uint64_t LiveFileSizeBytes(const std::filesystem::path& path)
+{
+#ifdef _WIN32
+    const HANDLE handle = CreateFileW(path.c_str(),
+                                      FILE_READ_ATTRIBUTES,
+                                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                      nullptr,
+                                      OPEN_EXISTING,
+                                      FILE_ATTRIBUTE_NORMAL,
+                                      nullptr);
+    if (handle == INVALID_HANDLE_VALUE)
+    {
+        return 0;
+    }
+
+    LARGE_INTEGER size{};
+    const BOOL ok = GetFileSizeEx(handle, &size);
+    CloseHandle(handle);
+    if (!ok || size.QuadPart < 0)
+    {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(size.QuadPart);
+#else
+    std::error_code error;
+    const auto size = std::filesystem::file_size(path, error);
+    if (error)
+    {
+        return 0;
+    }
+    return static_cast<std::uint64_t>(size);
+#endif
+}
+
+std::uint64_t SumDownloadArtifactBytes(const std::string& outputDirectory,
+                                       const std::string& titleStem,
+                                       bool singleMainPart,
+                                       const std::string& fileFormat)
+{
+    if (outputDirectory.empty() || titleStem.empty())
+    {
+        return 0;
+    }
+
+    std::error_code error;
+    const std::filesystem::path directory = std::filesystem::u8path(outputDirectory);
+    if (!std::filesystem::is_directory(directory, error) || error)
+    {
+        return 0;
+    }
+
+    std::uint64_t total = 0;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(directory, error))
+    {
+        if (error)
+        {
+            break;
+        }
+        if (!entry.is_regular_file(error) || error)
+        {
+            continue;
+        }
+
+        const std::string filename = entry.path().filename().u8string();
+        if (!ArtifactMatchesFileFormat(filename, titleStem, fileFormat))
+        {
+            continue;
+        }
+        if (singleMainPart)
+        {
+            if (!IsMainDownloadPartFile(filename, titleStem))
+            {
+                continue;
+            }
+        }
+        else if (!IsYtDlpDownloadArtifactName(filename, titleStem))
+        {
+            continue;
+        }
+        else if (filename.find("-Frag") != std::string::npos)
+        {
+            // HLS temps — size is already reflected in the main .part accumulator.
+            continue;
+        }
+
+        total += LiveFileSizeBytes(entry.path());
+        error.clear();
+    }
+    return total;
+}
+
+// Final Title.ext written by ffmpeg/yt-dlp merge (not .part / .ytdl / Title.fNNN.*).
+bool IsMergeOutputCandidateName(const std::string& filename,
+                                const std::string& titleStem,
+                                const std::string& fileFormat)
+{
+    if (titleStem.empty() || filename.size() <= titleStem.size() + 1 ||
+        filename.compare(0, titleStem.size(), titleStem) != 0 || filename[titleStem.size()] != '.')
+    {
+        return false;
+    }
+
+    if (IsYtDlpDownloadArtifactName(filename, titleStem))
+    {
+        return false;
+    }
+    return ArtifactMatchesFileFormat(filename, titleStem, fileFormat);
+}
+
+std::uint64_t
+SumMergeOutputBytes(const std::string& outputDirectory, const std::string& titleStem, const std::string& fileFormat)
+{
+    if (outputDirectory.empty() || titleStem.empty())
+    {
+        return 0;
+    }
+
+    std::error_code error;
+    const std::filesystem::path directory = std::filesystem::u8path(outputDirectory);
+    if (!std::filesystem::is_directory(directory, error) || error)
+    {
+        return 0;
+    }
+
+    std::uint64_t total = 0;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(directory, error))
+    {
+        if (error)
+        {
+            break;
+        }
+        if (!entry.is_regular_file(error) || error)
+        {
+            continue;
+        }
+
+        const std::string filename = entry.path().filename().u8string();
+        if (!IsMergeOutputCandidateName(filename, titleStem, fileFormat))
+        {
+            continue;
+        }
+
+        total += LiveFileSizeBytes(entry.path());
+        error.clear();
+    }
+    return total;
+}
+
+std::filesystem::path
+FindDownloadOutputFile(const std::string& outputDirectory, const std::string& titleStem, const std::string& fileFormat)
+{
+    if (outputDirectory.empty() || titleStem.empty())
+    {
+        return {};
+    }
+
+    std::error_code error;
+    const std::filesystem::path directory = std::filesystem::u8path(outputDirectory);
+    if (!std::filesystem::is_directory(directory, error) || error)
+    {
+        return {};
+    }
+
+    const std::string lowerExt = ToLower(fileFormat);
+    if (!lowerExt.empty())
+    {
+        const std::filesystem::path exact = directory / (titleStem + "." + lowerExt);
+        if (std::filesystem::is_regular_file(exact, error))
+        {
+            return exact;
+        }
+    }
+
+    std::filesystem::path bestMatch;
+    std::uint64_t bestSize = 0;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(directory, error))
+    {
+        if (error || !entry.is_regular_file(error))
+        {
+            continue;
+        }
+        const std::string filename = entry.path().filename().u8string();
+        if (!IsMergeOutputCandidateName(filename, titleStem, fileFormat))
+        {
+            continue;
+        }
+        const std::uint64_t size = LiveFileSizeBytes(entry.path());
+        if (bestMatch.empty() || size > bestSize)
+        {
+            bestMatch = entry.path();
+            bestSize = size;
+        }
+        error.clear();
+    }
+    return bestMatch;
+}
+
+#ifdef _WIN32
+std::wstring QuoteWidePath(const std::filesystem::path& path)
+{
+    std::wstring value = path.wstring();
+    std::wstring escaped;
+    escaped.reserve(value.size() + 2);
+    escaped.push_back(L'"');
+    for (const wchar_t ch : value)
+    {
+        if (ch == L'"')
+        {
+            escaped += L"\\\"";
+        }
+        else
+        {
+            escaped.push_back(ch);
+        }
+    }
+    escaped.push_back(L'"');
+    return escaped;
+}
+
+std::string CaptureProcessOutputUtf8(const std::wstring& commandLine, int* exitCodeOut)
+{
+    if (exitCodeOut != nullptr)
+    {
+        *exitCodeOut = -1;
+    }
+
+    SECURITY_ATTRIBUTES securityAttributes{};
+    securityAttributes.nLength = sizeof(securityAttributes);
+    securityAttributes.bInheritHandle = TRUE;
+
+    HANDLE readPipe = nullptr;
+    HANDLE writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &securityAttributes, 0))
+    {
+        return {};
+    }
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW startupInfo{};
+    PROCESS_INFORMATION processInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+    startupInfo.dwFlags = STARTF_USESTDHANDLES | STARTF_USESHOWWINDOW;
+    startupInfo.wShowWindow = SW_HIDE;
+    startupInfo.hStdOutput = writePipe;
+    startupInfo.hStdError = writePipe;
+    startupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    std::vector<wchar_t> mutableCommand(commandLine.begin(), commandLine.end());
+    mutableCommand.push_back(L'\0');
+    const BOOL started = CreateProcessW(nullptr,
+                                        mutableCommand.data(),
+                                        nullptr,
+                                        nullptr,
+                                        TRUE,
+                                        CREATE_NO_WINDOW,
+                                        nullptr,
+                                        nullptr,
+                                        &startupInfo,
+                                        &processInfo);
+    CloseHandle(writePipe);
+    if (!started)
+    {
+        CloseHandle(readPipe);
+        return {};
+    }
+
+    std::string output;
+    std::array<char, 512> buffer{};
+    for (;;)
+    {
+        DWORD read = 0;
+        if (!ReadFile(readPipe, buffer.data(), static_cast<DWORD>(buffer.size() - 1), &read, nullptr) || read == 0)
+        {
+            break;
+        }
+        output.append(buffer.data(), read);
+    }
+
+    WaitForSingleObject(processInfo.hProcess, 15000);
+    DWORD exitCode = 1;
+    GetExitCodeProcess(processInfo.hProcess, &exitCode);
+    if (exitCodeOut != nullptr)
+    {
+        *exitCodeOut = static_cast<int>(exitCode);
+    }
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    CloseHandle(readPipe);
+    return output;
+}
+#else
+std::string CaptureProcessOutputUtf8(const std::string& commandLine, int* exitCodeOut)
+{
+    if (exitCodeOut != nullptr)
+    {
+        *exitCodeOut = -1;
+    }
+    FILE* pipe = popen(commandLine.c_str(), "r");
+    if (pipe == nullptr)
+    {
+        return {};
+    }
+    std::string output;
+    std::array<char, 512> buffer{};
+    while (fgets(buffer.data(), static_cast<int>(buffer.size()), pipe) != nullptr)
+    {
+        output += buffer.data();
+    }
+    const int status = pclose(pipe);
+    if (exitCodeOut != nullptr)
+    {
+        if (status < 0)
+        {
+            *exitCodeOut = -1;
+        }
+        else if (WIFEXITED(status))
+        {
+            *exitCodeOut = WEXITSTATUS(status);
+        }
+        else
+        {
+            *exitCodeOut = status;
+        }
+    }
+    return output;
+}
+#endif
+
+bool BothOutputMissingAudio(const DownloadRequest& request, const std::string& outputTitle)
+{
+    if (request.mediaMode != "Both")
+    {
+        return false;
+    }
+    const std::filesystem::path outputFile =
+        FindDownloadOutputFile(request.outputDirectory, outputTitle, request.fileFormat);
+    if (outputFile.empty())
+    {
+        return false;
+    }
+    return ProbeMediaFileAudio(outputFile) == MediaAudioProbeResult::MissingAudio;
+}
+
+void TryRemoveDownloadPath(const std::filesystem::path& path);
+
+int ProbeMediaVideoShortSidePixels(const std::filesystem::path& mediaPath)
+{
+    std::error_code error;
+    if (mediaPath.empty() || !std::filesystem::is_regular_file(mediaPath, error) ||
+        std::filesystem::file_size(mediaPath, error) == 0)
+    {
+        return 0;
+    }
+
+    const std::filesystem::path ffprobe = FindFfprobeExecutable();
+    if (ffprobe.empty())
+    {
+        return 0;
+    }
+
+#ifdef _WIN32
+    const std::wstring commandLine =
+        QuoteWidePath(ffprobe) + L" -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x " +
+        QuoteWidePath(mediaPath);
+    int exitCode = -1;
+    const std::string output = CaptureProcessOutputUtf8(commandLine, &exitCode);
+#else
+    auto shellQuote = [](const std::string& value) -> std::string
+    {
+        std::string escaped;
+        escaped.reserve(value.size() + 2);
+        escaped.push_back('"');
+        for (const char c : value)
+        {
+            if (c == '"')
+            {
+                escaped += "\\\"";
+            }
+            else
+            {
+                escaped.push_back(c);
+            }
+        }
+        escaped.push_back('"');
+        return escaped;
+    };
+    const std::string command = shellQuote(PathUtf8(ffprobe)) +
+                                " -v error -select_streams v:0 -show_entries stream=width,height -of csv=p=0:s=x " +
+                                shellQuote(PathUtf8(mediaPath)) + " 2>&1";
+    int exitCode = -1;
+    const std::string output = CaptureProcessOutputUtf8(command, &exitCode);
+#endif
+    if (exitCode != 0 || output.empty())
+    {
+        return 0;
+    }
+
+    int width = 0;
+    int height = 0;
+    const size_t sep = output.find('x');
+    if (sep == std::string::npos)
+    {
+        const size_t comma = output.find(',');
+        if (comma == std::string::npos)
+        {
+            return 0;
+        }
+        try
+        {
+            width = std::stoi(output.substr(0, comma));
+            height = std::stoi(output.substr(comma + 1));
+        }
+        catch (...)
+        {
+            return 0;
+        }
+    }
+    else
+    {
+        try
+        {
+            width = std::stoi(output.substr(0, sep));
+            height = std::stoi(output.substr(sep + 1));
+        }
+        catch (...)
+        {
+            return 0;
+        }
+    }
+    if (width <= 0 || height <= 0)
+    {
+        return 0;
+    }
+    return std::min(width, height);
+}
+
+// True when an explicit quality (e.g. 2160p) was requested but the file's ladder bucket is lower.
+// Cookie/client caps often silently settle on 1080 under height<=2160.
+bool OutputBelowRequestedQuality(const DownloadRequest& request, const std::string& outputTitle)
+{
+    if (request.mediaMode == "Audio only")
+    {
+        return false;
+    }
+    const int requested = ParseQualityHeight(request.quality);
+    if (requested <= 0)
+    {
+        return false; // Max / empty — no hard floor.
+    }
+    const std::filesystem::path outputFile =
+        FindDownloadOutputFile(request.outputDirectory, outputTitle, request.fileFormat);
+    if (outputFile.empty())
+    {
+        return false;
+    }
+    const int shortSide = ProbeMediaVideoShortSidePixels(outputFile);
+    if (shortSide <= 0)
+    {
+        return false;
+    }
+    const int actualBucket = BucketDownloadHeight(shortSide);
+    return actualBucket > 0 && actualBucket < requested;
+}
+
+void DiscardUndersizedDownloadOutput(const DownloadRequest& request, const std::string& outputTitle)
+{
+    const std::filesystem::path outputFile =
+        FindDownloadOutputFile(request.outputDirectory, outputTitle, request.fileFormat);
+    TryRemoveDownloadPath(outputFile);
+}
+
+void TryRemoveDownloadPath(const std::filesystem::path& path)
+{
+    if (path.empty())
+    {
+        return;
+    }
+#ifdef _WIN32
+    const std::wstring widePath = path.wstring();
+    SetFileAttributesW(widePath.c_str(), FILE_ATTRIBUTE_NORMAL);
+    if (DeleteFileW(widePath.c_str()))
+    {
+        return;
+    }
+    const std::wstring trashPath = widePath + L".trash";
+    if (MoveFileExW(widePath.c_str(), trashPath.c_str(), MOVEFILE_REPLACE_EXISTING))
+    {
+        SetFileAttributesW(trashPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+        DeleteFileW(trashPath.c_str());
+    }
+#else
+    std::error_code error;
+    std::filesystem::remove(path, error);
+#endif
+}
+
+// Deletes yt-dlp leftovers (.part / .ytdl / Title.fXXX.*) for this title+format. Never touches final Title.ext.
+void RemoveDownloadArtifacts(const std::string& outputDirectory,
+                             const std::string& titleStem,
+                             const std::string& fileFormat)
+{
+    if (outputDirectory.empty() || titleStem.empty())
+    {
+        return;
+    }
+
+    std::error_code error;
+    const std::filesystem::path directory = std::filesystem::u8path(outputDirectory);
+    if (!std::filesystem::is_directory(directory, error) || error)
+    {
+        return;
+    }
+
+    std::vector<std::filesystem::path> toRemove;
+    for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(directory, error))
+    {
+        if (error)
+        {
+            break;
+        }
+        if (!entry.is_regular_file(error) || error)
+        {
+            continue;
+        }
+
+        const std::string filename = entry.path().filename().u8string();
+        if (IsYtDlpDownloadArtifactName(filename, titleStem) &&
+            ArtifactMatchesFileFormat(filename, titleStem, fileFormat))
+        {
+            toRemove.push_back(entry.path());
+        }
+        error.clear();
+    }
+
+    for (const std::filesystem::path& path : toRemove)
+    {
+        TryRemoveDownloadPath(path);
+    }
+
+#ifdef _WIN32
+    // yt-dlp may release handles slightly after process kill.
+    if (!toRemove.empty())
+    {
+        Sleep(150);
+        for (const std::filesystem::path& path : toRemove)
+        {
+            if (std::filesystem::exists(path, error))
+            {
+                TryRemoveDownloadPath(path);
+            }
+            error.clear();
+        }
+    }
+#endif
+}
+
+void RefreshSharedDiskProgress(const std::shared_ptr<DownloadSharedState>& sharedState,
+                               const std::string& outputDirectory,
+                               const std::string& titleStem,
+                               std::int64_t estimatedBytes,
+                               bool singleMainPart,
+                               const std::string& fileFormat)
+{
+    if (sharedState == nullptr)
+    {
+        return;
+    }
+
+    // Prefer single main .part when prediction says so, or when HLS Frags appear on disk.
+    bool useSingleMain = singleMainPart;
+    if (!useSingleMain)
+    {
+        std::error_code error;
+        const std::filesystem::path directory = std::filesystem::u8path(outputDirectory);
+        if (std::filesystem::is_directory(directory, error) && !error)
+        {
+            for (const std::filesystem::directory_entry& entry : std::filesystem::directory_iterator(directory, error))
+            {
+                if (error || !entry.is_regular_file(error) || error)
+                {
+                    continue;
+                }
+                const std::string name = entry.path().filename().u8string();
+                if (name.find(titleStem) == 0 && name.find("-Frag") != std::string::npos &&
+                    ArtifactMatchesFileFormat(name, titleStem, fileFormat))
+                {
+                    useSingleMain = true;
+                    break;
+                }
+                error.clear();
+            }
+        }
+    }
+
+    const std::uint64_t onDisk = SumDownloadArtifactBytes(outputDirectory, titleStem, useSingleMain, fileFormat);
+    // Mispredicted HLS-only mode: DASH writes Title.fNNN.* — fall back to summing those.
+    const std::uint64_t onDiskResolved = (useSingleMain && onDisk == 0)
+                                             ? SumDownloadArtifactBytes(outputDirectory, titleStem, false, fileFormat)
+                                             : onDisk;
+    DownloadRunner::SetSharedDiskBytes(sharedState, onDiskResolved);
+
+    std::int64_t totalBytes = estimatedBytes;
+    {
+        std::lock_guard<std::mutex> lock(sharedState->mutex);
+        if (sharedState->estimatedBytes > totalBytes)
+        {
+            totalBytes = sharedState->estimatedBytes;
+        }
+        else if (estimatedBytes > 0 && sharedState->estimatedBytes <= 0)
+        {
+            sharedState->estimatedBytes = estimatedBytes;
+        }
+    }
+
+    if (totalBytes <= 0)
+    {
+        return;
+    }
+
+    const float ratio = std::clamp(static_cast<float>(onDiskResolved) / static_cast<float>(totalBytes), 0.0f, 1.0f);
+    DownloadRunner::SetSharedDiskProgress(sharedState, ratio);
+
+    // Taskbar / overall progress may follow disk when yt-% stalls — never touch ytProgress here.
+    // During merge, artifact sum is already ~complete; overwriting progress would fill the yellow bar instantly.
+    {
+        std::lock_guard<std::mutex> lock(sharedState->mutex);
+        if (sharedState->phase == DownloadSharedState::Phase::Merging)
+        {
+            return;
+        }
+        if (ratio > sharedState->progress || sharedState->progress <= 0.05f)
+        {
+            sharedState->progress = ratio;
+        }
+    }
 }
 
 class DownloadProgressTracker
@@ -458,6 +1547,75 @@ public:
         return PhaseProgress();
     }
 
+    void UpdateStreamSpeed(const std::string& line)
+    {
+        double speedBps = -1.0;
+        if (!ParseYtdlpSpeedBps(line, speedBps))
+        {
+            return;
+        }
+
+        if (streamIndex_ >= 0 && streamIndex_ < static_cast<int>(streamSpeedBps_.size()))
+        {
+            streamSpeedBps_[static_cast<size_t>(streamIndex_)] = speedBps;
+        }
+    }
+
+    double TotalStreamSpeedBps() const
+    {
+        double total = 0.0;
+        bool hasAny = false;
+        const int activeStreams = std::min(streamCount_, static_cast<int>(streamSpeedBps_.size()));
+        for (int index = 0; index < activeStreams; ++index)
+        {
+            const double speed = streamSpeedBps_[static_cast<size_t>(index)];
+            if (speed >= 0.0)
+            {
+                total += speed;
+                hasAny = true;
+            }
+        }
+        return hasAny ? total : -1.0;
+    }
+
+    void ResetStreamSpeeds()
+    {
+        streamSpeedBps_.fill(-1.0);
+    }
+
+    // Prefer output-file growth vs merge inputs; fall back to size-scaled elapsed time.
+    void
+    UpdateMergeFromDisk(const std::string& outputDirectory, const std::string& titleStem, const std::string& fileFormat)
+    {
+        if (phase_ != DownloadSharedState::Phase::Merging)
+        {
+            return;
+        }
+
+        if (mergeInputBytes_ == 0)
+        {
+            std::uint64_t inputs = SumDownloadArtifactBytes(outputDirectory, titleStem, false, fileFormat);
+            if (inputs == 0)
+            {
+                inputs = SumDownloadArtifactBytes(outputDirectory, titleStem, true, fileFormat);
+            }
+            mergeInputBytes_ = inputs;
+        }
+
+        float diskRatio = -1.0f;
+        if (mergeInputBytes_ > 0)
+        {
+            const std::uint64_t outputBytes = SumMergeOutputBytes(outputDirectory, titleStem, fileFormat);
+            if (outputBytes > 0)
+            {
+                diskRatio =
+                    std::clamp(static_cast<float>(outputBytes) / static_cast<float>(mergeInputBytes_), 0.0f, 1.0f);
+            }
+        }
+
+        AdvanceMergeProgress(diskRatio);
+    }
+
 private:
     static bool IsMergeLine(const std::string& line)
     {
@@ -476,9 +1634,11 @@ private:
         phase_ = DownloadSharedState::Phase::Merging;
         mergeStartedAt_ = std::chrono::steady_clock::now();
         mergeProgress_ = 0.04f;
+        mergeInputBytes_ = 0;
+        ResetStreamSpeeds();
     }
 
-    void AdvanceMergeProgress()
+    void AdvanceMergeProgress(float diskRatio = -1.0f)
     {
         if (phase_ != DownloadSharedState::Phase::Merging)
         {
@@ -487,8 +1647,26 @@ private:
 
         const double elapsed =
             std::chrono::duration<double>(std::chrono::steady_clock::now() - mergeStartedAt_).count();
-        // yt-dlp/ffmpeg rarely report merge %, so advance by elapsed time up to ~95%.
-        mergeProgress_ = std::min(0.95f, 0.04f + static_cast<float>(elapsed) * 0.12f);
+
+        // Remux is roughly disk-bound; scale fake time by input size (~32 MiB/s), clamp 15s..30min.
+        double estimatedSeconds = 90.0;
+        if (mergeInputBytes_ > 0)
+        {
+            estimatedSeconds =
+                std::clamp(static_cast<double>(mergeInputBytes_) / (32.0 * 1024.0 * 1024.0), 15.0, 1800.0);
+        }
+        const float fromTime =
+            std::min(0.95f, 0.04f + 0.91f * static_cast<float>(elapsed / std::max(1.0, estimatedSeconds)));
+
+        float candidate = fromTime;
+        if (diskRatio >= 0.0f)
+        {
+            const float fromDisk = std::min(0.95f, std::max(0.04f, diskRatio));
+            // Disk leads when ffmpeg writes the final file; time keeps a slow floor if output lags.
+            candidate = std::max(fromDisk, fromTime * 0.25f);
+        }
+
+        mergeProgress_ = std::max(mergeProgress_, candidate);
     }
 
     float StreamBase() const
@@ -513,9 +1691,34 @@ private:
     float lastStreamProgress_ = 0.0f;
     float downloadProgress_ = 0.04f;
     float mergeProgress_ = 0.0f;
+    std::uint64_t mergeInputBytes_ = 0;
     DownloadSharedState::Phase phase_ = DownloadSharedState::Phase::Downloading;
     std::chrono::steady_clock::time_point mergeStartedAt_{};
+    std::array<double, 4> streamSpeedBps_{-1.0, -1.0, -1.0, -1.0};
 };
+
+void RefreshSharedMergeProgress(const std::shared_ptr<DownloadSharedState>& sharedState,
+                                DownloadProgressTracker& tracker,
+                                const std::string& outputDirectory,
+                                const std::string& titleStem,
+                                const std::string& fileFormat)
+{
+    if (sharedState == nullptr || tracker.Phase() != DownloadSharedState::Phase::Merging)
+    {
+        return;
+    }
+
+    const float previous = tracker.PhaseProgress();
+    tracker.UpdateMergeFromDisk(outputDirectory, titleStem, fileFormat);
+    const float progress = tracker.PhaseProgress();
+    if (progress > previous + 0.001f || previous < 0.05f)
+    {
+        DownloadRunner::SetSharedStatus(sharedState,
+                                        "Merging " + std::to_string(static_cast<int>(progress * 100.0f)) + "%",
+                                        progress,
+                                        DownloadSharedState::Phase::Merging);
+    }
+}
 
 std::string BuildProgressStatus(const std::string& line, float progress)
 {
@@ -553,7 +1756,10 @@ void ApplyDownloadProgress(const std::shared_ptr<DownloadSharedState>& sharedSta
         return;
     }
 
-    lastMeaningfulLine = line;
+    if (!IsYtDlpDownloadProgressLine(line))
+    {
+        lastMeaningfulLine = line;
+    }
     const float phaseProgress = tracker.UpdateLine(line);
     const DownloadSharedState::Phase phase = tracker.Phase();
     if (line.find("ERROR:") != std::string::npos)
@@ -565,6 +1771,7 @@ void ApplyDownloadProgress(const std::shared_ptr<DownloadSharedState>& sharedSta
     float streamProgress = 0.0f;
     if (phase == DownloadSharedState::Phase::Merging)
     {
+        DownloadRunner::SetSharedYtDlpSpeed(sharedState, -1.0);
         DownloadRunner::SetSharedStatus(sharedState,
                                         "Merging " + std::to_string(static_cast<int>(phaseProgress * 100.0f)) + "%",
                                         phaseProgress,
@@ -572,14 +1779,46 @@ void ApplyDownloadProgress(const std::shared_ptr<DownloadSharedState>& sharedSta
     }
     else if (ParseDownloadProgress(line, streamProgress))
     {
+        std::int64_t totalBytes = 0;
+        if (ParseYtDlpTotalBytes(line, totalBytes))
+        {
+            DownloadRunner::SetSharedEstimatedBytes(sharedState, totalBytes);
+        }
+        tracker.UpdateStreamSpeed(line);
+        const double totalSpeed = tracker.TotalStreamSpeedBps();
+        if (totalSpeed >= 0.0)
+        {
+            DownloadRunner::SetSharedYtDlpSpeed(sharedState, totalSpeed);
+        }
         DownloadRunner::SetSharedStatus(sharedState, BuildProgressStatus(line, streamProgress), phaseProgress, phase);
     }
     else if (line.find("[download]") != std::string::npos)
     {
-        DownloadRunner::SetSharedStatus(sharedState,
-                                        "Downloading " + std::to_string(static_cast<int>(phaseProgress * 100.0f)) + "%",
-                                        phaseProgress,
-                                        phase);
+        std::int64_t totalBytes = 0;
+        if (ParseYtDlpTotalBytes(line, totalBytes))
+        {
+            DownloadRunner::SetSharedEstimatedBytes(sharedState, totalBytes);
+        }
+
+        float fragmentRatio = 0.0f;
+        if (ParseYtDlpFragmentProgress(line, fragmentRatio))
+        {
+            // Fragment index is the honest yt-dlp progress for HLS (no rolling %).
+            // Do NOT infer total size from disk/fragment — that makes disk% == yt% and hides the dim bar.
+            DownloadRunner::SetSharedStatus(sharedState,
+                                            "Downloading " + std::to_string(static_cast<int>(fragmentRatio * 100.0f)) +
+                                                "%",
+                                            fragmentRatio,
+                                            phase);
+        }
+        else
+        {
+            DownloadRunner::SetSharedStatus(sharedState,
+                                            "Downloading " + std::to_string(static_cast<int>(phaseProgress * 100.0f)) +
+                                                "%",
+                                            phaseProgress,
+                                            phase);
+        }
     }
 }
 
@@ -619,7 +1858,12 @@ void IngestDownloadOutputChunk(const std::shared_ptr<DownloadSharedState>& share
 DownloadRunResult RunProcess(std::string command,
                              const std::shared_ptr<std::atomic_bool>& cancelRequested,
                              const std::shared_ptr<DownloadSharedState>& sharedState,
-                             int downloadStreams)
+                             int downloadStreams,
+                             const std::string& outputDirectory,
+                             const std::string& titleStem,
+                             std::int64_t estimatedBytes,
+                             bool singleMainPartDiskProgress,
+                             const std::string& fileFormat)
 {
     DownloadRunResult result;
     SECURITY_ATTRIBUTES securityAttributes{};
@@ -713,6 +1957,9 @@ DownloadRunResult RunProcess(std::string command,
     while (WaitForSingleObject(processInfo.hProcess, 50) == WAIT_TIMEOUT)
     {
         consumeOutput();
+        RefreshSharedDiskProgress(
+            sharedState, outputDirectory, titleStem, estimatedBytes, singleMainPartDiskProgress, fileFormat);
+        RefreshSharedMergeProgress(sharedState, tracker, outputDirectory, titleStem, fileFormat);
         if (cancelRequested != nullptr && cancelRequested->load())
         {
             KillProcessTree(processInfo.dwProcessId);
@@ -779,7 +2026,7 @@ DownloadRunResult RunProcess(std::string command,
     }
 
     result.status = BuildDownloadFailureStatus(lastMeaningfulLine, fullOutput, exitCode);
-    result.errorLog = fullOutput;
+    result.errorLog = FilterYtDlpProgressLinesFromOutput(fullOutput);
     result.exitCode = static_cast<int>(exitCode);
     return result;
 }
@@ -787,7 +2034,12 @@ DownloadRunResult RunProcess(std::string command,
 DownloadRunResult RunProcess(std::string command,
                              const std::shared_ptr<std::atomic_bool>& cancelRequested,
                              const std::shared_ptr<DownloadSharedState>& sharedState,
-                             int downloadStreams)
+                             int downloadStreams,
+                             const std::string& outputDirectory,
+                             const std::string& titleStem,
+                             std::int64_t estimatedBytes,
+                             bool singleMainPartDiskProgress,
+                             const std::string& fileFormat)
 {
     DownloadRunResult result;
     int pipefd[2] = {-1, -1};
@@ -853,6 +2105,9 @@ DownloadRunResult RunProcess(std::string command,
         pfd.fd = pipefd[0];
         pfd.events = POLLIN;
         const int pollResult = poll(&pfd, 1, 50);
+        RefreshSharedDiskProgress(
+            sharedState, outputDirectory, titleStem, estimatedBytes, singleMainPartDiskProgress, fileFormat);
+        RefreshSharedMergeProgress(sharedState, tracker, outputDirectory, titleStem, fileFormat);
         if (pollResult > 0 && (pfd.revents & (POLLIN | POLLHUP | POLLERR)) != 0)
         {
             for (;;)
@@ -948,12 +2203,76 @@ DownloadRunResult RunProcess(std::string command,
     }
 
     result.status = BuildDownloadFailureStatus(lastMeaningfulLine, fullOutput, exitCode);
-    result.errorLog = fullOutput;
+    result.errorLog = FilterYtDlpProgressLinesFromOutput(fullOutput);
     result.exitCode = exitCode;
     return result;
 }
 #endif
 } // namespace
+
+MediaAudioProbeResult ProbeMediaFileAudio(const std::filesystem::path& mediaPath)
+{
+    std::error_code error;
+    if (mediaPath.empty() || !std::filesystem::is_regular_file(mediaPath, error) ||
+        std::filesystem::file_size(mediaPath, error) == 0)
+    {
+        return MediaAudioProbeResult::Unavailable;
+    }
+
+    const std::filesystem::path ffprobe = FindFfprobeExecutable();
+    if (ffprobe.empty())
+    {
+        return MediaAudioProbeResult::Unavailable;
+    }
+
+#ifdef _WIN32
+    const std::wstring commandLine = QuoteWidePath(ffprobe) +
+                                     L" -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 " +
+                                     QuoteWidePath(mediaPath);
+    int exitCode = -1;
+    const std::string output = CaptureProcessOutputUtf8(commandLine, &exitCode);
+#else
+    auto shellQuote = [](const std::string& value) -> std::string
+    {
+        std::string escaped;
+        escaped.reserve(value.size() + 2);
+        escaped.push_back('"');
+        for (const char c : value)
+        {
+            if (c == '"')
+            {
+                escaped += "\\\"";
+            }
+            else
+            {
+                escaped.push_back(c);
+            }
+        }
+        escaped.push_back('"');
+        return escaped;
+    };
+    const std::string command = shellQuote(PathUtf8(ffprobe)) +
+                                " -v error -select_streams a -show_entries stream=codec_type -of csv=p=0 " +
+                                shellQuote(PathUtf8(mediaPath)) + " 2>&1";
+    int exitCode = -1;
+    const std::string output = CaptureProcessOutputUtf8(command, &exitCode);
+#endif
+
+    if (exitCode != 0)
+    {
+        return MediaAudioProbeResult::Unavailable;
+    }
+
+    // Empty stdout with exit 0 means no audio streams matched -select_streams a.
+    for (char c : output)
+    {
+        if (c != ' ' && c != '\t' && c != '\r' && c != '\n')
+        {
+            return MediaAudioProbeResult::HasAudio;
+        }
+    }
+    return MediaAudioProbeResult::MissingAudio;
+}
 
 namespace
 {
@@ -991,11 +2310,22 @@ void DownloadRunner::Start(DownloadRequest request)
 
     status_ = "Downloading...";
     progress_ = 0.04f;
+    ytProgress_ = 0.04f;
+    diskProgress_ = -1.0f;
+    ytDlpSpeedBps_ = -1.0;
+    diskSpeedBps_ = -1.0;
+    estimatedBytes_ = request.estimatedBytes > 0 ? request.estimatedBytes : 0;
+    diskBytes_ = 0;
+    lastDiskBytesSample_ = 0;
+    lastDiskSampleAt_ = {};
     phase_ = DownloadSharedState::Phase::Downloading;
     elapsedSeconds_ = 0.0;
     currentUrl_ = request.url;
+    outputIdentity_ = MakeOutputIdentity(request);
     lastErrorLog_.clear();
     lastDownloadBrowserReport_.clear();
+    lastResolvedTitle_.clear();
+    lastResolvedNormalizedTitle_.clear();
     completedUrl_.clear();
     completedElapsedSeconds_ = 0.0;
     hasCompletedDownload_ = false;
@@ -1003,6 +2333,10 @@ void DownloadRunner::Start(DownloadRequest request)
     cancelRequested_ = std::make_shared<std::atomic_bool>(false);
     sharedState_ = std::make_shared<DownloadSharedState>();
     SetSharedStatus(sharedState_, status_, progress_, phase_);
+    if (request.estimatedBytes > 0)
+    {
+        SetSharedEstimatedBytes(sharedState_, request.estimatedBytes);
+    }
 
     try
     {
@@ -1043,6 +2377,25 @@ void DownloadRunner::Cancel()
     }
 }
 
+void DownloadRunner::Shutdown()
+{
+    Cancel();
+    if (future_.valid())
+    {
+        try
+        {
+            future_.wait();
+            (void)future_.get();
+        }
+        catch (...)
+        {
+        }
+    }
+    isRunning_ = false;
+    cancelRequested_.reset();
+    sharedState_.reset();
+}
+
 void DownloadRunner::Update()
 {
     if (!future_.valid())
@@ -1063,6 +2416,8 @@ void DownloadRunner::Update()
             status_ = result.status;
             lastErrorLog_ = result.errorLog;
             lastDownloadBrowserReport_ = result.downloadBrowserReport;
+            lastResolvedTitle_ = result.resolvedTitle;
+            lastResolvedNormalizedTitle_ = result.resolvedNormalizedTitle;
         }
         catch (const std::exception& exception)
         {
@@ -1102,7 +2457,36 @@ void DownloadRunner::Update()
         std::lock_guard<std::mutex> lock(sharedState_->mutex);
         status_ = sharedState_->status;
         progress_ = sharedState_->progress;
+        ytProgress_ = sharedState_->ytProgress;
+        diskProgress_ = sharedState_->diskProgress;
         phase_ = sharedState_->phase;
+        ytDlpSpeedBps_ = sharedState_->ytDlpSpeedBps;
+        estimatedBytes_ = sharedState_->estimatedBytes;
+        diskBytes_ = sharedState_->diskBytes;
+
+        const auto now = std::chrono::steady_clock::now();
+        const std::uint64_t diskBytes = diskBytes_;
+        if (lastDiskSampleAt_.time_since_epoch().count() == 0)
+        {
+            lastDiskBytesSample_ = diskBytes;
+            lastDiskSampleAt_ = now;
+        }
+        else if (diskBytes >= lastDiskBytesSample_)
+        {
+            const double elapsedSeconds = std::chrono::duration<double>(now - lastDiskSampleAt_).count();
+            if (elapsedSeconds >= 0.2)
+            {
+                diskSpeedBps_ = static_cast<double>(diskBytes - lastDiskBytesSample_) / elapsedSeconds;
+                lastDiskBytesSample_ = diskBytes;
+                lastDiskSampleAt_ = now;
+            }
+        }
+        else
+        {
+            lastDiskBytesSample_ = diskBytes;
+            lastDiskSampleAt_ = now;
+            diskSpeedBps_ = -1.0;
+        }
     }
     elapsedSeconds_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - startedAt_).count();
 }
@@ -1122,9 +2506,30 @@ const std::string& DownloadRunner::CurrentUrl() const
     return currentUrl_;
 }
 
+const std::string& DownloadRunner::OutputIdentity() const
+{
+    return outputIdentity_;
+}
+
+std::string DownloadRunner::MakeOutputIdentity(const DownloadRequest& request)
+{
+    return request.url + "\n" + request.outputDirectory + "\n" + request.normalizedTitle + "\n" +
+           ToLower(request.fileFormat);
+}
+
 float DownloadRunner::Progress() const
 {
     return progress_;
+}
+
+float DownloadRunner::YtProgress() const
+{
+    return ytProgress_;
+}
+
+float DownloadRunner::DiskProgress() const
+{
+    return diskProgress_;
 }
 
 DownloadSharedState::Phase DownloadRunner::Phase() const
@@ -1135,6 +2540,26 @@ DownloadSharedState::Phase DownloadRunner::Phase() const
 double DownloadRunner::ElapsedSeconds() const
 {
     return elapsedSeconds_;
+}
+
+double DownloadRunner::YtDlpSpeedBps() const
+{
+    return ytDlpSpeedBps_;
+}
+
+double DownloadRunner::DiskSpeedBps() const
+{
+    return diskSpeedBps_;
+}
+
+std::int64_t DownloadRunner::EstimatedBytes() const
+{
+    return estimatedBytes_;
+}
+
+std::uint64_t DownloadRunner::DiskBytes() const
+{
+    return diskBytes_;
 }
 
 bool DownloadRunner::ConsumeCompletedDownload(std::string& url, double& elapsedSeconds)
@@ -1166,6 +2591,259 @@ const std::string& DownloadRunner::LastDownloadBrowserReport() const
 {
     return lastDownloadBrowserReport_;
 }
+
+const std::string& DownloadRunner::LastResolvedTitle() const
+{
+    return lastResolvedTitle_;
+}
+
+const std::string& DownloadRunner::LastResolvedNormalizedTitle() const
+{
+    return lastResolvedNormalizedTitle_;
+}
+
+namespace
+{
+std::string ExtractNumberingPrefix(const std::string& stem)
+{
+    size_t index = 0;
+    while (index < stem.size() && std::isdigit(static_cast<unsigned char>(stem[index])))
+    {
+        ++index;
+    }
+    if (index > 0 && index + 1 < stem.size() && stem[index] == '.' && stem[index + 1] == ' ')
+    {
+        return stem.substr(0, index + 2);
+    }
+    return {};
+}
+
+bool EndsWithDownloadedSuffix(const std::string& stem)
+{
+    constexpr char kSuffix[] = "_downloaded";
+    constexpr size_t kSuffixLen = sizeof(kSuffix) - 1;
+    return stem.size() >= kSuffixLen && stem.compare(stem.size() - kSuffixLen, kSuffixLen, kSuffix) == 0;
+}
+
+std::string StripDownloadedSuffix(std::string stem)
+{
+    if (EndsWithDownloadedSuffix(stem))
+    {
+        stem.resize(stem.size() - 11);
+    }
+    return stem;
+}
+
+std::string CaptureYtDlpStdout(std::string command, const std::shared_ptr<std::atomic_bool>& cancelRequested)
+{
+#ifdef _WIN32
+    command = "cmd /S /C \"chcp 65001>nul && set PYTHONIOENCODING=utf-8 && " + command + "\"";
+#else
+    command = "env PYTHONIOENCODING=utf-8 PYTHONUNBUFFERED=1 " + command;
+#endif
+
+#ifdef _WIN32
+    SECURITY_ATTRIBUTES securityAttributes{};
+    securityAttributes.nLength = sizeof(securityAttributes);
+    securityAttributes.bInheritHandle = TRUE;
+    HANDLE readPipe = nullptr;
+    HANDLE writePipe = nullptr;
+    if (!CreatePipe(&readPipe, &writePipe, &securityAttributes, 0))
+    {
+        return {};
+    }
+    SetHandleInformation(readPipe, HANDLE_FLAG_INHERIT, 0);
+
+    STARTUPINFOW startupInfo{};
+    PROCESS_INFORMATION processInfo{};
+    startupInfo.cb = sizeof(startupInfo);
+    startupInfo.dwFlags = STARTF_USESTDHANDLES;
+    startupInfo.hStdOutput = writePipe;
+    startupInfo.hStdError = writePipe;
+    startupInfo.hStdInput = GetStdHandle(STD_INPUT_HANDLE);
+
+    std::wstring wideCommand = Utf8ToWide(command);
+    std::vector<wchar_t> mutableCommand(wideCommand.begin(), wideCommand.end());
+    mutableCommand.push_back(L'\0');
+    if (!CreateProcessW(nullptr,
+                        mutableCommand.data(),
+                        nullptr,
+                        nullptr,
+                        TRUE,
+                        CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+                        nullptr,
+                        nullptr,
+                        &startupInfo,
+                        &processInfo))
+    {
+        CloseHandle(writePipe);
+        CloseHandle(readPipe);
+        return {};
+    }
+    CloseHandle(writePipe);
+
+    std::string output;
+    while (WaitForSingleObject(processInfo.hProcess, 50) == WAIT_TIMEOUT)
+    {
+        if (cancelRequested != nullptr && cancelRequested->load())
+        {
+            KillProcessTree(processInfo.dwProcessId);
+            WaitForSingleObject(processInfo.hProcess, 3000);
+            CloseHandle(processInfo.hThread);
+            CloseHandle(processInfo.hProcess);
+            CloseHandle(readPipe);
+            return {};
+        }
+        DWORD available = 0;
+        while (PeekNamedPipe(readPipe, nullptr, 0, nullptr, &available, nullptr) && available > 0)
+        {
+            char buffer[512]{};
+            DWORD read = 0;
+            if (!ReadFile(readPipe, buffer, static_cast<DWORD>(sizeof(buffer) - 1), &read, nullptr) || read == 0)
+            {
+                break;
+            }
+            output.append(buffer, read);
+        }
+    }
+    for (;;)
+    {
+        char buffer[512]{};
+        DWORD read = 0;
+        if (!ReadFile(readPipe, buffer, static_cast<DWORD>(sizeof(buffer) - 1), &read, nullptr) || read == 0)
+        {
+            break;
+        }
+        output.append(buffer, read);
+    }
+    CloseHandle(processInfo.hThread);
+    CloseHandle(processInfo.hProcess);
+    CloseHandle(readPipe);
+#else
+    FILE* pipe = popen(command.c_str(), "r");
+    if (pipe == nullptr)
+    {
+        return {};
+    }
+    std::string output;
+    char buffer[512]{};
+    while (fgets(buffer, sizeof(buffer), pipe) != nullptr)
+    {
+        if (cancelRequested != nullptr && cancelRequested->load())
+        {
+            pclose(pipe);
+            return {};
+        }
+        output += buffer;
+    }
+    pclose(pipe);
+#endif
+
+    std::string best;
+    size_t lineStart = 0;
+    while (lineStart < output.size())
+    {
+        size_t lineEnd = output.find_first_of("\r\n", lineStart);
+        if (lineEnd == std::string::npos)
+        {
+            lineEnd = output.size();
+        }
+        std::string line = output.substr(lineStart, lineEnd - lineStart);
+        while (!line.empty() && (line.back() == ' ' || line.back() == '\t'))
+        {
+            line.pop_back();
+        }
+        while (!line.empty() && (line.front() == ' ' || line.front() == '\t'))
+        {
+            line.erase(line.begin());
+        }
+        if (!line.empty() && line.rfind("WARNING:", 0) != 0 && line.rfind("ERROR:", 0) != 0 && line.rfind("[", 0) != 0)
+        {
+            best = line;
+        }
+        lineStart = lineEnd + (lineEnd < output.size() ? 1 : 0);
+        while (lineStart < output.size() && (output[lineStart] == '\r' || output[lineStart] == '\n'))
+        {
+            ++lineStart;
+        }
+    }
+    return best;
+}
+
+std::string QuoteArg(const std::string& value)
+{
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (const char c : value)
+    {
+        if (c == '"')
+        {
+            escaped += "\\\"";
+        }
+        else
+        {
+            escaped.push_back(c);
+        }
+    }
+    return "\"" + escaped + "\"";
+}
+
+std::string ProbeOriginalYoutubeTitle(const std::string& ytDlpInvocation,
+                                      const std::string& url,
+                                      const std::shared_ptr<std::atomic_bool>& cancelRequested)
+{
+    if (ytDlpInvocation.empty() || url.empty())
+    {
+        return {};
+    }
+    const std::string base = ytDlpInvocation + BuildYoutubeJsRuntimeArgs() +
+                             " --skip-download --no-playlist --no-warnings --print %(title)s ";
+    std::string title = CaptureYtDlpStdout(base + QuoteArg(NormalizeYoutubeUrl(url)) + " 2>&1", cancelRequested);
+    if (!title.empty() || (cancelRequested != nullptr && cancelRequested->load()))
+    {
+        return title;
+    }
+    for (const std::string& browser : BuildYoutubeCookieBrowsersToTryList())
+    {
+        if (browser.empty())
+        {
+            continue;
+        }
+        title = CaptureYtDlpStdout(base + BuildYoutubeCookiesArgs(browser) + " " + QuoteArg(NormalizeYoutubeUrl(url)) +
+                                       " 2>&1",
+                                   cancelRequested);
+        if (!title.empty() || (cancelRequested != nullptr && cancelRequested->load()))
+        {
+            return title;
+        }
+    }
+    return {};
+}
+
+void ApplyOriginalTitleToRequest(DownloadRequest& request, const std::string& originalTitle)
+{
+    if (originalTitle.empty())
+    {
+        return;
+    }
+    request.title = originalTitle;
+    const bool downloadedSuffix = EndsWithDownloadedSuffix(request.normalizedTitle);
+    std::string baseStem = request.normalizedTitle.empty() ? NormalizeVideoTitle(request.title)
+                                                           : StripDownloadedSuffix(request.normalizedTitle);
+    if (baseStem.empty())
+    {
+        baseStem = NormalizeVideoTitle(originalTitle);
+    }
+    const std::string prefix = ExtractNumberingPrefix(baseStem);
+    const std::string newBase = prefix + NormalizeVideoTitle(originalTitle);
+    request.normalizedTitle = downloadedSuffix ? (newBase + "_downloaded") : newBase;
+    if (!request.originalNormalizedTitle.empty())
+    {
+        const std::string originalPrefix = ExtractNumberingPrefix(request.originalNormalizedTitle);
+        request.originalNormalizedTitle = originalPrefix + NormalizeVideoTitle(originalTitle);
+    }
+}
+} // namespace
 
 DownloadRunResult DownloadRunner::Run(DownloadRequest request,
                                       std::shared_ptr<std::atomic_bool> cancelRequested,
@@ -1205,20 +2883,42 @@ DownloadRunResult DownloadRunner::Run(DownloadRequest request,
             return result;
         }
 
+        DownloadRunner::SetSharedStatus(sharedState, "Resolving title...", 0.02f);
+        const std::string originalTitle = ProbeOriginalYoutubeTitle(ytDlpInvocation, request.url, cancelRequested);
+        if (cancelRequested != nullptr && cancelRequested->load())
+        {
+            result.status = "Download cancelled.";
+            return result;
+        }
+        if (!originalTitle.empty())
+        {
+            ApplyOriginalTitleToRequest(request, originalTitle);
+            result.resolvedTitle = originalTitle;
+        }
+
         // Pass the native binary path (not the bin/ folder): a shared packages/
         // tree may contain both ffmpeg.exe and a Linux `ffmpeg` side by side.
         const std::filesystem::path ffmpegPath = ::FindFfmpegExecutable();
         const std::string ext = ToLower(request.fileFormat);
         const std::string formatSelector = BuildFormatSelector(request);
         const std::string relaxedFormatSelector = BuildRelaxedFormatSelector(request);
+        const std::string hlsFormatSelector = BuildHlsFormatSelector(request);
         const std::string outputTitle =
             request.normalizedTitle.empty() ? NormalizeVideoTitle(request.title) : request.normalizedTitle;
-        auto buildCommandBase = [&](const std::string& selector) -> std::string
+        if (!result.resolvedTitle.empty())
         {
-            std::string commandBase = ytDlpInvocation + BuildYoutubeJsRuntimeArgs() +
-                                      " --no-playlist --no-warnings -P " + Quote(request.outputDirectory) + " -o " +
-                                      Quote(outputTitle + ".%(ext)s") + " -f " + Quote(selector);
-            commandBase += request.overwriteExisting ? " --force-overwrites" : " --no-overwrites";
+            result.resolvedNormalizedTitle = outputTitle;
+        }
+        auto buildCommandBase = [&](const std::string& selector,
+                                    bool forceOverwrite,
+                                    const std::string& youtubeRuntimeArgs = {}) -> std::string
+        {
+            const std::string& runtimeArgs =
+                youtubeRuntimeArgs.empty() ? BuildYoutubeJsRuntimeArgs() : youtubeRuntimeArgs;
+            std::string commandBase = ytDlpInvocation + runtimeArgs + " --no-playlist --no-warnings -P " +
+                                      Quote(request.outputDirectory) + " -o " + Quote(outputTitle + ".%(ext)s") +
+                                      " -f " + Quote(selector);
+            commandBase += forceOverwrite ? " --force-overwrites" : " --no-overwrites";
 
             if (!ffmpegPath.empty())
             {
@@ -1239,17 +2939,60 @@ DownloadRunResult DownloadRunner::Run(DownloadRequest request,
             }
             return commandBase;
         };
-        const std::string commandBase = buildCommandBase(formatSelector);
-        const std::string relaxedCommandBase = buildCommandBase(relaxedFormatSelector);
+        const bool preferForceOverwrite = request.overwriteExisting;
+        bool forceOverwrite = preferForceOverwrite;
 
         const std::vector<std::string> browsersToTry = BuildYoutubeCookieBrowsersToTryList();
         BrowserAttemptLog downloadLog;
         std::string lastOutput;
         std::string successfulBrowser;
+        std::string bestFailureStatus;
+        std::string bestFailureLog;
+        int bestFailureScore = -1; // higher = more useful for the user
+        bool noCookiesAttempted = false;
+        bool noCookiesHad403 = false;
+        bool visionOsHlsTried = false;
+
+        auto rememberFailure = [&](const std::string& status, const std::string& log)
+        {
+            int score = 1;
+            if (IsYoutubeHttpForbiddenError(log) || IsYoutubeHttpForbiddenError(status))
+            {
+                score = 5;
+            }
+            else if (status.find("below requested quality") != std::string::npos ||
+                     log.find("below requested quality") != std::string::npos)
+            {
+                score = 4;
+            }
+            else if (log.find("cookies database") != std::string::npos ||
+                     log.find("Could not read browser cookies") != std::string::npos)
+            {
+                score = 0; // never prefer "Opera missing" as the headline error
+            }
+            if (score > bestFailureScore)
+            {
+                bestFailureScore = score;
+                bestFailureStatus = status;
+                bestFailureLog = FilterYtDlpProgressLinesFromOutput(log);
+                if (bestFailureLog.empty())
+                {
+                    bestFailureLog = SimplifyYtDlpError(log);
+                }
+            }
+        };
+
         for (size_t browserIndex = 0; browserIndex < browsersToTry.size(); ++browserIndex)
         {
             const std::string& browser = browsersToTry[browserIndex];
             const bool hasMoreBrowsers = browserIndex + 1 < browsersToTry.size();
+            if (browser.empty())
+            {
+                noCookiesAttempted = true;
+            }
+
+            const std::string activeCommandBase = buildCommandBase(formatSelector, forceOverwrite);
+            const std::string activeRelaxedCommandBase = buildCommandBase(relaxedFormatSelector, forceOverwrite);
 
             auto runOnce = [&](const std::string& baseCommand) -> bool
             {
@@ -1262,17 +3005,186 @@ DownloadRunResult DownloadRunner::Run(DownloadRequest request,
 #else
                 command = "PYTHONIOENCODING=utf-8 PYTHONUNBUFFERED=1 " + command;
 #endif
-                result = RunProcess(command, cancelRequested, sharedState, CountDownloadStreams(request.mediaMode));
+                result = RunProcess(command,
+                                    cancelRequested,
+                                    sharedState,
+                                    CountDownloadStreams(request.mediaMode),
+                                    request.outputDirectory,
+                                    outputTitle,
+                                    request.estimatedBytes,
+                                    request.singleMainPartDiskProgress,
+                                    request.fileFormat);
                 lastOutput = result.errorLog;
                 return result.status == "Download finished.";
             };
 
-            bool success = runOnce(commandBase);
+            // VisionOS HLS works without cookies; signed-in sessions often hide 4K / reload.
+            auto runVisionOsOnce = [&](const std::string& baseCommand) -> bool
+            {
+                std::string command = baseCommand + " " + Quote(NormalizeYoutubeUrl(request.url)) + " 2>&1";
+
+#ifdef _WIN32
+                command = "cmd /S /C \"chcp 65001>nul && set PYTHONIOENCODING=utf-8 && set PYTHONUNBUFFERED=1 && " +
+                          command + "\"";
+#else
+                command = "PYTHONIOENCODING=utf-8 PYTHONUNBUFFERED=1 " + command;
+#endif
+                result = RunProcess(command,
+                                    cancelRequested,
+                                    sharedState,
+                                    CountDownloadStreams(request.mediaMode),
+                                    request.outputDirectory,
+                                    outputTitle,
+                                    request.estimatedBytes,
+                                    request.singleMainPartDiskProgress,
+                                    request.fileFormat);
+                lastOutput = result.errorLog;
+                return result.status == "Download finished.";
+            };
+
+            bool success = runOnce(activeCommandBase);
             if (!success && result.status != "Download cancelled." &&
                 IsYoutubeFormatUnavailableError(result.errorLog.empty() ? result.status : result.errorLog))
             {
-                // Cookies worked; only the exact quality/container combo was missing.
-                success = runOnce(relaxedCommandBase);
+                success = runOnce(activeRelaxedCommandBase);
+            }
+
+            // Transient CDN 403 on DASH (often after a partial .fNNN.part) — one forced retry.
+            if (!success && result.status != "Download cancelled." &&
+                IsYoutubeHttpForbiddenError(result.errorLog.empty() ? result.status : result.errorLog))
+            {
+                if (browser.empty())
+                {
+                    noCookiesHad403 = true;
+                }
+                rememberFailure(result.status, result.errorLog.empty() ? result.status : result.errorLog);
+                SetSharedStatus(sharedState, "Retrying after HTTP 403...", 0.05f);
+                RemoveDownloadArtifacts(request.outputDirectory, outputTitle, request.fileFormat);
+                forceOverwrite = true;
+                success = runOnce(buildCommandBase(formatSelector, true));
+                if (!success && result.status != "Download cancelled." &&
+                    IsYoutubeFormatUnavailableError(result.errorLog.empty() ? result.status : result.errorLog))
+                {
+                    success = runOnce(buildCommandBase(relaxedFormatSelector, true));
+                }
+                if (!success && browser.empty() &&
+                    IsYoutubeHttpForbiddenError(result.errorLog.empty() ? result.status : result.errorLog))
+                {
+                    noCookiesHad403 = true;
+                }
+            }
+
+            // Same requested quality via visionos HLS when https DASH CDN keeps 403'ing (no lower-res fallback).
+            const bool wantVisionOsHls = request.mediaMode != "Audio only" && !IsAudioOnlyExtension(ext);
+            if (!success && !visionOsHlsTried && wantVisionOsHls && result.status != "Download cancelled." &&
+                (noCookiesHad403 ||
+                 IsYoutubeHttpForbiddenError(result.errorLog.empty() ? result.status : result.errorLog)))
+            {
+                visionOsHlsTried = true;
+                rememberFailure(result.status, result.errorLog.empty() ? result.status : result.errorLog);
+                SetSharedStatus(sharedState, "Retrying via HLS (same quality)...", 0.05f);
+                RemoveDownloadArtifacts(request.outputDirectory, outputTitle, request.fileFormat);
+                forceOverwrite = true;
+                const std::string visionArgs = BuildYoutubeVisionOsJsRuntimeArgs();
+                success = runVisionOsOnce(buildCommandBase(hlsFormatSelector, true, visionArgs));
+                if (success && OutputBelowRequestedQuality(request, outputTitle))
+                {
+                    success = false;
+                    rememberFailure("Download failed: requested quality unavailable (got a lower resolution).",
+                                    "HLS fallback finished below requested quality.");
+                    RemoveDownloadArtifacts(request.outputDirectory, outputTitle, request.fileFormat);
+                    DiscardUndersizedDownloadOutput(request, outputTitle);
+                    result.status = "Download failed: requested quality unavailable (got a lower resolution).";
+                    result.errorLog = "HLS fallback finished below requested quality.";
+                    lastOutput = result.errorLog;
+                }
+
+                BrowserAttempt hlsAttempt;
+                hlsAttempt.browserSpec = "visionos HLS (no cookies)";
+                hlsAttempt.success = success;
+                hlsAttempt.summary = success ? "Downloaded requested quality via visionos HLS."
+                                             : SummarizeBrowserAttemptOutput(
+                                                   result.errorLog.empty() ? result.status : result.errorLog, false);
+                hlsAttempt.nextAction = success ? "Used HLS after DASH HTTP 403."
+                                                : "HLS same-quality retry failed; continuing browser options if any.";
+                downloadLog.AddAttempt(hlsAttempt);
+
+                if (success)
+                {
+                    successfulBrowser = browser;
+                    RemoveDownloadArtifacts(request.outputDirectory, outputTitle, request.fileFormat);
+                    break;
+                }
+            }
+
+            if (success && BothOutputMissingAudio(request, outputTitle))
+            {
+                if (!forceOverwrite)
+                {
+                    SetSharedStatus(sharedState, "Re-downloading (no audio in file)...", 0.05f);
+                    forceOverwrite = true;
+                    success = runOnce(buildCommandBase(formatSelector, true));
+                    if (!success && result.status != "Download cancelled." &&
+                        IsYoutubeFormatUnavailableError(result.errorLog.empty() ? result.status : result.errorLog))
+                    {
+                        success = runOnce(buildCommandBase(relaxedFormatSelector, true));
+                    }
+                }
+                if (success && BothOutputMissingAudio(request, outputTitle))
+                {
+                    success = false;
+                    result.status = "Download failed: output has no audio.";
+                    result.errorLog =
+                        "Both mode produced a file without an audio stream.\nOutput: " +
+                        PathUtf8(FindDownloadOutputFile(request.outputDirectory, outputTitle, request.fileFormat));
+                    lastOutput = result.errorLog;
+                }
+            }
+
+            if (success && OutputBelowRequestedQuality(request, outputTitle))
+            {
+                size_t noCookieIndex = browsersToTry.size();
+                for (size_t j = 0; j < browsersToTry.size(); ++j)
+                {
+                    if (browsersToTry[j].empty())
+                    {
+                        noCookieIndex = j;
+                        break;
+                    }
+                }
+
+                if (!browser.empty() && !noCookiesAttempted && noCookieIndex < browsersToTry.size())
+                {
+                    BrowserAttempt softFail;
+                    softFail.browserSpec = browser;
+                    softFail.success = false;
+                    softFail.summary = "Finished below requested quality; trying fuller DASH without cookies.";
+                    softFail.nextAction = "Trying next browser option for requested quality.";
+                    downloadLog.AddAttempt(softFail);
+                    rememberFailure("Download finished below requested quality.", softFail.summary);
+
+                    RemoveDownloadArtifacts(request.outputDirectory, outputTitle, request.fileFormat);
+                    DiscardUndersizedDownloadOutput(request, outputTitle);
+                    forceOverwrite = true;
+                    browserIndex = noCookieIndex - 1; // loop ++ lands on no-cookies
+                    continue;
+                }
+
+                // Never accept a lower resolution as success — requested quality is mandatory.
+                BrowserAttempt softFail;
+                softFail.browserSpec = browser;
+                softFail.success = false;
+                softFail.summary = "Finished below requested quality; requested quality unavailable.";
+                softFail.nextAction = "Stopped — requested quality unavailable for this video/session.";
+                downloadLog.AddAttempt(softFail);
+                rememberFailure("Download failed: requested quality unavailable (got a lower resolution).",
+                                softFail.summary);
+                RemoveDownloadArtifacts(request.outputDirectory, outputTitle, request.fileFormat);
+                DiscardUndersizedDownloadOutput(request, outputTitle);
+                result.status = "Download failed: requested quality unavailable (got a lower resolution).";
+                result.errorLog = bestFailureLog.empty() ? softFail.summary : bestFailureLog;
+                lastOutput = result.errorLog;
+                break;
             }
 
             BrowserAttempt attempt;
@@ -1289,15 +3201,26 @@ DownloadRunResult DownloadRunner::Run(DownloadRequest request,
             if (success)
             {
                 successfulBrowser = browser;
+                RemoveDownloadArtifacts(request.outputDirectory, outputTitle, request.fileFormat);
                 break;
             }
             if (result.status == "Download cancelled.")
             {
+                RemoveDownloadArtifacts(request.outputDirectory, outputTitle, request.fileFormat);
                 result.downloadBrowserReport = downloadLog.FormatSection("Download");
                 return result;
             }
 
-            if (!browser.empty() && !ShouldRetryYoutubeWithDifferentCookies(result.errorLog))
+            rememberFailure(result.status, result.errorLog.empty() ? result.status : result.errorLog);
+
+            // Bare high-res often 403s on CDN; one signed-in fallback is enough — don't walk every cookie DB.
+            if (!browser.empty() && noCookiesHad403)
+            {
+                break;
+            }
+
+            if (!browser.empty() && !ShouldRetryYoutubeWithDifferentCookies(result.errorLog) &&
+                !IsYoutubeHttpForbiddenError(result.errorLog.empty() ? result.status : result.errorLog))
             {
                 break;
             }
@@ -1307,14 +3230,27 @@ DownloadRunResult DownloadRunner::Run(DownloadRequest request,
 
         if (result.status == "Download finished.")
         {
+            RemoveDownloadArtifacts(request.outputDirectory, outputTitle, request.fileFormat);
             downloadLog.SetWinner(successfulBrowser);
             result.downloadBrowserReport = downloadLog.FormatSection("Download");
             SetPreferredYoutubeCookieBrowser(successfulBrowser);
             return result;
         }
 
-        if (result.status != "Download cancelled.")
+        if (result.status == "Download cancelled.")
         {
+            RemoveDownloadArtifacts(request.outputDirectory, outputTitle, request.fileFormat);
+        }
+        else
+        {
+            if (!bestFailureStatus.empty())
+            {
+                result.status = bestFailureStatus.rfind("Download failed", 0) == 0
+                                    ? bestFailureStatus
+                                    : ("Download failed: " +
+                                       SimplifyYtDlpError(bestFailureLog.empty() ? bestFailureStatus : bestFailureLog));
+                lastOutput = bestFailureLog.empty() ? bestFailureStatus : bestFailureLog;
+            }
             result.errorLog =
                 BuildDownloadErrorLog(request, formatSelector, static_cast<int>(result.exitCode), lastOutput);
         }
@@ -1346,14 +3282,65 @@ void DownloadRunner::SetSharedStatus(const std::shared_ptr<DownloadSharedState>&
 
     std::lock_guard<std::mutex> lock(sharedState->mutex);
     sharedState->status = status;
+    const float clamped = std::clamp(progress, 0.0f, 1.0f);
+    if (phase == DownloadSharedState::Phase::Downloading)
+    {
+        sharedState->ytProgress = std::max(sharedState->ytProgress, clamped);
+    }
     if (sharedState->phase != phase)
     {
         sharedState->phase = phase;
-        sharedState->progress = std::clamp(progress, 0.0f, 1.0f);
+        sharedState->progress = clamped;
         return;
     }
 
-    sharedState->progress = std::max(sharedState->progress, std::clamp(progress, 0.0f, 1.0f));
+    sharedState->progress = std::max(sharedState->progress, clamped);
+}
+
+void DownloadRunner::SetSharedDiskProgress(const std::shared_ptr<DownloadSharedState>& sharedState, float diskProgress)
+{
+    if (sharedState == nullptr)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(sharedState->mutex);
+    sharedState->diskProgress = std::clamp(diskProgress, 0.0f, 1.0f);
+}
+
+void DownloadRunner::SetSharedDiskBytes(const std::shared_ptr<DownloadSharedState>& sharedState,
+                                        std::uint64_t diskBytes)
+{
+    if (sharedState == nullptr)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(sharedState->mutex);
+    sharedState->diskBytes = diskBytes;
+}
+
+void DownloadRunner::SetSharedEstimatedBytes(const std::shared_ptr<DownloadSharedState>& sharedState,
+                                             std::int64_t estimatedBytes)
+{
+    if (sharedState == nullptr || estimatedBytes <= 0)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(sharedState->mutex);
+    sharedState->estimatedBytes = std::max(sharedState->estimatedBytes, estimatedBytes);
+}
+
+void DownloadRunner::SetSharedYtDlpSpeed(const std::shared_ptr<DownloadSharedState>& sharedState, double ytDlpSpeedBps)
+{
+    if (sharedState == nullptr)
+    {
+        return;
+    }
+
+    std::lock_guard<std::mutex> lock(sharedState->mutex);
+    sharedState->ytDlpSpeedBps = ytDlpSpeedBps >= 0.0 ? ytDlpSpeedBps : -1.0;
 }
 
 std::string DownloadRunner::Quote(const std::string& value)

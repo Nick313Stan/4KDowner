@@ -178,9 +178,34 @@ bool IsBetterVideoCandidate(const LinkFormatStream& candidate, const LinkFormatS
         return true;
     }
 
-    if (candidate.height != current->height)
+    const int candidateQuality = [&]()
     {
-        return candidate.height > current->height;
+        if (candidate.width > 0 && candidate.height > 0)
+        {
+            return std::min(candidate.width, candidate.height);
+        }
+        return candidate.height > 0 ? candidate.height : candidate.width;
+    }();
+    const int currentQuality = [&]()
+    {
+        if (current->width > 0 && current->height > 0)
+        {
+            return std::min(current->width, current->height);
+        }
+        return current->height > 0 ? current->height : current->width;
+    }();
+
+    if (candidateQuality != currentQuality)
+    {
+        return candidateQuality > currentQuality;
+    }
+
+    // Same YouTube quality label: prefer more pixels (portrait 1080x1920 over 1080x1080).
+    const int candidatePixels = std::max(0, candidate.width) * std::max(0, candidate.height);
+    const int currentPixels = std::max(0, current->width) * std::max(0, current->height);
+    if (candidatePixels != currentPixels)
+    {
+        return candidatePixels > currentPixels;
     }
 
     if (VideoCodecRank(candidate.vcodec) != VideoCodecRank(current->vcodec))
@@ -188,12 +213,40 @@ bool IsBetterVideoCandidate(const LinkFormatStream& candidate, const LinkFormatS
         return VideoCodecRank(candidate.vcodec) > VideoCodecRank(current->vcodec);
     }
 
-    return false;
+    // Same height/codec: prefer the larger known size (e.g. HLS approx vs progressive).
+    const auto streamBytes = [](const LinkFormatStream& stream) -> std::int64_t
+    {
+        if (stream.filesize > 0)
+        {
+            return stream.filesize;
+        }
+        if (stream.filesizeApprox > 0)
+        {
+            return stream.filesizeApprox;
+        }
+        return 0;
+    };
+    return streamBytes(candidate) > streamBytes(*current);
 }
 
-bool MatchesSelectedQuality(int height, const std::string& quality)
+int StreamQualityLabelHeight(const LinkFormatStream& stream)
 {
-    if (height < 144)
+    // YouTube labels Shorts by the short side: 1080x1920 is "1080p", not 1920p/2K.
+    if (stream.width > 0 && stream.height > 0)
+    {
+        return std::min(stream.width, stream.height);
+    }
+    if (stream.height > 0)
+    {
+        return stream.height;
+    }
+    return stream.width;
+}
+
+bool MatchesSelectedQuality(const LinkFormatStream& stream, const std::string& quality)
+{
+    const int qualityHeight = StreamQualityLabelHeight(stream);
+    if (qualityHeight < 144)
     {
         return false;
     }
@@ -204,8 +257,8 @@ bool MatchesSelectedQuality(int height, const std::string& quality)
         return true;
     }
 
-    // Cap semantics: accept any stream at or below the selected height.
-    return BucketDownloadHeight(height) <= selected;
+    // Cap semantics: accept any stream at or below the selected YouTube quality label.
+    return BucketDownloadHeight(qualityHeight) <= selected;
 }
 
 std::string FormatResolution(int height)
@@ -224,8 +277,8 @@ PickBestVideoOnly(const std::vector<LinkFormatStream>& streams, const std::strin
     const LinkFormatStream* best = nullptr;
     for (const LinkFormatStream& stream : streams)
     {
-        if (ToLower(stream.ext) != targetExt || !IsVideoOnly(stream) ||
-            !MatchesSelectedQuality(stream.height, quality) || !AcceptVideoStream(stream, ext))
+        if (ToLower(stream.ext) != targetExt || !IsVideoOnly(stream) || !MatchesSelectedQuality(stream, quality) ||
+            !AcceptVideoStream(stream, ext))
         {
             continue;
         }
@@ -245,7 +298,7 @@ PickBestMuxed(const std::vector<LinkFormatStream>& streams, const std::string& e
     const LinkFormatStream* best = nullptr;
     for (const LinkFormatStream& stream : streams)
     {
-        if (ToLower(stream.ext) != targetExt || !IsMuxed(stream) || !MatchesSelectedQuality(stream.height, quality) ||
+        if (ToLower(stream.ext) != targetExt || !IsMuxed(stream) || !MatchesSelectedQuality(stream, quality) ||
             !AcceptVideoStream(stream, ext))
         {
             continue;
@@ -295,20 +348,24 @@ PredictBoth(const std::vector<LinkFormatStream>& streams, const std::string& ext
     const LinkFormatStream* audio = PickBestAudioOnly(streams, audioExt);
     if (video != nullptr && audio != nullptr)
     {
-        return MakePrediction(
-            lowerExt, NormalizeCodecName(video->vcodec), NormalizeCodecName(audio->acodec), video->height);
+        return MakePrediction(lowerExt,
+                              NormalizeCodecName(video->vcodec),
+                              NormalizeCodecName(audio->acodec),
+                              StreamQualityLabelHeight(*video));
     }
 
     const LinkFormatStream* muxed = PickBestMuxed(streams, lowerExt, quality);
     if (muxed != nullptr)
     {
-        return MakePrediction(
-            lowerExt, NormalizeCodecName(muxed->vcodec), NormalizeCodecName(muxed->acodec), muxed->height);
+        return MakePrediction(lowerExt,
+                              NormalizeCodecName(muxed->vcodec),
+                              NormalizeCodecName(muxed->acodec),
+                              StreamQualityLabelHeight(*muxed));
     }
 
     if (video != nullptr)
     {
-        return MakePrediction(lowerExt, NormalizeCodecName(video->vcodec), "None", video->height);
+        return MakePrediction(lowerExt, NormalizeCodecName(video->vcodec), "None", StreamQualityLabelHeight(*video));
     }
 
     return MakePrediction(ext, "Unknown", "Unknown", 0);
@@ -419,6 +476,36 @@ int ExtractJsonIntField(const std::string& object, const char* key)
     }
 }
 
+std::int64_t ExtractJsonInt64Field(const std::string& object, const char* key)
+{
+    const std::string raw = ExtractJsonFieldRaw(object, key);
+    if (raw.empty() || raw == "null" || raw == "NA" || raw == "None" || raw == "none")
+    {
+        return 0;
+    }
+    try
+    {
+        return static_cast<std::int64_t>(std::stoll(raw));
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
+std::int64_t PreferredStreamBytes(const LinkFormatStream& stream)
+{
+    if (stream.filesize > 0)
+    {
+        return stream.filesize;
+    }
+    if (stream.filesizeApprox > 0)
+    {
+        return stream.filesizeApprox;
+    }
+    return 0;
+}
+
 int HeightFromResolutionString(const std::string& resolution)
 {
     // "7680x4320" / "7680×4320"
@@ -430,6 +517,23 @@ int HeightFromResolutionString(const std::string& resolution)
     try
     {
         return std::stoi(resolution.substr(sep + 1));
+    }
+    catch (...)
+    {
+        return 0;
+    }
+}
+
+int WidthFromResolutionString(const std::string& resolution)
+{
+    const size_t sep = resolution.find_first_of("xX×");
+    if (sep == std::string::npos || sep == 0)
+    {
+        return 0;
+    }
+    try
+    {
+        return std::stoi(resolution.substr(0, sep));
     }
     catch (...)
     {
@@ -534,6 +638,30 @@ std::vector<std::string> OrderExts(const std::set<std::string>& seenIn, const st
     }
     return result;
 }
+
+bool UsesSeparateVideoAudioStreams(const std::vector<LinkFormatStream>& streams,
+                                   const std::string& fileFormat,
+                                   const std::string& mediaMode,
+                                   const std::string& quality)
+{
+    if (mediaMode != "Both" || streams.empty())
+    {
+        return false;
+    }
+
+    const std::string ext = ToLower(StripFormatItemLabel(fileFormat));
+    if (ext.empty())
+    {
+        return false;
+    }
+
+    // Match BuildFormatSelector: bestvideo+bestaudio first → Title.fNNN.* on disk.
+    // Only when those are missing does yt-dlp fall through to muxed/HLS (one Title.ext.part).
+    const std::string audioExt = ext == "mp4" ? "m4a" : ext;
+    const LinkFormatStream* video = PickBestVideoOnly(streams, ext, quality);
+    const LinkFormatStream* audio = PickBestAudioOnly(streams, audioExt);
+    return video != nullptr && audio != nullptr;
+}
 } // namespace
 
 std::vector<LinkFormatStream> ParseLinkFormatStreamsJson(const std::string& jsonArray)
@@ -566,8 +694,16 @@ std::vector<LinkFormatStream> ParseLinkFormatStreamsJson(const std::string& json
         stream.formatId = ExtractJsonFieldRaw(object, "format_id");
         stream.ext = std::move(ext);
         stream.height = InferStreamHeight(object);
+        stream.width = ExtractJsonIntField(object, "width");
+        if (stream.width <= 0)
+        {
+            stream.width = WidthFromResolutionString(ExtractJsonFieldRaw(object, "resolution"));
+        }
+        stream.filesize = ExtractJsonInt64Field(object, "filesize");
+        stream.filesizeApprox = ExtractJsonInt64Field(object, "filesize_approx");
         stream.vcodec = ExtractJsonFieldRaw(object, "vcodec");
         stream.acodec = ExtractJsonFieldRaw(object, "acodec");
+        stream.protocol = ExtractJsonFieldRaw(object, "protocol");
         streams.push_back(std::move(stream));
     }
     return streams;
@@ -655,7 +791,7 @@ std::vector<std::string> QualitiesFromStreams(const std::vector<LinkFormatStream
         {
             continue;
         }
-        const int bucket = BucketDownloadHeight(stream.height);
+        const int bucket = BucketDownloadHeight(EffectiveQualityHeight(stream));
         if (bucket > 0)
         {
             heights.insert(bucket);
@@ -710,19 +846,93 @@ PredictedDownload PredictDownload(const std::vector<LinkFormatStream>& streams,
         const LinkFormatStream* video = PickBestVideoOnly(streams, ext, quality);
         if (video != nullptr)
         {
-            return MakePrediction(ext, NormalizeCodecName(video->vcodec), "None", video->height);
+            return MakePrediction(ext, NormalizeCodecName(video->vcodec), "None", EffectiveQualityHeight(*video));
         }
 
         const LinkFormatStream* muxed = PickBestMuxed(streams, ext, quality);
         if (muxed != nullptr)
         {
-            return MakePrediction(ext, NormalizeCodecName(muxed->vcodec), "None", muxed->height);
+            return MakePrediction(ext, NormalizeCodecName(muxed->vcodec), "None", EffectiveQualityHeight(*muxed));
         }
 
         return MakePrediction(fileFormat, "Unknown", "None", 0);
     }
 
     return PredictBoth(streams, ext, quality);
+}
+
+std::int64_t EstimateDownloadBytes(const std::vector<LinkFormatStream>& streams,
+                                   const std::string& fileFormat,
+                                   const std::string& mediaMode,
+                                   const std::string& quality)
+{
+    if (streams.empty())
+    {
+        return 0;
+    }
+
+    const std::string ext = ToLower(StripFormatItemLabel(fileFormat));
+    if (ext.empty())
+    {
+        return 0;
+    }
+
+    if (mediaMode == "Audio only")
+    {
+        const LinkFormatStream* audio = PickBestAudioOnly(streams, ext);
+        return audio != nullptr ? PreferredStreamBytes(*audio) : 0;
+    }
+
+    if (mediaMode == "Video only")
+    {
+        const LinkFormatStream* video = PickBestVideoOnly(streams, ext, quality);
+        if (video != nullptr)
+        {
+            return PreferredStreamBytes(*video);
+        }
+        const LinkFormatStream* muxed = PickBestMuxed(streams, ext, quality);
+        return muxed != nullptr ? PreferredStreamBytes(*muxed) : 0;
+    }
+
+    // Both: separate video+audio (matches -f bestvideo+bestaudio), else muxed/HLS.
+    const std::string audioExt = ext == "mp4" ? "m4a" : ext;
+    const LinkFormatStream* video = PickBestVideoOnly(streams, ext, quality);
+    const LinkFormatStream* audio = PickBestAudioOnly(streams, audioExt);
+    if (video != nullptr && audio != nullptr)
+    {
+        const std::int64_t videoBytes = PreferredStreamBytes(*video);
+        const std::int64_t audioBytes = PreferredStreamBytes(*audio);
+        if (videoBytes > 0 && audioBytes > 0)
+        {
+            return videoBytes + audioBytes;
+        }
+        if (videoBytes > 0)
+        {
+            return videoBytes;
+        }
+        return audioBytes;
+    }
+
+    const LinkFormatStream* muxed = PickBestMuxed(streams, ext, quality);
+    if (muxed != nullptr)
+    {
+        return PreferredStreamBytes(*muxed);
+    }
+    if (video != nullptr)
+    {
+        return PreferredStreamBytes(*video);
+    }
+    return 0;
+}
+
+bool PredictSingleMainPartDiskProgress(const std::vector<LinkFormatStream>& streams,
+                                       const std::string& fileFormat,
+                                       const std::string& mediaMode,
+                                       const std::string& quality)
+{
+    // DASH Both (android_vr etc.): Title.f398.mp4.part + Title.f140.m4a.part — sum all artifacts.
+    // HLS/muxed/progressive (web_safari etc.): one Title.mp4.part accumulator — ignore -Frag temps.
+    return !UsesSeparateVideoAudioStreams(streams, fileFormat, mediaMode, quality);
 }
 
 int ParseQualityHeight(const std::string& quality)
@@ -757,6 +967,11 @@ int BucketDownloadHeight(int height)
     {
         return 2160;
     }
+    // YouTube 4K Shorts are often square 1920x1920 but labeled / sold as 2160p.
+    if (height >= 1920)
+    {
+        return 2160;
+    }
     if (height >= 1440)
     {
         return 1440;
@@ -788,6 +1003,19 @@ int BucketDownloadHeight(int height)
     return 0;
 }
 
+int EffectiveQualityHeight(const LinkFormatStream& stream)
+{
+    if (stream.width > 0 && stream.height > 0)
+    {
+        return std::min(stream.width, stream.height);
+    }
+    if (stream.height > 0)
+    {
+        return stream.height;
+    }
+    return stream.width;
+}
+
 bool ContainerSupportsQuality(const std::vector<LinkFormatStream>& streams, const std::string& container, int height)
 {
     if (height <= 0 || container.empty())
@@ -798,7 +1026,7 @@ bool ContainerSupportsQuality(const std::vector<LinkFormatStream>& streams, cons
     const std::string targetExt = ToLower(container);
     for (const LinkFormatStream& stream : streams)
     {
-        if (BucketDownloadHeight(stream.height) != height || ToLower(stream.ext) != targetExt)
+        if (BucketDownloadHeight(EffectiveQualityHeight(stream)) != height || ToLower(stream.ext) != targetExt)
         {
             continue;
         }
@@ -855,6 +1083,12 @@ std::vector<std::string> BuildFormatItemsForQuality(const std::vector<std::strin
                                                     int mediaMode)
 {
     if (mediaMode == 2)
+    {
+        return allFormats;
+    }
+
+    // No stream metadata yet (channel tab / quiet detail-parse): don't claim Unavailable.
+    if (streams.empty())
     {
         return allFormats;
     }

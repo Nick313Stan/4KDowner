@@ -28,6 +28,15 @@ struct DownloadOptions
     std::string qualityCap;
     bool useCustomPath = false;
     std::string customPath;
+    // Prefix downloaded filenames with the list/tab index (1. Title…).
+    // For channel groups: header flag applies to all tabs; each tab can also enable it alone.
+    // Default off for single videos; playlist/channel groups turn this on in their constructor.
+    bool keepNumbering = false;
+    // When keepNumbering is on:
+    // - Channels: unchecked = N…1 (newest/top = highest), checked = 1…N.
+    // - Playlists: unchecked = 1…N (top = first), checked = N…1.
+    // Controls filename prefixes and list badges.
+    bool inverseNumbering = false;
 };
 
 struct ConverterOptions

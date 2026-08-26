@@ -1,11 +1,15 @@
 ﻿#include "DockArea.h"
 
+#include "Version.h"
+
 #include "BrowserDiagnostics.h"
 #include "DownloadFormatPredictor.h"
 #include "FoldoutPanel.h"
 #include "LinkCardGroupNodeInclude.h"
+#include "WinAppPaths.h"
 #include "LinkGroupInfoLoader.h"
 #include "MouseCursor.h"
+#include "Scrollbar.h"
 #include "ShortcutRouter.h"
 #include "TaskbarProgress.h"
 #include "Tooltip.h"
@@ -17,9 +21,9 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
-#include <cwctype>
 #include <filesystem>
 #include <fstream>
 #include <memory>
@@ -29,10 +33,6 @@
 #include <unordered_set>
 #include <utility>
 #include <vector>
-
-#ifndef FOURKDOWNER_VERSION
-#define FOURKDOWNER_VERSION "1.1.0"
-#endif
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -44,6 +44,7 @@
 #include <shellapi.h>
 #include <shlobj.h>
 #include <shobjidl.h>
+#include <cwctype>
 #undef CloseWindow
 #undef ShowCursor
 #undef DrawTextEx
@@ -807,33 +808,6 @@ float GetConverterOptionsContentHeight(float panelY, bool resultExpanded)
     return std::max(0.0f, contentBottom - (panelY + kOptionsContentTopPad));
 }
 
-constexpr float kScrollbarTrackWidth = 4.0f;
-constexpr float kScrollbarEdgePad = 2.0f; // gap outside track on left and right
-
-void DrawOptionsScrollbar(Rectangle viewport, float scrollOffset, float maxScroll)
-{
-    if (maxScroll <= 0.0f || viewport.height <= 1.0f)
-    {
-        return;
-    }
-
-    const Rectangle track = {viewport.x + viewport.width - kScrollbarTrackWidth - kScrollbarEdgePad,
-                             viewport.y + 4.0f,
-                             kScrollbarTrackWidth,
-                             viewport.height - 8.0f};
-    DrawRectangleRounded(track, 1.0f, 4, Color{48, 58, 48, 255});
-
-    const float thumbRatio = viewport.height / (viewport.height + maxScroll);
-    const float thumbHeight = std::max(18.0f, track.height * thumbRatio);
-    const float thumbTravel = track.height - thumbHeight;
-    const float thumbY = track.y + (scrollOffset / maxScroll) * thumbTravel;
-    constexpr float kThumbInset = 1.0f;
-    DrawRectangleRounded({track.x + kThumbInset, thumbY, std::max(1.0f, track.width - kThumbInset * 2.0f), thumbHeight},
-                         1.0f,
-                         4,
-                         Color{96, 118, 96, 255});
-}
-
 void DrawDownloadResultPreview(Font font,
                                const Rectangle& settingsPanel,
                                const PredictedDownload& prediction,
@@ -995,15 +969,6 @@ void TryRemoveFile(const std::filesystem::path& path)
     std::error_code error;
     std::filesystem::remove(path, error);
 #endif
-}
-
-void TryRemoveUtf8File(const std::string& utf8Path)
-{
-    if (utf8Path.empty())
-    {
-        return;
-    }
-    TryRemoveFile(std::filesystem::u8path(utf8Path));
 }
 
 // Wipe Documents staging leftovers for a download title. Never used for overwrite prompts.
@@ -1261,17 +1226,6 @@ int GetDefaultConverterIndex(const std::vector<std::string>& items, const std::s
     return 0;
 }
 
-void EnsureConverterDropdownIndex(int& selectedIndex,
-                                  const std::vector<std::string>& items,
-                                  const std::string& preferred)
-{
-    if (selectedIndex < 0 || selectedIndex >= static_cast<int>(items.size()) ||
-        IsConverterCurrentItem(items[selectedIndex]))
-    {
-        selectedIndex = GetDefaultConverterIndex(items, preferred);
-    }
-}
-
 std::vector<std::string> CompatibleVideoCodecsForContainer(const std::string& container)
 {
     const std::string lower = ToLowerAscii(container);
@@ -1457,11 +1411,80 @@ std::string FormatElapsedTime(double seconds)
     }
 
     const int totalSeconds = static_cast<int>(seconds + 0.5);
-    const int minutes = totalSeconds / 60;
-    const int secs = totalSeconds % 60;
+    const int hours = totalSeconds / 3600;
+    const int remainder = totalSeconds % 3600;
+    const int minutes = remainder / 60;
+    const int secs = remainder % 60;
     char buffer[32]{};
-    std::snprintf(buffer, sizeof(buffer), "%d:%02d", minutes, secs);
+    if (hours > 0)
+    {
+        std::snprintf(buffer, sizeof(buffer), "%d:%02d:%02d", hours, minutes, secs);
+    }
+    else
+    {
+        std::snprintf(buffer, sizeof(buffer), "%d:%02d", minutes, secs);
+    }
     return buffer;
+}
+
+// Footer ETA label: "~30s", "~5m", "~1h 30m".
+std::string FormatEstimatedRemaining(double seconds)
+{
+    if (seconds < 0.0 || !std::isfinite(seconds))
+    {
+        return {};
+    }
+
+    const int totalSeconds = std::max(1, static_cast<int>(seconds + 0.5));
+    if (totalSeconds < 60)
+    {
+        return "~" + std::to_string(totalSeconds) + "s";
+    }
+
+    const int hours = totalSeconds / 3600;
+    const int minutes = (totalSeconds % 3600) / 60;
+    if (hours > 0)
+    {
+        if (minutes <= 0)
+        {
+            return "~" + std::to_string(hours) + "h";
+        }
+        return "~" + std::to_string(hours) + "h " + std::to_string(minutes) + "m";
+    }
+
+    return "~" + std::to_string(std::max(1, minutes)) + "m";
+}
+
+double ComputeConvertEtaSeconds(const ConvertRunner& runner)
+{
+    if (!runner.IsRunning())
+    {
+        return -1.0;
+    }
+
+    const float progress = runner.Progress();
+    const double elapsed = runner.ElapsedSeconds();
+    if (progress > 0.02f && progress < 0.995f && elapsed >= 1.0)
+    {
+        return elapsed * (1.0 - static_cast<double>(progress)) / static_cast<double>(progress);
+    }
+
+    const double duration = runner.SourceDurationSeconds();
+    if (duration > 0.0 && progress >= 0.0f && progress < 0.995f)
+    {
+        // Remux/copy is usually much faster than realtime; encode closer to ~0.5–2x.
+        // Before progress moves, assume ~realtime as a soft floor.
+        const double assumedTotal = std::max(5.0, duration);
+        return std::max(1.0, assumedTotal * (1.0 - static_cast<double>(std::max(progress, 0.0f))));
+    }
+
+    return -1.0;
+}
+
+std::string BuildEstimatedFooterStatus(double etaSeconds)
+{
+    const std::string etaLabel = FormatEstimatedRemaining(etaSeconds);
+    return etaLabel.empty() ? "estimated: …" : ("estimated: " + etaLabel);
 }
 
 std::string TruncateTextToWidth(Font font, const std::string& text, float fontSize, float maxWidth)
@@ -1690,7 +1713,7 @@ struct AboutDialogMetrics
     static AboutDialogMetrics FromWindow(int windowWidth, int windowHeight)
     {
         constexpr float kModalWidth = 460.0f;
-        constexpr float kModalHeight = 356.0f;
+        constexpr float kModalHeight = 406.0f;
         AboutDialogMetrics metrics;
         metrics.modal = {(static_cast<float>(windowWidth) - kModalWidth) * 0.5f,
                          (static_cast<float>(windowHeight) - kModalHeight) * 0.5f,
@@ -1849,11 +1872,330 @@ std::vector<std::string> BuildGroupQualityCapItems()
     return {"Max", "4320p", "2160p", "1440p", "1080p", "720p", "480p", "360p"};
 }
 
+// Provisional ladder for a single video card before formats are parsed (no "Max").
+std::vector<std::string> BuildVideoQualityItems()
+{
+    return {"4320p", "2160p", "1440p", "1080p", "720p", "480p", "360p"};
+}
+
 std::string GroupQualityCapFromOptions(const DownloadOptions& options)
 {
     const std::vector<std::string> items = BuildGroupQualityCapItems();
     const int index = std::clamp(options.quality, 0, static_cast<int>(items.size()) - 1);
     return items[static_cast<size_t>(index)];
+}
+
+bool ResolveKeepDownloadNumbering(const std::vector<DownloaderListItem>& cards, const LinkCardNode& card)
+{
+    for (const DownloaderListItem& item : cards)
+    {
+        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr)
+        {
+            continue;
+        }
+
+        LinkCardGroupNode& group = *item.group;
+        if (group.UsesChannelTabs())
+        {
+            for (int tab = 0; tab < kChannelTabCount; ++tab)
+            {
+                for (const LinkCardNode& child : group.ChannelTabLoadedCards(tab))
+                {
+                    if (&child == &card)
+                    {
+                        // Channel header flag covers every tab; each tab can also enable numbering alone.
+                        return group.Options().keepNumbering || group.ChannelTabKeepNumbering(tab);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (group.UsesPlaylistShelf())
+        {
+            for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+            {
+                LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+                if (playlist == nullptr)
+                {
+                    continue;
+                }
+                bool belongs = false;
+                playlist->ForEachLoadedCard(
+                    [&](const LinkCardNode& child)
+                    {
+                        if (&child == &card)
+                        {
+                            belongs = true;
+                        }
+                    });
+                if (belongs)
+                {
+                    return group.Options().keepNumbering || playlist->Options().keepNumbering;
+                }
+            }
+            continue;
+        }
+
+        for (const LinkCardNode& child : group.LoadedCards())
+        {
+            if (&child == &card)
+            {
+                return group.Options().keepNumbering;
+            }
+        }
+    }
+
+    return card.Options().keepNumbering;
+}
+
+// Checkbox "Inverse numbering": channels off = N…1 / on = 1…N; playlists off = 1…N / on = N…1.
+// Header flag covers channel/shelf; each channel tab can also enable it alone when the header flag is off.
+bool ResolveInverseDownloadNumbering(const std::vector<DownloaderListItem>& cards, const LinkCardNode& card)
+{
+    for (const DownloaderListItem& item : cards)
+    {
+        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr)
+        {
+            continue;
+        }
+
+        LinkCardGroupNode& group = *item.group;
+        if (group.UsesChannelTabs())
+        {
+            for (int tab = 0; tab < kChannelTabCount; ++tab)
+            {
+                for (const LinkCardNode& child : group.ChannelTabLoadedCards(tab))
+                {
+                    if (&child == &card)
+                    {
+                        return group.Options().inverseNumbering || group.ChannelTabInverseNumbering(tab);
+                    }
+                }
+            }
+            continue;
+        }
+
+        if (group.UsesPlaylistShelf())
+        {
+            for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+            {
+                LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+                if (playlist == nullptr)
+                {
+                    continue;
+                }
+                bool belongs = false;
+                playlist->ForEachLoadedCard(
+                    [&](const LinkCardNode& child)
+                    {
+                        if (&child == &card)
+                        {
+                            belongs = true;
+                        }
+                    });
+                if (belongs)
+                {
+                    return group.Options().inverseNumbering || playlist->Options().inverseNumbering;
+                }
+            }
+            continue;
+        }
+
+        for (const LinkCardNode& child : group.LoadedCards())
+        {
+            if (&child == &card)
+            {
+                return group.Options().inverseNumbering;
+            }
+        }
+    }
+
+    return card.Options().inverseNumbering;
+}
+
+// Playlist/channel lists: newest/first-at-top → highest index when not inverted.
+int ReverseGroupChildDisplayIndex(int childIndex, int totalCount)
+{
+    if (childIndex < 0)
+    {
+        return 0;
+    }
+    if (totalCount <= 0)
+    {
+        return childIndex + 1;
+    }
+    return totalCount - childIndex;
+}
+
+// Filename/badge index.
+// Channels: inverse off → N…1 from the top; on → 1…N.
+// Playlists: inverse off → 1…N from the top; on → N…1 (checkbox still defaults off).
+int GroupChildDisplayIndex(int childIndex, int totalCount, bool inverseNumbering, bool playlistOrder = false)
+{
+    const bool ascending = playlistOrder ? !inverseNumbering : inverseNumbering;
+    if (!ascending)
+    {
+        return ReverseGroupChildDisplayIndex(childIndex, totalCount);
+    }
+    if (childIndex < 0)
+    {
+        return 0;
+    }
+    return childIndex + 1;
+}
+
+void SplitPaginationButtons(
+    Rectangle row, bool showLoadMore, bool showCollapse, Rectangle& loadMoreOut, Rectangle& collapseOut)
+{
+    loadMoreOut = {};
+    collapseOut = {};
+    if (row.width <= 0.0f || row.height <= 0.0f)
+    {
+        return;
+    }
+    constexpr float kBtnGap = 6.0f;
+    if (showLoadMore && showCollapse)
+    {
+        const float half = (row.width - kBtnGap) * 0.5f;
+        loadMoreOut = {row.x, row.y, half, row.height};
+        collapseOut = {row.x + half + kBtnGap, row.y, half, row.height};
+        return;
+    }
+    if (showLoadMore)
+    {
+        loadMoreOut = row;
+        return;
+    }
+    if (showCollapse)
+    {
+        collapseOut = row;
+    }
+}
+
+// Channel downloads go under: <base>/<ChannelName>/<Videos|Shorts|Lives>/
+bool AppendChannelCategoryOutputSubdirs(const std::vector<DownloaderListItem>& cards,
+                                        const LinkCardNode& card,
+                                        std::filesystem::path& outputPath)
+{
+    for (const DownloaderListItem& item : cards)
+    {
+        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr || !item.group->UsesChannelTabs())
+        {
+            continue;
+        }
+
+        LinkCardGroupNode& group = *item.group;
+        for (int tab = 0; tab < kChannelTabCount; ++tab)
+        {
+            for (const LinkCardNode& child : group.ChannelTabLoadedCards(tab))
+            {
+                if (&child != &card)
+                {
+                    continue;
+                }
+
+                std::string channelFolder = NormalizeVideoTitle(group.Title());
+                if (channelFolder.empty())
+                {
+                    channelFolder = "Channel";
+                }
+
+                const char* category = "Videos";
+                if (tab == static_cast<int>(ChannelContentTab::Shorts))
+                {
+                    category = "Shorts";
+                }
+                else if (tab == static_cast<int>(ChannelContentTab::Lives))
+                {
+                    category = "Lives";
+                }
+
+                outputPath /= std::filesystem::u8path(channelFolder);
+                outputPath /= category;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// Playlist downloads go under: <base>/<PlaylistName>/
+// Channel playlist-shelf videos: <base>/<ChannelName>/<PlaylistName>/
+bool AppendPlaylistOutputSubdir(const std::vector<DownloaderListItem>& cards,
+                                const LinkCardNode& card,
+                                std::filesystem::path& outputPath)
+{
+    for (const DownloaderListItem& item : cards)
+    {
+        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr || item.group->UsesChannelTabs())
+        {
+            continue;
+        }
+
+        LinkCardGroupNode& group = *item.group;
+        if (group.UsesPlaylistShelf())
+        {
+            for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+            {
+                LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+                if (playlist == nullptr)
+                {
+                    continue;
+                }
+                bool belongs = false;
+                playlist->ForEachLoadedCard(
+                    [&](const LinkCardNode& child)
+                    {
+                        if (&child == &card)
+                        {
+                            belongs = true;
+                        }
+                    });
+                if (!belongs)
+                {
+                    continue;
+                }
+
+                std::string channelFolder = NormalizeVideoTitle(group.Title());
+                if (channelFolder.empty())
+                {
+                    channelFolder = "Channel";
+                }
+                std::string playlistFolder = NormalizeVideoTitle(playlist->Title());
+                if (playlistFolder.empty())
+                {
+                    const LinkGroupEntry* entry = group.PlaylistShelfEntry(shelfIndex);
+                    playlistFolder = entry != nullptr ? NormalizeVideoTitle(entry->title) : std::string{};
+                }
+                if (playlistFolder.empty())
+                {
+                    playlistFolder = "Playlist";
+                }
+                outputPath /= std::filesystem::u8path(channelFolder);
+                outputPath /= std::filesystem::u8path(playlistFolder);
+                return true;
+            }
+            continue;
+        }
+
+        for (const LinkCardNode& child : group.LoadedCards())
+        {
+            if (&child != &card)
+            {
+                continue;
+            }
+
+            std::string playlistFolder = NormalizeVideoTitle(group.Title());
+            if (playlistFolder.empty())
+            {
+                playlistFolder = "Playlist";
+            }
+            outputPath /= std::filesystem::u8path(playlistFolder);
+            return true;
+        }
+    }
+    return false;
 }
 } // namespace
 
@@ -1885,6 +2227,7 @@ void DockArea::Update(int windowWidth, int windowHeight, Font font)
     {
         runner.Update();
     }
+    downloadSpeedHistory_.Update(downloadRunners_.data(), downloadRunners_.size());
     for (ConvertRunner& runner : convertRunners_)
     {
         runner.Update();
@@ -2074,7 +2417,23 @@ void DockArea::Draw(int windowWidth, int windowHeight, Font font, Font fontFoote
 
 void DockArea::UnloadResources()
 {
+    // App exit: stop workers first so DownloadRunner can delete .part/.ytdl leftovers.
+    pendingDownloadQueue_.clear();
+    pendingConvertQueue_.clear();
+    isBatchDownloading_ = false;
+    isBatchConverting_ = false;
+    CancelAllDownloads();
+    CancelAllConverts();
+    for (DownloadRunner& runner : downloadRunners_)
+    {
+        runner.Shutdown();
+    }
+    for (ConvertRunner& runner : convertRunners_)
+    {
+        runner.Shutdown();
+    }
     cards_.clear();
+    ClearDownloadHostCards();
     converterCards_.clear();
 }
 
@@ -2217,8 +2576,9 @@ Rectangle DockArea::GetInsertLinkButtonBounds(Rectangle leftPanel) const
     constexpr float kPad = 12.0f;
     const float width = std::min(kIdealW, std::max(24.0f, leftPanel.width - kPad * 2.0f));
     const float height = std::min(kIdealH, std::max(24.0f, leftPanel.height - kPad * 2.0f));
+    const float clusterHeight = height + kInsertLinkButtonHintsGap + kInsertLinkHintsBlockHeight;
     return {leftPanel.x + (leftPanel.width - width) * 0.5f,
-            leftPanel.y + (leftPanel.height - height) * 0.5f,
+            leftPanel.y + (leftPanel.height - clusterHeight) * 0.5f,
             width,
             height};
 }
@@ -2233,12 +2593,36 @@ Rectangle DockArea::GetListActionButtonBounds(Rectangle leftPanel, int index, fl
     constexpr float kIdealW = 180.0f;
     constexpr float kIdealH = 48.0f;
     constexpr float kPad = 12.0f;
-    const Rectangle slot = activeWorkspace_ == Workspace::Downloader
-                               ? GetDownloaderActionSlotBounds(leftPanel, scrollOffset)
-                               : GetCardBounds(leftPanel, index, scrollOffset);
+    const bool downloaderSlot = activeWorkspace_ == Workspace::Downloader;
+    const Rectangle slot = downloaderSlot ? GetDownloaderActionSlotBounds(leftPanel, scrollOffset)
+                                          : GetCardBounds(leftPanel, index, scrollOffset);
     const float width = std::min(kIdealW, std::max(24.0f, slot.width - kPad * 2.0f));
     const float height = std::min(kIdealH, std::max(24.0f, slot.height - 8.0f));
-    return {slot.x + (slot.width - width) * 0.5f, slot.y + (slot.height - height) * 0.5f, width, height};
+    const float y = downloaderSlot ? slot.y + 4.0f : slot.y + (slot.height - height) * 0.5f;
+    return {slot.x + (slot.width - width) * 0.5f, y, width, height};
+}
+
+void DockArea::DrawInsertLinkShortcutHints(Rectangle buttonBounds, Font font) const
+{
+    const Color color = Color{150, 168, 150, 255};
+    const char* line0 = "CTRL+V to paste video";
+    const char* line1 = "SHIFT+CTRL+V to paste same video again";
+    const float line0Y = buttonBounds.y + buttonBounds.height + kInsertLinkButtonHintsGap;
+    const float line1Y = line0Y + kInsertLinkHintFontSize + kInsertLinkHintLineGap;
+    const Vector2 size0 = MeasureTextEx(font, line0, kInsertLinkHintFontSize, 0.0f);
+    const Vector2 size1 = MeasureTextEx(font, line1, kInsertLinkHintFontSize, 0.0f);
+    DrawTextEx(font,
+               line0,
+               {buttonBounds.x + (buttonBounds.width - size0.x) * 0.5f, line0Y},
+               kInsertLinkHintFontSize,
+               0.0f,
+               color);
+    DrawTextEx(font,
+               line1,
+               {buttonBounds.x + (buttonBounds.width - size1.x) * 0.5f, line1Y},
+               kInsertLinkHintFontSize,
+               0.0f,
+               color);
 }
 
 DockArea::SettingsActionGrid DockArea::GetSettingsActionGrid(Rectangle settingsPanel) const
@@ -2290,7 +2674,7 @@ void DockArea::RebuildDownloaderLayoutCache() const
     downloaderCachedContentHeight_ = running;
     if (!cards_.empty())
     {
-        downloaderCachedContentHeight_ += kGap + kCardHeight;
+        downloaderCachedContentHeight_ += kGap + kCardHeight + kInsertLinkActionSlotExtra;
     }
 }
 
@@ -2325,7 +2709,7 @@ float DockArea::GetDownloaderReservedRight(Rectangle leftPanel) const
     {
         return 0.0f;
     }
-    const float gutterFromPanelEdge = kScrollbarEdgePad + kScrollbarTrackWidth + kScrollbarEdgePad;
+    const float gutterFromPanelEdge = Scrollbar::kEdgePad + Scrollbar::kIdleWidth + Scrollbar::kEdgePad;
     return std::max(0.0f, gutterFromPanelEdge - kMargin);
 }
 
@@ -2367,19 +2751,279 @@ DockArea::GetDownloaderGroupChildBounds(Rectangle leftPanel, int itemIndex, int 
 
 Rectangle DockArea::GetDownloaderGroupLoadMoreBounds(Rectangle leftPanel, int itemIndex, float scrollOffset) const
 {
+    Rectangle loadMore{};
+    Rectangle collapse{};
+    SplitPaginationButtons(GetDownloaderGroupPaginationRowBounds(leftPanel, itemIndex, scrollOffset),
+                           itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+                               cards_[itemIndex].kind == DownloaderListItem::Kind::Group &&
+                               cards_[itemIndex].group != nullptr && cards_[itemIndex].group->ShowsLoadMore(),
+                           itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+                               cards_[itemIndex].kind == DownloaderListItem::Kind::Group &&
+                               cards_[itemIndex].group != nullptr &&
+                               cards_[itemIndex].group->ShowsCollapseToFirstPage(),
+                           loadMore,
+                           collapse);
+    return loadMore;
+}
+
+Rectangle DockArea::GetDownloaderGroupCollapseBounds(Rectangle leftPanel, int itemIndex, float scrollOffset) const
+{
+    Rectangle loadMore{};
+    Rectangle collapse{};
+    SplitPaginationButtons(GetDownloaderGroupPaginationRowBounds(leftPanel, itemIndex, scrollOffset),
+                           itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+                               cards_[itemIndex].kind == DownloaderListItem::Kind::Group &&
+                               cards_[itemIndex].group != nullptr && cards_[itemIndex].group->ShowsLoadMore(),
+                           itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+                               cards_[itemIndex].kind == DownloaderListItem::Kind::Group &&
+                               cards_[itemIndex].group != nullptr &&
+                               cards_[itemIndex].group->ShowsCollapseToFirstPage(),
+                           loadMore,
+                           collapse);
+    return collapse;
+}
+
+Rectangle DockArea::GetDownloaderGroupPaginationRowBounds(Rectangle leftPanel, int itemIndex, float scrollOffset) const
+{
     if (itemIndex < 0 || itemIndex >= static_cast<int>(cards_.size()) ||
-        cards_[itemIndex].kind != DownloaderListItem::Kind::Group || !cards_[itemIndex].group->ShowsLoadMore())
+        cards_[itemIndex].kind != DownloaderListItem::Kind::Group || cards_[itemIndex].group == nullptr)
+    {
+        return {};
+    }
+    const LinkCardGroupNode& group = *cards_[itemIndex].group;
+    if (!group.ShowsLoadMore() && !group.ShowsCollapseToFirstPage())
     {
         return {};
     }
 
     const float reservedRight = GetDownloaderReservedRight(leftPanel);
-    const LinkCardGroupNode& group = *cards_[itemIndex].group;
-    const float top = GetDownloaderItemTop(leftPanel, itemIndex, scrollOffset) + kCardHeight + kGap +
-                      static_cast<float>(group.LoadedChildCount()) * (kCardHeight + kGap);
+    float top = GetDownloaderItemTop(leftPanel, itemIndex, scrollOffset) + kCardHeight + kGap;
+    if (group.UsesPlaylistShelf())
+    {
+        top += group.PlaylistShelfItemOffsetFromHeader(group.PlaylistShelfLoadedCount());
+    }
+    else
+    {
+        top += static_cast<float>(group.LoadedChildCount()) * (kCardHeight + kGap);
+    }
     return {leftPanel.x + kMargin + LinkCardGroupNode::kChildIndent,
             top,
             leftPanel.width - kMargin * 2.0f - reservedRight - LinkCardGroupNode::kChildIndent,
+            LinkCardGroupNode::kLoadMoreHeight};
+}
+
+Rectangle
+DockArea::GetDownloaderChannelTabBounds(Rectangle leftPanel, int itemIndex, int tabIndex, float scrollOffset) const
+{
+    if (itemIndex < 0 || itemIndex >= static_cast<int>(cards_.size()) ||
+        cards_[itemIndex].kind != DownloaderListItem::Kind::Group || cards_[itemIndex].group == nullptr)
+    {
+        return {};
+    }
+    const LinkCardGroupNode& group = *cards_[itemIndex].group;
+    const float reservedRight = GetDownloaderReservedRight(leftPanel);
+    const float top = GetDownloaderItemTop(leftPanel, itemIndex, scrollOffset) + kCardHeight + kGap +
+                      group.ChannelTabOffsetFromHeader(tabIndex);
+    return {leftPanel.x + kMargin + LinkCardGroupNode::kChildIndent,
+            top,
+            leftPanel.width - kMargin * 2.0f - reservedRight - LinkCardGroupNode::kChildIndent,
+            kCardHeight};
+}
+
+Rectangle DockArea::GetDownloaderChannelTabChildBounds(
+    Rectangle leftPanel, int itemIndex, int tabIndex, int childIndex, float scrollOffset) const
+{
+    const Rectangle tabBounds = GetDownloaderChannelTabBounds(leftPanel, itemIndex, tabIndex, scrollOffset);
+    if (tabBounds.width <= 0.0f)
+    {
+        return {};
+    }
+    const float reservedRight = GetDownloaderReservedRight(leftPanel);
+    const float extraIndent = LinkCardGroupNode::kChildIndent;
+    const float childTop = tabBounds.y + kCardHeight + kGap + static_cast<float>(childIndex) * (kCardHeight + kGap);
+    return {leftPanel.x + kMargin + LinkCardGroupNode::kChildIndent + extraIndent,
+            childTop,
+            leftPanel.width - kMargin * 2.0f - reservedRight - LinkCardGroupNode::kChildIndent - extraIndent,
+            kCardHeight};
+}
+
+Rectangle DockArea::GetDownloaderChannelTabLoadMoreBounds(Rectangle leftPanel,
+                                                          int itemIndex,
+                                                          int tabIndex,
+                                                          float scrollOffset) const
+{
+    Rectangle loadMore{};
+    Rectangle collapse{};
+    const bool showLoadMore = itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+                              cards_[itemIndex].kind == DownloaderListItem::Kind::Group &&
+                              cards_[itemIndex].group != nullptr &&
+                              cards_[itemIndex].group->ChannelTabShowsLoadMore(tabIndex);
+    const bool showCollapse = itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+                              cards_[itemIndex].kind == DownloaderListItem::Kind::Group &&
+                              cards_[itemIndex].group != nullptr &&
+                              cards_[itemIndex].group->ChannelTabShowsCollapseToFirstPage(tabIndex);
+    SplitPaginationButtons(GetDownloaderChannelTabPaginationRowBounds(leftPanel, itemIndex, tabIndex, scrollOffset),
+                           showLoadMore,
+                           showCollapse,
+                           loadMore,
+                           collapse);
+    return loadMore;
+}
+
+Rectangle DockArea::GetDownloaderChannelTabCollapseBounds(Rectangle leftPanel,
+                                                          int itemIndex,
+                                                          int tabIndex,
+                                                          float scrollOffset) const
+{
+    Rectangle loadMore{};
+    Rectangle collapse{};
+    const bool showLoadMore = itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+                              cards_[itemIndex].kind == DownloaderListItem::Kind::Group &&
+                              cards_[itemIndex].group != nullptr &&
+                              cards_[itemIndex].group->ChannelTabShowsLoadMore(tabIndex);
+    const bool showCollapse = itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+                              cards_[itemIndex].kind == DownloaderListItem::Kind::Group &&
+                              cards_[itemIndex].group != nullptr &&
+                              cards_[itemIndex].group->ChannelTabShowsCollapseToFirstPage(tabIndex);
+    SplitPaginationButtons(GetDownloaderChannelTabPaginationRowBounds(leftPanel, itemIndex, tabIndex, scrollOffset),
+                           showLoadMore,
+                           showCollapse,
+                           loadMore,
+                           collapse);
+    return collapse;
+}
+
+Rectangle DockArea::GetDownloaderChannelTabPaginationRowBounds(Rectangle leftPanel,
+                                                               int itemIndex,
+                                                               int tabIndex,
+                                                               float scrollOffset) const
+{
+    if (itemIndex < 0 || itemIndex >= static_cast<int>(cards_.size()) ||
+        cards_[itemIndex].kind != DownloaderListItem::Kind::Group || cards_[itemIndex].group == nullptr ||
+        (!cards_[itemIndex].group->ChannelTabShowsLoadMore(tabIndex) &&
+         !cards_[itemIndex].group->ChannelTabShowsCollapseToFirstPage(tabIndex)))
+    {
+        return {};
+    }
+    const LinkCardGroupNode& group = *cards_[itemIndex].group;
+    const Rectangle tabBounds = GetDownloaderChannelTabBounds(leftPanel, itemIndex, tabIndex, scrollOffset);
+    const float reservedRight = GetDownloaderReservedRight(leftPanel);
+    const float extraIndent = LinkCardGroupNode::kChildIndent;
+    const float top = tabBounds.y + kCardHeight + kGap +
+                      static_cast<float>(group.ChannelTabLoadedCount(tabIndex)) * (kCardHeight + kGap);
+    return {leftPanel.x + kMargin + LinkCardGroupNode::kChildIndent + extraIndent,
+            top,
+            leftPanel.width - kMargin * 2.0f - reservedRight - LinkCardGroupNode::kChildIndent - extraIndent,
+            LinkCardGroupNode::kLoadMoreHeight};
+}
+
+Rectangle DockArea::GetDownloaderPlaylistShelfItemBounds(Rectangle leftPanel,
+                                                         int itemIndex,
+                                                         int shelfIndex,
+                                                         float scrollOffset) const
+{
+    if (itemIndex < 0 || itemIndex >= static_cast<int>(cards_.size()) ||
+        cards_[itemIndex].kind != DownloaderListItem::Kind::Group || cards_[itemIndex].group == nullptr)
+    {
+        return {};
+    }
+    const LinkCardGroupNode& group = *cards_[itemIndex].group;
+    if (!group.UsesPlaylistShelf() || shelfIndex < 0 || shelfIndex >= group.PlaylistShelfLoadedCount())
+    {
+        return {};
+    }
+    const float reservedRight = GetDownloaderReservedRight(leftPanel);
+    const float top = GetDownloaderItemTop(leftPanel, itemIndex, scrollOffset) + kCardHeight + kGap +
+                      group.PlaylistShelfItemOffsetFromHeader(shelfIndex);
+    return {leftPanel.x + kMargin + LinkCardGroupNode::kChildIndent,
+            top,
+            leftPanel.width - kMargin * 2.0f - reservedRight - LinkCardGroupNode::kChildIndent,
+            LinkCardGroupNode::kPlaylistShelfItemHeight};
+}
+
+Rectangle DockArea::GetDownloaderPlaylistShelfChildBounds(
+    Rectangle leftPanel, int itemIndex, int shelfIndex, int childIndex, float scrollOffset) const
+{
+    const Rectangle shelfBounds = GetDownloaderPlaylistShelfItemBounds(leftPanel, itemIndex, shelfIndex, scrollOffset);
+    if (shelfBounds.width <= 0.0f)
+    {
+        return {};
+    }
+    const float reservedRight = GetDownloaderReservedRight(leftPanel);
+    const float extraIndent = LinkCardGroupNode::kChildIndent;
+    const float childTop = shelfBounds.y + LinkCardGroupNode::kPlaylistShelfItemHeight + kGap +
+                           static_cast<float>(childIndex) * (kCardHeight + kGap);
+    return {leftPanel.x + kMargin + LinkCardGroupNode::kChildIndent + extraIndent,
+            childTop,
+            leftPanel.width - kMargin * 2.0f - reservedRight - LinkCardGroupNode::kChildIndent - extraIndent,
+            kCardHeight};
+}
+
+Rectangle DockArea::GetDownloaderPlaylistShelfLoadMoreBounds(Rectangle leftPanel,
+                                                             int itemIndex,
+                                                             int shelfIndex,
+                                                             float scrollOffset) const
+{
+    Rectangle loadMore{};
+    Rectangle collapse{};
+    const LinkCardGroupNode* playlist =
+        (itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+         cards_[itemIndex].kind == DownloaderListItem::Kind::Group && cards_[itemIndex].group != nullptr)
+            ? cards_[itemIndex].group->PlaylistShelfPlaylist(shelfIndex)
+            : nullptr;
+    SplitPaginationButtons(
+        GetDownloaderPlaylistShelfPaginationRowBounds(leftPanel, itemIndex, shelfIndex, scrollOffset),
+        playlist != nullptr && playlist->ShowsLoadMore(),
+        playlist != nullptr && playlist->ShowsCollapseToFirstPage(),
+        loadMore,
+        collapse);
+    return loadMore;
+}
+
+Rectangle DockArea::GetDownloaderPlaylistShelfCollapseBounds(Rectangle leftPanel,
+                                                             int itemIndex,
+                                                             int shelfIndex,
+                                                             float scrollOffset) const
+{
+    Rectangle loadMore{};
+    Rectangle collapse{};
+    const LinkCardGroupNode* playlist =
+        (itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+         cards_[itemIndex].kind == DownloaderListItem::Kind::Group && cards_[itemIndex].group != nullptr)
+            ? cards_[itemIndex].group->PlaylistShelfPlaylist(shelfIndex)
+            : nullptr;
+    SplitPaginationButtons(
+        GetDownloaderPlaylistShelfPaginationRowBounds(leftPanel, itemIndex, shelfIndex, scrollOffset),
+        playlist != nullptr && playlist->ShowsLoadMore(),
+        playlist != nullptr && playlist->ShowsCollapseToFirstPage(),
+        loadMore,
+        collapse);
+    return collapse;
+}
+
+Rectangle DockArea::GetDownloaderPlaylistShelfPaginationRowBounds(Rectangle leftPanel,
+                                                                  int itemIndex,
+                                                                  int shelfIndex,
+                                                                  float scrollOffset) const
+{
+    if (itemIndex < 0 || itemIndex >= static_cast<int>(cards_.size()) ||
+        cards_[itemIndex].kind != DownloaderListItem::Kind::Group || cards_[itemIndex].group == nullptr)
+    {
+        return {};
+    }
+    const LinkCardGroupNode* playlist = cards_[itemIndex].group->PlaylistShelfPlaylist(shelfIndex);
+    if (playlist == nullptr || (!playlist->ShowsLoadMore() && !playlist->ShowsCollapseToFirstPage()))
+    {
+        return {};
+    }
+    const Rectangle shelfBounds = GetDownloaderPlaylistShelfItemBounds(leftPanel, itemIndex, shelfIndex, scrollOffset);
+    const float reservedRight = GetDownloaderReservedRight(leftPanel);
+    const float extraIndent = LinkCardGroupNode::kChildIndent;
+    const float top = shelfBounds.y + LinkCardGroupNode::kPlaylistShelfItemHeight + kGap +
+                      static_cast<float>(playlist->LoadedChildCount()) * (kCardHeight + kGap);
+    return {leftPanel.x + kMargin + LinkCardGroupNode::kChildIndent + extraIndent,
+            top,
+            leftPanel.width - kMargin * 2.0f - reservedRight - LinkCardGroupNode::kChildIndent - extraIndent,
             LinkCardGroupNode::kLoadMoreHeight};
 }
 
@@ -2390,7 +3034,7 @@ Rectangle DockArea::GetDownloaderActionSlotBounds(Rectangle leftPanel, float scr
     return {leftPanel.x + kMargin,
             GetDownloaderItemTop(leftPanel, index, scrollOffset),
             leftPanel.width - kMargin * 2.0f - reservedRight,
-            kCardHeight};
+            kCardHeight + kInsertLinkActionSlotExtra};
 }
 
 LinkCardNode* DockArea::FindLinkCardByUrl(const std::string& url)
@@ -2405,12 +3049,25 @@ LinkCardNode* DockArea::FindLinkCardByUrl(const std::string& url)
             }
             continue;
         }
-        for (LinkCardNode& child : item.group->LoadedCards())
-        {
-            if (child.HasUrl(url))
+        LinkCardNode* found = nullptr;
+        item.group->ForEachLoadedCard(
+            [&](LinkCardNode& child)
             {
-                return &child;
-            }
+                if (found == nullptr && child.HasUrl(url))
+                {
+                    found = &child;
+                }
+            });
+        if (found != nullptr)
+        {
+            return found;
+        }
+    }
+    for (DownloadHostCard& host : downloadHostCards_)
+    {
+        if (host.card != nullptr && host.card->HasUrl(url))
+        {
+            return host.card.get();
         }
     }
     return nullptr;
@@ -2428,19 +3085,116 @@ const LinkCardNode* DockArea::FindLinkCardByUrl(const std::string& url) const
             }
             continue;
         }
-        for (const LinkCardNode& child : item.group->LoadedCards())
+        const LinkCardNode* found = nullptr;
+        static_cast<const LinkCardGroupNode&>(*item.group)
+            .ForEachLoadedCard(
+                [&](const LinkCardNode& child)
+                {
+                    if (found == nullptr && child.HasUrl(url))
+                    {
+                        found = &child;
+                    }
+                });
+        if (found != nullptr)
         {
-            if (child.HasUrl(url))
-            {
-                return &child;
-            }
+            return found;
+        }
+    }
+    for (const DownloadHostCard& host : downloadHostCards_)
+    {
+        if (host.card != nullptr && host.card->HasUrl(url))
+        {
+            return host.card.get();
         }
     }
     return nullptr;
 }
 
+LinkCardNode* DockArea::FindQueuedLinkCardForRequest(const DownloadRequest& request)
+{
+    const std::string wantedIdentity = DownloadRunner::MakeOutputIdentity(request);
+    LinkCardNode* identityMatch = nullptr;
+    LinkCardNode* urlMatch = nullptr;
+    ForEachLinkCard(
+        [&](LinkCardNode& card)
+        {
+            if (!card.HasUrl(request.url) || !card.IsInQueue())
+            {
+                return;
+            }
+            if (urlMatch == nullptr)
+            {
+                urlMatch = &card;
+            }
+            DownloadRequest probe;
+            if (BuildDownloadRequestForCard(card, probe) &&
+                DownloadRunner::MakeOutputIdentity(probe) == wantedIdentity && identityMatch == nullptr)
+            {
+                identityMatch = &card;
+            }
+        });
+    return identityMatch != nullptr ? identityMatch : urlMatch;
+}
+
+std::string DockArea::MakeLinkCardOutputIdentity(const LinkCardNode& card)
+{
+    DownloadRequest probe;
+    probe.url = card.Url();
+    probe.outputDirectory = card.ExpectedOutputDirectory();
+    probe.normalizedTitle =
+        card.ExpectedNormalizedTitle().empty() ? card.NormalizedTitle() : card.ExpectedNormalizedTitle();
+    probe.fileFormat = card.ExpectedFileFormat();
+    return DownloadRunner::MakeOutputIdentity(probe);
+}
+
+bool DockArea::CardMatchesDownloadRunner(const LinkCardNode& card, const DownloadRunner& runner) const
+{
+    if (!card.IsDownloading())
+    {
+        return false;
+    }
+    const std::string& identity = runner.OutputIdentity();
+    if (!identity.empty())
+    {
+        return MakeLinkCardOutputIdentity(card) == identity;
+    }
+    return !runner.CurrentUrl().empty() && card.HasUrl(runner.CurrentUrl());
+}
+
 double DockArea::SumCompletedCardDownloadElapsed() const
 {
+    double batchTotal = 0.0;
+    bool anyBatch = false;
+    for (const DownloaderListItem& item : cards_)
+    {
+        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr)
+        {
+            continue;
+        }
+        const LinkCardGroupNode& group = *item.group;
+        if (group.BatchDownloadElapsedSum() > 0.0)
+        {
+            batchTotal += group.BatchDownloadElapsedSum();
+            anyBatch = true;
+        }
+        if (group.UsesPlaylistShelf())
+        {
+            for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+            {
+                const LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+                if (playlist != nullptr && playlist->BatchDownloadElapsedSum() > 0.0)
+                {
+                    batchTotal += playlist->BatchDownloadElapsedSum();
+                    anyBatch = true;
+                }
+            }
+        }
+    }
+    if (anyBatch)
+    {
+        return batchTotal;
+    }
+
     double total = 0.0;
     ForEachLinkCard(
         [&total](const LinkCardNode& card)
@@ -2459,9 +3213,13 @@ void DockArea::ForEachLinkCard(const std::function<void(LinkCardNode&)>& visitor
             visitor(*item.single);
             continue;
         }
-        for (LinkCardNode& child : item.group->LoadedCards())
+        item.group->ForEachLoadedCard(visitor);
+    }
+    for (DownloadHostCard& host : downloadHostCards_)
+    {
+        if (host.card != nullptr)
         {
-            visitor(child);
+            visitor(*host.card);
         }
     }
 }
@@ -2475,9 +3233,13 @@ void DockArea::ForEachLinkCard(const std::function<void(const LinkCardNode&)>& v
             visitor(*item.single);
             continue;
         }
-        for (const LinkCardNode& child : item.group->LoadedCards())
+        static_cast<const LinkCardGroupNode&>(*item.group).ForEachLoadedCard(visitor);
+    }
+    for (const DownloadHostCard& host : downloadHostCards_)
+    {
+        if (host.card != nullptr)
         {
-            visitor(child);
+            visitor(*host.card);
         }
     }
 }
@@ -2519,7 +3281,7 @@ float DockArea::GetCardListScrollbarReserve(Rectangle leftPanel, int itemCount) 
         {
             return 0.0f;
         }
-        const float gutterFromPanelEdge = kScrollbarEdgePad + kScrollbarTrackWidth + kScrollbarEdgePad;
+        const float gutterFromPanelEdge = Scrollbar::kEdgePad + Scrollbar::kIdleWidth + Scrollbar::kEdgePad;
         return std::max(0.0f, gutterFromPanelEdge - kMargin);
     }
 
@@ -2529,7 +3291,7 @@ float DockArea::GetCardListScrollbarReserve(Rectangle leftPanel, int itemCount) 
         return 0.0f;
     }
 
-    const float gutterFromPanelEdge = kScrollbarEdgePad + kScrollbarTrackWidth + kScrollbarEdgePad;
+    const float gutterFromPanelEdge = Scrollbar::kEdgePad + Scrollbar::kIdleWidth + Scrollbar::kEdgePad;
     return std::max(0.0f, gutterFromPanelEdge - kMargin);
 }
 
@@ -2539,26 +3301,32 @@ float DockArea::GetMaxCardScroll(Rectangle leftPanel, float contentHeight, float
     return std::max(0.0f, contentHeight - visibleHeight);
 }
 
-void DockArea::UpdateCardScroll(Rectangle leftPanel,
-                                float contentHeight,
-                                float reservedBottom,
-                                float& scrollOffset) const
+void DockArea::UpdateCardScroll(
+    Rectangle leftPanel, float contentHeight, float reservedBottom, float& scrollOffset, Scrollbar& scrollbar)
 {
     const float maxScroll = GetMaxCardScroll(leftPanel, contentHeight, reservedBottom);
+    const Rectangle viewport = {
+        leftPanel.x, leftPanel.y + kMargin, leftPanel.width, std::max(0.0f, leftPanel.height - kMargin * 2.0f)};
     if (contentHeight <= 0.0f)
     {
         scrollOffset = 0.0f;
+        scrollbar.Reset();
         return;
     }
 
-    if (CheckCollisionPointRec(GetMousePosition(), leftPanel))
+    if (CheckCollisionPointRec(GetMousePosition(), leftPanel) && !scrollbar.IsDragging())
     {
         const float wheel = GetMouseWheelMove();
         if (wheel != 0.0f)
         {
-            scrollOffset = std::clamp(scrollOffset - wheel * 46.0f, 0.0f, maxScroll);
+            const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+            const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            // Normal 46; Ctrl ×6; Shift ×12 (Shift wins if both held).
+            const float step = shift ? 552.0f : (ctrl ? 276.0f : 46.0f);
+            scrollOffset = std::clamp(scrollOffset - wheel * step, 0.0f, maxScroll);
         }
     }
+    scrollbar.Update(viewport, scrollOffset, maxScroll);
     scrollOffset = std::clamp(scrollOffset, 0.0f, maxScroll);
 }
 
@@ -2606,25 +3374,42 @@ void DockArea::UpdateHeader()
 
 void DockArea::UpdateDownloaderWorkspace(Rectangle leftPanel, Rectangle rightPanel, Font font)
 {
-    if (cards_.empty() && insertLinkButton_.Update(GetInsertLinkButtonBounds(leftPanel)))
+    UpdateCardScroll(
+        leftPanel, GetDownloaderListContentHeight(), 0.0f, downloaderScrollOffset_, downloaderListScrollbar_);
+    const bool listDragging = downloaderListScrollbar_.IsDragging();
+    if (!listDragging)
     {
-        HandleInsertLinkRequest();
+        if (cards_.empty() && insertLinkButton_.Update(GetInsertLinkButtonBounds(leftPanel)))
+        {
+            HandleInsertLinkRequest();
+        }
+        else if (!cards_.empty() && insertLinkButton_.Update(GetListActionButtonBounds(
+                                        leftPanel, static_cast<int>(cards_.size()), downloaderScrollOffset_)))
+        {
+            HandleInsertLinkRequest();
+        }
+        UpdateCards(leftPanel, font);
     }
-    else if (!cards_.empty() && insertLinkButton_.Update(GetListActionButtonBounds(
-                                    leftPanel, static_cast<int>(cards_.size()), downloaderScrollOffset_)))
+    else
     {
-        HandleInsertLinkRequest();
+        // Keep playlist detail-prefetch / duration-fill alive while the scrollbar is dragged.
+        for (DownloaderListItem& item : cards_)
+        {
+            if (item.kind == DownloaderListItem::Kind::Group && item.group != nullptr)
+            {
+                item.group->PumpBackgroundWork();
+            }
+        }
     }
 
-    UpdateCardScroll(leftPanel, GetDownloaderListContentHeight(), 0.0f, downloaderScrollOffset_);
-    UpdateCards(leftPanel, font);
-    const bool upperOverlay = UpdateAutoConvertDock(GetAutoConvertDockPanel(rightPanel), font);
-    if (upperOverlay)
+    const bool upperOverlay = listDragging ? false : UpdateAutoConvertDock(GetAutoConvertDockPanel(rightPanel), font);
+    if (upperOverlay || listDragging)
     {
         overlayBlocksActions_ = true;
     }
-    UpdateRightPanel(rightPanel, font, upperOverlay);
+    UpdateRightPanel(rightPanel, font, upperOverlay || listDragging);
     HandleShortcuts(leftPanel, rightPanel);
+    TryFlushPlaylistShelfDownloads();
 
     for (int index = static_cast<int>(cards_.size()) - 1; index >= 0; --index)
     {
@@ -2661,128 +3446,139 @@ void DockArea::UpdateDownloaderWorkspace(Rectangle leftPanel, Rectangle rightPan
 
 void DockArea::UpdateConverterWorkspace(Rectangle leftPanel, Rectangle rightPanel, Font font)
 {
+    const int converterItemCount = static_cast<int>(converterCards_.size()) + (!converterCards_.empty() ? 1 : 0);
+    UpdateCardScroll(leftPanel,
+                     static_cast<float>(converterItemCount) * (kCardHeight + kGap),
+                     0.0f,
+                     converterScrollOffset_,
+                     converterListScrollbar_);
+    const bool listDragging = converterListScrollbar_.IsDragging();
+
     const Rectangle globalPanel = GetGlobalPathPanel(rightPanel);
     const Rectangle globalPathBounds = {globalPanel.x + 10.0f, globalPanel.y + 34.0f, globalPanel.width - 20.0f, 26.0f};
-    const std::string globalPathBefore = globalDownloadPath_;
-    UpdateGlobalPathLabelClick(font, globalPanel, "Global Output Path", globalDownloadPath_);
-    globalPathField_.Update(globalPathBounds, font, globalDownloadPath_, true);
-    PushUndo(MakeGlobalPathCommand(globalPathBefore, globalDownloadPath_));
-
-    const int converterItemCount = static_cast<int>(converterCards_.size()) + (!converterCards_.empty() ? 1 : 0);
-    UpdateCardScroll(
-        leftPanel, static_cast<float>(converterItemCount) * (kCardHeight + kGap), 0.0f, converterScrollOffset_);
+    if (!listDragging)
+    {
+        const std::string globalPathBefore = globalDownloadPath_;
+        UpdateGlobalPathLabelClick(font, globalPanel, "Global Output Path", globalDownloadPath_);
+        globalPathField_.Update(globalPathBounds, font, globalDownloadPath_, true);
+        PushUndo(MakeGlobalPathCommand(globalPathBefore, globalDownloadPath_));
+    }
 
     const Rectangle chooseBounds =
         converterCards_.empty()
             ? GetChooseFileButtonBounds(leftPanel)
             : GetListActionButtonBounds(leftPanel, static_cast<int>(converterCards_.size()), converterScrollOffset_);
-    if (chooseFileButton_.Update(chooseBounds))
+    if (!converterListScrollbar_.IsDragging() && chooseFileButton_.Update(chooseBounds))
     {
         HandleChooseFileRequest();
     }
 
     int clickedIndex = -1;
-    for (int index = 0; index < static_cast<int>(converterCards_.size()); ++index)
+    if (!converterListScrollbar_.IsDragging())
     {
-        converterCards_[index].Update(GetCardBounds(leftPanel, index, converterScrollOffset_), font);
-        if (converterCards_[index].WasCopyClicked())
+        for (int index = 0; index < static_cast<int>(converterCards_.size()); ++index)
         {
-            ShowFooterNotification("Info Copied to Clipboard", FooterNotificationScope::Converter);
-            continue;
-        }
-        if (converterCards_[index].WasOpenPathClicked())
-        {
-            RevealPathInExplorer(converterCards_[index].ResolvePathForReveal());
-            continue;
-        }
-        const std::string inputPath = converterCards_[index].Info().filePath;
-        if (converterCards_[index].WasConvertCancelClicked() && FindConvertRunnerByPath(inputPath) != nullptr)
-        {
-            CancelConverterCard(inputPath);
-            continue;
-        }
-        if (converterCards_[index].ShouldClose())
-        {
-            // Always drop queued work and cancel any runner for this path, even if the
-            // card flag already cleared вЂ” otherwise Cancel stays up with an empty list.
-            RemovePendingConvertsForPath(inputPath);
-            if (ConvertRunner* runner = FindConvertRunnerByPath(inputPath))
+            converterCards_[index].Update(GetCardBounds(leftPanel, index, converterScrollOffset_), font);
+            if (converterCards_[index].WasCopyClicked())
             {
-                if (converterCards_[index].IsConverting())
+                ShowFooterNotification("Info Copied to Clipboard", FooterNotificationScope::Converter);
+                continue;
+            }
+            if (converterCards_[index].WasOpenPathClicked())
+            {
+                RevealPathInExplorer(converterCards_[index].ResolvePathForReveal());
+                continue;
+            }
+            const std::string inputPath = converterCards_[index].Info().filePath;
+            if (converterCards_[index].WasConvertCancelClicked() && FindConvertRunnerByPath(inputPath) != nullptr)
+            {
+                CancelConverterCard(inputPath);
+                continue;
+            }
+            if (converterCards_[index].ShouldClose())
+            {
+                // Always drop queued work and cancel any runner for this path, even if the
+                // card flag already cleared вЂ” otherwise Cancel stays up with an empty list.
+                RemovePendingConvertsForPath(inputPath);
+                if (ConvertRunner* runner = FindConvertRunnerByPath(inputPath))
+                {
+                    if (converterCards_[index].IsConverting())
+                    {
+                        converterCards_[index].ClearConverting();
+                    }
+                    runner->Cancel();
+                }
+                else if (converterCards_[index].IsConverting())
                 {
                     converterCards_[index].ClearConverting();
                 }
-                runner->Cancel();
             }
-            else if (converterCards_[index].IsConverting())
+            if (converterCards_[index].WasClicked())
             {
-                converterCards_[index].ClearConverting();
+                clickedIndex = index;
             }
         }
-        if (converterCards_[index].WasClicked())
-        {
-            clickedIndex = index;
-        }
-    }
 
-    if (clickedIndex >= 0)
-    {
-        const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
-        const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-        if (shift && lastConverterSelectionAnchor_ >= 0)
+        if (clickedIndex >= 0)
         {
-            const int a = std::min(lastConverterSelectionAnchor_, clickedIndex);
-            const int b = std::max(lastConverterSelectionAnchor_, clickedIndex);
+            const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
+            const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+            if (shift && lastConverterSelectionAnchor_ >= 0)
+            {
+                const int a = std::min(lastConverterSelectionAnchor_, clickedIndex);
+                const int b = std::max(lastConverterSelectionAnchor_, clickedIndex);
+                for (int index = 0; index < static_cast<int>(converterCards_.size()); ++index)
+                {
+                    converterCards_[index].SetSelected(index >= a && index <= b);
+                }
+                lastConverterSelectionFocus_ = clickedIndex;
+            }
+            else if (ctrl)
+            {
+                converterCards_[clickedIndex].SetSelected(!converterCards_[clickedIndex].IsSelected());
+                lastConverterSelectionAnchor_ = clickedIndex;
+                lastConverterSelectionFocus_ = clickedIndex;
+            }
+            else
+            {
+                for (int index = 0; index < static_cast<int>(converterCards_.size()); ++index)
+                {
+                    converterCards_[index].SetSelected(index == clickedIndex);
+                }
+                lastConverterSelectionAnchor_ = clickedIndex;
+                lastConverterSelectionFocus_ = clickedIndex;
+            }
+        }
+        else if (!converterCards_.empty() && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) &&
+                 CheckCollisionPointRec(GetMousePosition(), leftPanel) &&
+                 !CheckCollisionPointRec(GetMousePosition(), chooseBounds))
+        {
+            bool clickedCard = false;
             for (int index = 0; index < static_cast<int>(converterCards_.size()); ++index)
             {
-                converterCards_[index].SetSelected(index >= a && index <= b);
+                if (CheckCollisionPointRec(GetMousePosition(), GetCardBounds(leftPanel, index, converterScrollOffset_)))
+                {
+                    clickedCard = true;
+                    break;
+                }
             }
-            lastConverterSelectionFocus_ = clickedIndex;
-        }
-        else if (ctrl)
-        {
-            converterCards_[clickedIndex].SetSelected(!converterCards_[clickedIndex].IsSelected());
-            lastConverterSelectionAnchor_ = clickedIndex;
-            lastConverterSelectionFocus_ = clickedIndex;
-        }
-        else
-        {
-            for (int index = 0; index < static_cast<int>(converterCards_.size()); ++index)
+            if (!clickedCard)
             {
-                converterCards_[index].SetSelected(index == clickedIndex);
-            }
-            lastConverterSelectionAnchor_ = clickedIndex;
-            lastConverterSelectionFocus_ = clickedIndex;
-        }
-    }
-    else if (!converterCards_.empty() && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) &&
-             CheckCollisionPointRec(GetMousePosition(), leftPanel) &&
-             !CheckCollisionPointRec(GetMousePosition(), chooseBounds))
-    {
-        bool clickedCard = false;
-        for (int index = 0; index < static_cast<int>(converterCards_.size()); ++index)
-        {
-            if (CheckCollisionPointRec(GetMousePosition(), GetCardBounds(leftPanel, index, converterScrollOffset_)))
-            {
-                clickedCard = true;
-                break;
-            }
-        }
-        if (!clickedCard)
-        {
-            for (ConverterFileCardNode& card : converterCards_)
-            {
-                card.SetSelected(false);
+                for (ConverterFileCardNode& card : converterCards_)
+                {
+                    card.SetSelected(false);
+                }
             }
         }
     }
 
-    const bool upperOverlay = UpdateConverterDefaultDock(GetConverterDefaultDockPanel(rightPanel), font);
-    if (upperOverlay)
+    const bool upperOverlay =
+        listDragging ? false : UpdateConverterDefaultDock(GetConverterDefaultDockPanel(rightPanel), font);
+    if (upperOverlay || listDragging)
     {
         overlayBlocksActions_ = true;
     }
-    UpdateConverterCardOptions(GetRightSettingsPanel(rightPanel), font, upperOverlay);
+    UpdateConverterCardOptions(GetRightSettingsPanel(rightPanel), font, upperOverlay || listDragging);
 
     HandleShortcuts(leftPanel, rightPanel);
 
@@ -2808,7 +3604,9 @@ void DockArea::DrawDownloaderWorkspace(Rectangle leftPanel, Rectangle rightPanel
 {
     if (cards_.empty())
     {
-        insertLinkButton_.Draw(GetInsertLinkButtonBounds(leftPanel), font);
+        const Rectangle insertBounds = GetInsertLinkButtonBounds(leftPanel);
+        insertLinkButton_.Draw(insertBounds, font);
+        DrawInsertLinkShortcutHints(insertBounds, font);
     }
 
     UiClip::Push(leftPanel);
@@ -2845,29 +3643,178 @@ void DockArea::DrawDownloaderWorkspace(Rectangle leftPanel, Rectangle rightPanel
         if (group.IsExpanded())
         {
             float contentBottom = headerBounds.y + headerBounds.height;
-            for (int childIndex = 0; childIndex < group.LoadedChildCount(); ++childIndex)
+            if (group.UsesChannelTabs())
             {
-                const LinkCardNode& child = group.LoadedCards()[static_cast<size_t>(childIndex)];
-                const Rectangle childBounds =
-                    GetDownloaderGroupChildBounds(leftPanel, index, childIndex, downloaderScrollOffset_);
-                contentBottom = childBounds.y + childBounds.height;
-                const bool highlightCustom = child.CustomAutoConvert().enabled && !child.IsExcludedFromAutoConvert();
-                // Local 1-based index within this playlist/channel card.
-                child.Draw(
-                    childBounds, font, globalAutoConvert_.enabled || anyCustomEnabled, highlightCustom, childIndex + 1);
+                for (int tab = 0; tab < kChannelTabCount; ++tab)
+                {
+                    const Rectangle tabBounds =
+                        GetDownloaderChannelTabBounds(leftPanel, index, tab, downloaderScrollOffset_);
+                    contentBottom = tabBounds.y + tabBounds.height;
+                    group.DrawChannelTab(tab, tabBounds, font);
+                    if (group.IsChannelTabExpanded(tab))
+                    {
+                        float tabContentBottom = tabBounds.y + tabBounds.height;
+                        for (int childIndex = 0; childIndex < group.ChannelTabLoadedCount(tab); ++childIndex)
+                        {
+                            const LinkCardNode& child =
+                                group.ChannelTabLoadedCards(tab)[static_cast<size_t>(childIndex)];
+                            const Rectangle childBounds = GetDownloaderChannelTabChildBounds(
+                                leftPanel, index, tab, childIndex, downloaderScrollOffset_);
+                            tabContentBottom = childBounds.y + childBounds.height;
+                            contentBottom = tabContentBottom;
+                            const bool highlightCustom =
+                                child.CustomAutoConvert().enabled && !child.IsExcludedFromAutoConvert();
+                            const bool inverseBadge =
+                                group.Options().inverseNumbering || group.ChannelTabInverseNumbering(tab);
+                            child.Draw(
+                                childBounds,
+                                font,
+                                globalAutoConvert_.enabled || anyCustomEnabled,
+                                highlightCustom,
+                                GroupChildDisplayIndex(childIndex, group.ChannelTabEntryCount(tab), inverseBadge));
+                        }
+                        if (group.ChannelTabShowsLoadMore(tab) || group.ChannelTabShowsCollapseToFirstPage(tab))
+                        {
+                            const Rectangle loadMoreBounds =
+                                GetDownloaderChannelTabLoadMoreBounds(leftPanel, index, tab, downloaderScrollOffset_);
+                            const Rectangle collapseBounds =
+                                GetDownloaderChannelTabCollapseBounds(leftPanel, index, tab, downloaderScrollOffset_);
+                            if (loadMoreBounds.width > 0.0f)
+                            {
+                                tabContentBottom = loadMoreBounds.y + loadMoreBounds.height;
+                                contentBottom = tabContentBottom;
+                                group.DrawChannelTabLoadMore(tab, loadMoreBounds, font);
+                            }
+                            if (collapseBounds.width > 0.0f)
+                            {
+                                tabContentBottom = collapseBounds.y + collapseBounds.height;
+                                contentBottom = tabContentBottom;
+                                group.DrawChannelTabCollapseToFirstPage(tab, collapseBounds, font);
+                            }
+                        }
+                        group.DrawRail(tabBounds, tabContentBottom);
+                    }
+                }
+            }
+            else if (group.UsesPlaylistShelf())
+            {
+                for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+                {
+                    const Rectangle shelfBounds =
+                        GetDownloaderPlaylistShelfItemBounds(leftPanel, index, shelfIndex, downloaderScrollOffset_);
+                    contentBottom = shelfBounds.y + shelfBounds.height;
+                    group.DrawPlaylistShelfItem(shelfIndex, shelfBounds, font);
+                    if (group.IsPlaylistShelfItemExpanded(shelfIndex))
+                    {
+                        const LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+                        if (playlist != nullptr)
+                        {
+                            float shelfContentBottom = shelfBounds.y + shelfBounds.height;
+                            for (int childIndex = 0; childIndex < playlist->LoadedChildCount(); ++childIndex)
+                            {
+                                const LinkCardNode& child = playlist->LoadedCards()[static_cast<size_t>(childIndex)];
+                                const Rectangle childBounds = GetDownloaderPlaylistShelfChildBounds(
+                                    leftPanel, index, shelfIndex, childIndex, downloaderScrollOffset_);
+                                shelfContentBottom = childBounds.y + childBounds.height;
+                                contentBottom = shelfContentBottom;
+                                const bool highlightCustom =
+                                    child.CustomAutoConvert().enabled && !child.IsExcludedFromAutoConvert();
+                                const bool inverseBadge =
+                                    group.Options().inverseNumbering || playlist->Options().inverseNumbering;
+                                child.Draw(
+                                    childBounds,
+                                    font,
+                                    globalAutoConvert_.enabled || anyCustomEnabled,
+                                    highlightCustom,
+                                    GroupChildDisplayIndex(childIndex, playlist->EntryCount(), inverseBadge, true));
+                            }
+                            if (playlist->ShowsLoadMore() || playlist->ShowsCollapseToFirstPage())
+                            {
+                                const Rectangle loadMoreBounds = GetDownloaderPlaylistShelfLoadMoreBounds(
+                                    leftPanel, index, shelfIndex, downloaderScrollOffset_);
+                                const Rectangle collapseBounds = GetDownloaderPlaylistShelfCollapseBounds(
+                                    leftPanel, index, shelfIndex, downloaderScrollOffset_);
+                                if (loadMoreBounds.width > 0.0f)
+                                {
+                                    shelfContentBottom = loadMoreBounds.y + loadMoreBounds.height;
+                                    contentBottom = shelfContentBottom;
+                                    playlist->DrawLoadMore(loadMoreBounds, font);
+                                }
+                                if (collapseBounds.width > 0.0f)
+                                {
+                                    shelfContentBottom = collapseBounds.y + collapseBounds.height;
+                                    contentBottom = shelfContentBottom;
+                                    playlist->DrawCollapseToFirstPage(
+                                        collapseBounds, font, playlist->CanCollapseToFirstPage());
+                                }
+                            }
+                            playlist->DrawRail(shelfBounds, shelfContentBottom);
+                        }
+                    }
+                }
+                if (group.ShowsLoadMore() || group.ShowsCollapseToFirstPage())
+                {
+                    const Rectangle loadMoreBounds =
+                        GetDownloaderGroupLoadMoreBounds(leftPanel, index, downloaderScrollOffset_);
+                    const Rectangle collapseBounds =
+                        GetDownloaderGroupCollapseBounds(leftPanel, index, downloaderScrollOffset_);
+                    if (loadMoreBounds.width > 0.0f)
+                    {
+                        contentBottom = loadMoreBounds.y + loadMoreBounds.height;
+                        group.DrawLoadMore(loadMoreBounds, font);
+                    }
+                    if (collapseBounds.width > 0.0f)
+                    {
+                        contentBottom = collapseBounds.y + collapseBounds.height;
+                        group.DrawCollapseToFirstPage(collapseBounds, font, group.CanCollapseToFirstPage());
+                    }
+                }
+            }
+            else
+            {
+                for (int childIndex = 0; childIndex < group.LoadedChildCount(); ++childIndex)
+                {
+                    const LinkCardNode& child = group.LoadedCards()[static_cast<size_t>(childIndex)];
+                    const Rectangle childBounds =
+                        GetDownloaderGroupChildBounds(leftPanel, index, childIndex, downloaderScrollOffset_);
+                    contentBottom = childBounds.y + childBounds.height;
+                    const bool highlightCustom =
+                        child.CustomAutoConvert().enabled && !child.IsExcludedFromAutoConvert();
+                    child.Draw(
+                        childBounds,
+                        font,
+                        globalAutoConvert_.enabled || anyCustomEnabled,
+                        highlightCustom,
+                        GroupChildDisplayIndex(childIndex, group.EntryCount(), group.Options().inverseNumbering, true));
+                }
+                if (group.ShowsLoadMore() || group.ShowsCollapseToFirstPage())
+                {
+                    const Rectangle loadMoreBounds =
+                        GetDownloaderGroupLoadMoreBounds(leftPanel, index, downloaderScrollOffset_);
+                    const Rectangle collapseBounds =
+                        GetDownloaderGroupCollapseBounds(leftPanel, index, downloaderScrollOffset_);
+                    if (loadMoreBounds.width > 0.0f)
+                    {
+                        contentBottom = loadMoreBounds.y + loadMoreBounds.height;
+                        group.DrawLoadMore(loadMoreBounds, font);
+                    }
+                    if (collapseBounds.width > 0.0f)
+                    {
+                        contentBottom = collapseBounds.y + collapseBounds.height;
+                        group.DrawCollapseToFirstPage(collapseBounds, font, group.CanCollapseToFirstPage());
+                    }
+                }
             }
             group.DrawRail(headerBounds, contentBottom);
-            if (group.ShowsLoadMore())
-            {
-                group.DrawLoadMore(GetDownloaderGroupLoadMoreBounds(leftPanel, index, downloaderScrollOffset_), font);
-            }
         }
     }
 
     if (!cards_.empty())
     {
-        insertLinkButton_.Draw(
-            GetListActionButtonBounds(leftPanel, static_cast<int>(cards_.size()), downloaderScrollOffset_), font);
+        const Rectangle insertBounds =
+            GetListActionButtonBounds(leftPanel, static_cast<int>(cards_.size()), downloaderScrollOffset_);
+        insertLinkButton_.Draw(insertBounds, font);
+        DrawInsertLinkShortcutHints(insertBounds, font);
     }
     UiClip::Pop();
 
@@ -2876,7 +3823,7 @@ void DockArea::DrawDownloaderWorkspace(Rectangle leftPanel, Rectangle rightPanel
         const float maxScroll = GetMaxCardScroll(leftPanel, GetDownloaderListContentHeight(), 0.0f);
         const Rectangle cardViewport = {
             leftPanel.x, leftPanel.y + kMargin, leftPanel.width, std::max(0.0f, leftPanel.height - kMargin * 2.0f)};
-        DrawOptionsScrollbar(cardViewport, downloaderScrollOffset_, maxScroll);
+        downloaderListScrollbar_.Draw(cardViewport, downloaderScrollOffset_, maxScroll);
     }
 
     DrawAutoConvertDock(GetAutoConvertDockPanel(rightPanel), font, true, false);
@@ -2911,7 +3858,7 @@ void DockArea::DrawConverterWorkspace(Rectangle leftPanel, Rectangle rightPanel,
         const float maxScroll = GetMaxCardScroll(leftPanel, static_cast<float>(itemCount) * (kCardHeight + kGap), 0.0f);
         const Rectangle cardViewport = {
             leftPanel.x, leftPanel.y + kMargin, leftPanel.width, std::max(0.0f, leftPanel.height - kMargin * 2.0f)};
-        DrawOptionsScrollbar(cardViewport, converterScrollOffset_, maxScroll);
+        converterListScrollbar_.Draw(cardViewport, converterScrollOffset_, maxScroll);
     }
 
     DrawConverterDefaultDock(GetConverterDefaultDockPanel(rightPanel), font, true, false);
@@ -2988,13 +3935,17 @@ void DockArea::HandleInsertLinkRequest(bool allowDuplicate)
 
     if (!allowDuplicate)
     {
-        for (const DownloaderListItem& item : cards_)
+        for (DownloaderListItem& item : cards_)
         {
             if (item.HasUrl(url))
             {
-                if (item.kind == DownloaderListItem::Kind::Single)
+                if (item.kind == DownloaderListItem::Kind::Single && item.single != nullptr)
                 {
-                    const_cast<DownloaderListItem&>(item).single->TriggerPulse();
+                    item.single->TriggerPulse();
+                }
+                else if (item.kind == DownloaderListItem::Kind::Group && item.group != nullptr)
+                {
+                    item.group->TriggerPulse();
                 }
                 return;
             }
@@ -3006,8 +3957,7 @@ void DockArea::HandleInsertLinkRequest(bool allowDuplicate)
         item.ClearSelection();
     }
     cards_.push_back(DownloaderListItem::MakeFromUrl(url));
-    lastDownloaderSelectionAnchor_ = static_cast<int>(cards_.size()) - 1;
-    lastDownloaderSelectionFocus_ = lastDownloaderSelectionAnchor_;
+    RememberDownloaderSelection(MakeTopLevelSelectionPoint(static_cast<int>(cards_.size()) - 1), true);
     if (cards_.back().kind == DownloaderListItem::Kind::Single)
     {
         cards_.back().single->SetSelected(true);
@@ -3083,8 +4033,9 @@ void DockArea::HandleSeedTestLinksRequest()
 
     if (lastNewIndex >= 0)
     {
-        lastDownloaderSelectionAnchor_ = firstNewIndex >= 0 ? firstNewIndex : lastNewIndex;
-        lastDownloaderSelectionFocus_ = lastNewIndex;
+        RememberDownloaderSelection(MakeTopLevelSelectionPoint(firstNewIndex >= 0 ? firstNewIndex : lastNewIndex),
+                                    true);
+        RememberDownloaderSelection(MakeTopLevelSelectionPoint(lastNewIndex), false);
     }
 
     ShowFooterNotification("Added 10 test links.", FooterNotificationScope::Downloader);
@@ -3121,8 +4072,7 @@ void DockArea::HandleSeed8kLinkRequest()
     }
     cards_.push_back(DownloaderListItem::MakeSingle(kUrl));
     cards_.back().single->SetSelected(true);
-    lastDownloaderSelectionAnchor_ = static_cast<int>(cards_.size()) - 1;
-    lastDownloaderSelectionFocus_ = lastDownloaderSelectionAnchor_;
+    RememberDownloaderSelection(MakeTopLevelSelectionPoint(static_cast<int>(cards_.size()) - 1), true);
     if (AnyDownloadRunning() || isBatchDownloading_)
     {
         cards_.back().single->SetNotInQueue();
@@ -3187,17 +4137,20 @@ void DockArea::SyncCardProgress()
         {
             continue;
         }
-        const std::string& currentUrl = runner.CurrentUrl();
-        const float progress = runner.Progress();
+        const float ytProgress = runner.YtProgress();
+        const float diskProgress = runner.DiskProgress();
         const bool merging = runner.Phase() == DownloadSharedState::Phase::Merging;
+        const float cardProgress = merging ? runner.Progress() : ytProgress;
         ForEachLinkCard(
             [&](LinkCardNode& card)
             {
-                if (card.IsDownloading() && card.HasUrl(currentUrl))
+                if (!CardMatchesDownloadRunner(card, runner))
                 {
-                    card.SetOperationProgress(progress);
-                    card.SetBusyStatusLabel(merging ? "merging" : "downloading");
+                    return;
                 }
+                card.SetOperationProgress(cardProgress);
+                card.SetDiskProgress(merging ? -1.0f : diskProgress);
+                card.SetBusyStatusLabel(merging ? "merging" : "downloading");
             });
     }
     if (!AnyDownloadRunning())
@@ -3246,23 +4199,20 @@ void DockArea::SyncCardProgress()
         }
     }
 
+    // Taskbar: average progress of active parallel downloads (up to kMaxParallelDownloads).
     float progressSum = 0.0f;
     int progressCount = 0;
     for (const DownloadRunner& runner : downloadRunners_)
     {
-        if (runner.IsRunning())
+        if (!runner.IsRunning())
         {
-            progressSum += runner.Progress();
-            ++progressCount;
+            continue;
         }
-    }
-    for (const ConvertRunner& runner : convertRunners_)
-    {
-        if (runner.IsRunning())
-        {
-            progressSum += runner.Progress();
-            ++progressCount;
-        }
+        const bool merging = runner.Phase() == DownloadSharedState::Phase::Merging;
+        const float ytProgress = runner.YtProgress();
+        const float cardProgress = merging ? runner.Progress() : (ytProgress >= 0.0f ? ytProgress : runner.Progress());
+        progressSum += cardProgress;
+        ++progressCount;
     }
     if (progressCount > 0)
     {
@@ -3280,6 +4230,7 @@ void DockArea::UpdateCards(Rectangle leftPanel, Font font)
     {
         int itemIndex = -1;
         int childIndex = -1;
+        int tabIndex = -1;
         bool isHeader = false;
     };
     ClickTarget clicked{};
@@ -3333,6 +4284,14 @@ void DockArea::UpdateCards(Rectangle leftPanel, Font font)
             DownloadRequest request;
             if (BuildDownloadRequestForCard(card, request))
             {
+                std::unordered_set<std::string> claimedIdentities;
+                FillBusyDownloadIdentities(claimedIdentities);
+                if (!claimedIdentities.insert(DownloadRunner::MakeOutputIdentity(request)).second)
+                {
+                    card.TriggerPulse();
+                    ShowFooterNotification("Already downloading this file", FooterNotificationScope::Downloader);
+                    return;
+                }
                 if (!AnyDownloadRunning() && !isBatchDownloading_)
                 {
                     ClearFooterNotification();
@@ -3361,7 +4320,7 @@ void DockArea::UpdateCards(Rectangle leftPanel, Font font)
             }
             if (card.WasClicked())
             {
-                clicked = {index, -1, false};
+                clicked = {index, -1, -1, false};
             }
             continue;
         }
@@ -3369,7 +4328,6 @@ void DockArea::UpdateCards(Rectangle leftPanel, Font font)
         LinkCardGroupNode& group = *item.group;
         const Rectangle headerBounds = GetDownloaderGroupHeaderBounds(leftPanel, index, downloaderScrollOffset_);
         group.Update(headerBounds, font);
-        group.TryToggleExpandShortcut();
 
         if (group.WasCopyClicked())
         {
@@ -3385,84 +4343,289 @@ void DockArea::UpdateCards(Rectangle leftPanel, Font font)
         }
         if (group.WasHeaderClicked() && !group.WasExpandToggleClicked())
         {
-            clicked = {index, -1, true};
+            clicked = {index, -1, -1, true};
         }
 
         if (group.IsExpanded())
         {
-            for (int childIndex = 0; childIndex < group.LoadedChildCount(); ++childIndex)
+            if (group.UsesChannelTabs())
             {
-                LinkCardNode& child = group.LoadedCards()[static_cast<size_t>(childIndex)];
-                child.Update(GetDownloaderGroupChildBounds(leftPanel, index, childIndex, downloaderScrollOffset_),
-                             font);
-                processCard(child);
-                if (child.ShouldClose())
+                for (int tab = 0; tab < kChannelTabCount; ++tab)
                 {
-                    OnCardClosed(child.Url());
-                    child.RequestClose();
-                }
-                if (child.WasClicked())
-                {
-                    clicked = {index, childIndex, false};
+                    const Rectangle tabBounds =
+                        GetDownloaderChannelTabBounds(leftPanel, index, tab, downloaderScrollOffset_);
+                    group.UpdateChannelTab(tab, tabBounds, font);
+                    if (group.WasChannelTabExpandClicked(tab))
+                    {
+                        group.ToggleChannelTabExpanded(tab);
+                    }
+                    if (group.WasChannelTabClicked(tab))
+                    {
+                        clicked = {index, -1, tab, false};
+                    }
+
+                    if (group.IsChannelTabExpanded(tab))
+                    {
+                        for (int childIndex = 0; childIndex < group.ChannelTabLoadedCount(tab); ++childIndex)
+                        {
+                            LinkCardNode& child = group.ChannelTabLoadedCards(tab)[static_cast<size_t>(childIndex)];
+                            child.Update(GetDownloaderChannelTabChildBounds(
+                                             leftPanel, index, tab, childIndex, downloaderScrollOffset_),
+                                         font);
+                            processCard(child);
+                            if (child.ShouldClose())
+                            {
+                                OnCardClosed(child.Url());
+                                child.RequestClose();
+                            }
+                            if (child.WasClicked())
+                            {
+                                clicked = {index, childIndex, tab, false};
+                            }
+                        }
+
+                        const Rectangle loadMoreBounds =
+                            GetDownloaderChannelTabLoadMoreBounds(leftPanel, index, tab, downloaderScrollOffset_);
+                        if (loadMoreBounds.width > 0.0f && CheckCollisionPointRec(GetMousePosition(), loadMoreBounds) &&
+                            IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+                        {
+                            group.LoadNextPageForTab(tab);
+                            SyncGroupLoadedCompletionsFromDisk(group);
+                        }
+                        const Rectangle collapseBounds =
+                            GetDownloaderChannelTabCollapseBounds(leftPanel, index, tab, downloaderScrollOffset_);
+                        if (collapseBounds.width > 0.0f && group.ChannelTabCanCollapseToFirstPage(tab) &&
+                            CheckCollisionPointRec(GetMousePosition(), collapseBounds) &&
+                            IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+                        {
+                            group.CollapseToFirstPageForTab(tab);
+                        }
+                    }
                 }
             }
-
-            const Rectangle loadMoreBounds =
-                GetDownloaderGroupLoadMoreBounds(leftPanel, index, downloaderScrollOffset_);
-            if (loadMoreBounds.width > 0.0f && CheckCollisionPointRec(GetMousePosition(), loadMoreBounds) &&
-                IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+            else if (group.UsesPlaylistShelf())
             {
-                group.LoadNextPage();
+                for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+                {
+                    const Rectangle shelfBounds =
+                        GetDownloaderPlaylistShelfItemBounds(leftPanel, index, shelfIndex, downloaderScrollOffset_);
+                    group.UpdatePlaylistShelfItem(shelfIndex, shelfBounds, font);
+                    if (group.WasPlaylistShelfItemExpandClicked(shelfIndex))
+                    {
+                        group.TogglePlaylistShelfItemExpanded(shelfIndex);
+                    }
+                    if (group.WasPlaylistShelfItemClicked(shelfIndex))
+                    {
+                        clicked = {index, -1, shelfIndex, false};
+                    }
+
+                    if (group.IsPlaylistShelfItemExpanded(shelfIndex))
+                    {
+                        LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+                        if (playlist != nullptr)
+                        {
+                            for (int childIndex = 0; childIndex < playlist->LoadedChildCount(); ++childIndex)
+                            {
+                                LinkCardNode& child = playlist->LoadedCards()[static_cast<size_t>(childIndex)];
+                                child.Update(GetDownloaderPlaylistShelfChildBounds(
+                                                 leftPanel, index, shelfIndex, childIndex, downloaderScrollOffset_),
+                                             font);
+                                processCard(child);
+                                if (child.ShouldClose())
+                                {
+                                    OnCardClosed(child.Url());
+                                    child.RequestClose();
+                                }
+                                if (child.WasClicked())
+                                {
+                                    clicked = {index, childIndex, shelfIndex, false};
+                                }
+                            }
+
+                            const Rectangle loadMoreBounds = GetDownloaderPlaylistShelfLoadMoreBounds(
+                                leftPanel, index, shelfIndex, downloaderScrollOffset_);
+                            if (loadMoreBounds.width > 0.0f &&
+                                CheckCollisionPointRec(GetMousePosition(), loadMoreBounds) &&
+                                IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+                            {
+                                playlist->LoadNextPage();
+                                SyncGroupLoadedCompletionsFromDisk(*playlist, &group);
+                            }
+                            const Rectangle collapseBounds = GetDownloaderPlaylistShelfCollapseBounds(
+                                leftPanel, index, shelfIndex, downloaderScrollOffset_);
+                            if (collapseBounds.width > 0.0f && playlist->CanCollapseToFirstPage() &&
+                                CheckCollisionPointRec(GetMousePosition(), collapseBounds) &&
+                                IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+                            {
+                                playlist->CollapseToFirstPage();
+                            }
+                        }
+                    }
+                }
+
+                const Rectangle loadMoreBounds =
+                    GetDownloaderGroupLoadMoreBounds(leftPanel, index, downloaderScrollOffset_);
+                if (loadMoreBounds.width > 0.0f && CheckCollisionPointRec(GetMousePosition(), loadMoreBounds) &&
+                    IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+                {
+                    group.LoadNextPage();
+                    SyncGroupLoadedCompletionsFromDisk(group);
+                }
+                const Rectangle collapseBounds =
+                    GetDownloaderGroupCollapseBounds(leftPanel, index, downloaderScrollOffset_);
+                if (collapseBounds.width > 0.0f && group.CanCollapseToFirstPage() &&
+                    CheckCollisionPointRec(GetMousePosition(), collapseBounds) &&
+                    IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+                {
+                    group.CollapseToFirstPage();
+                }
+            }
+            else
+            {
+                for (int childIndex = 0; childIndex < group.LoadedChildCount(); ++childIndex)
+                {
+                    LinkCardNode& child = group.LoadedCards()[static_cast<size_t>(childIndex)];
+                    child.Update(GetDownloaderGroupChildBounds(leftPanel, index, childIndex, downloaderScrollOffset_),
+                                 font);
+                    processCard(child);
+                    if (child.ShouldClose())
+                    {
+                        OnCardClosed(child.Url());
+                        child.RequestClose();
+                    }
+                    if (child.WasClicked())
+                    {
+                        clicked = {index, childIndex, -1, false};
+                    }
+                }
+
+                const Rectangle loadMoreBounds =
+                    GetDownloaderGroupLoadMoreBounds(leftPanel, index, downloaderScrollOffset_);
+                if (loadMoreBounds.width > 0.0f && CheckCollisionPointRec(GetMousePosition(), loadMoreBounds) &&
+                    IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+                {
+                    group.LoadNextPage();
+                    SyncGroupLoadedCompletionsFromDisk(group);
+                }
+                const Rectangle collapseBounds =
+                    GetDownloaderGroupCollapseBounds(leftPanel, index, downloaderScrollOffset_);
+                if (collapseBounds.width > 0.0f && group.CanCollapseToFirstPage() &&
+                    CheckCollisionPointRec(GetMousePosition(), collapseBounds) &&
+                    IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+                {
+                    group.CollapseToFirstPage();
+                }
             }
         }
+        group.TryToggleExpandShortcut();
     }
 
     if (clicked.itemIndex >= 0)
     {
         const bool ctrl = IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL);
         const bool shift = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
-        if (shift && lastDownloaderSelectionAnchor_ >= 0)
+        DownloaderSelectionPoint clickedPoint;
+        clickedPoint.itemIndex = clicked.itemIndex;
+        clickedPoint.tabIndex = clicked.tabIndex;
+        clickedPoint.childIndex = clicked.childIndex;
+        clickedPoint.isHeader = clicked.isHeader;
+
+        if (shift && (lastDownloaderSelectionAnchorPoint_.itemIndex >= 0 || lastDownloaderSelectionAnchor_ >= 0))
         {
-            const int a = std::min(lastDownloaderSelectionAnchor_, clicked.itemIndex);
-            const int b = std::max(lastDownloaderSelectionAnchor_, clicked.itemIndex);
-            for (int index = 0; index < static_cast<int>(cards_.size()); ++index)
+            DownloaderSelectionPoint anchorPoint = lastDownloaderSelectionAnchorPoint_;
+            if (anchorPoint.itemIndex < 0)
             {
-                cards_[index].ClearSelection();
-                if (index >= a && index <= b)
-                {
-                    if (cards_[index].kind == DownloaderListItem::Kind::Single)
-                    {
-                        cards_[index].single->SetSelected(true);
-                    }
-                    else
-                    {
-                        cards_[index].group->SetHeaderSelected(true);
-                    }
-                }
+                anchorPoint = MakeTopLevelSelectionPoint(lastDownloaderSelectionAnchor_);
             }
-            lastDownloaderSelectionFocus_ = clicked.itemIndex;
+            const std::vector<DownloaderSelectionPoint> order = BuildDownloaderSelectionOrder();
+            int anchorIndex = FindDownloaderSelectionIndex(order, anchorPoint);
+            int clickIndex = FindDownloaderSelectionIndex(order, clickedPoint);
+            if (anchorIndex < 0)
+            {
+                anchorIndex =
+                    FindDownloaderSelectionIndex(order, MakeTopLevelSelectionPoint(lastDownloaderSelectionAnchor_));
+            }
+            if (anchorIndex >= 0 && clickIndex >= 0)
+            {
+                const int a = std::min(anchorIndex, clickIndex);
+                const int b = std::max(anchorIndex, clickIndex);
+                for (DownloaderListItem& listItem : cards_)
+                {
+                    listItem.ClearSelection();
+                }
+                for (int index = a; index <= b; ++index)
+                {
+                    SelectDownloaderSelectionPoint(order[static_cast<size_t>(index)], true);
+                }
+                RememberDownloaderSelection(clickedPoint, false);
+            }
+            else
+            {
+                // Fall back to selecting only the clicked target.
+                for (DownloaderListItem& listItem : cards_)
+                {
+                    listItem.ClearSelection();
+                }
+                SelectDownloaderSelectionPoint(clickedPoint, true);
+                RememberDownloaderSelection(clickedPoint, true);
+            }
         }
         else if (ctrl)
         {
             DownloaderListItem& item = cards_[clicked.itemIndex];
-            if (clicked.isHeader || item.kind == DownloaderListItem::Kind::Group)
+            if (item.kind == DownloaderListItem::Kind::Group)
             {
-                if (clicked.childIndex < 0)
+                LinkCardGroupNode& group = *item.group;
+                if (clicked.isHeader)
                 {
-                    item.group->SetHeaderSelected(!item.group->IsHeaderSelected());
+                    group.SetHeaderSelected(!group.IsHeaderSelected());
                 }
-                else
+                else if (clicked.tabIndex >= 0 && clicked.childIndex < 0)
                 {
-                    LinkCardNode& child = item.group->LoadedCards()[static_cast<size_t>(clicked.childIndex)];
-                    child.SetSelected(!child.IsSelected());
+                    if (group.UsesPlaylistShelf())
+                    {
+                        group.SetPlaylistShelfItemSelected(clicked.tabIndex,
+                                                           !group.IsPlaylistShelfItemSelected(clicked.tabIndex));
+                    }
+                    else
+                    {
+                        group.SetChannelTabSelected(clicked.tabIndex, !group.IsChannelTabSelected(clicked.tabIndex));
+                    }
+                }
+                else if (clicked.childIndex >= 0)
+                {
+                    LinkCardNode* childPtr = nullptr;
+                    if (group.UsesPlaylistShelf() && clicked.tabIndex >= 0)
+                    {
+                        LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(clicked.tabIndex);
+                        if (playlist != nullptr && clicked.childIndex < playlist->LoadedChildCount())
+                        {
+                            childPtr = &playlist->LoadedCards()[static_cast<size_t>(clicked.childIndex)];
+                        }
+                    }
+                    else if (clicked.tabIndex >= 0)
+                    {
+                        childPtr =
+                            &group.ChannelTabLoadedCards(clicked.tabIndex)[static_cast<size_t>(clicked.childIndex)];
+                    }
+                    else
+                    {
+                        childPtr = &group.LoadedCards()[static_cast<size_t>(clicked.childIndex)];
+                    }
+                    if (childPtr != nullptr)
+                    {
+                        childPtr->SetSelected(!childPtr->IsSelected());
+                        group.SetHeaderSelected(false);
+                        group.ClearChannelTabSelection();
+                        group.ClearPlaylistShelfSelection();
+                    }
                 }
             }
             else
             {
                 item.single->SetSelected(!item.single->IsSelected());
             }
-            lastDownloaderSelectionAnchor_ = clicked.itemIndex;
-            lastDownloaderSelectionFocus_ = clicked.itemIndex;
+            RememberDownloaderSelection(clickedPoint, true);
         }
         else
         {
@@ -3478,15 +4641,50 @@ void DockArea::UpdateCards(Rectangle leftPanel, Font font)
             }
             else if (clicked.childIndex >= 0)
             {
-                item.group->LoadedCards()[static_cast<size_t>(clicked.childIndex)].SetSelected(true);
-                item.group->LoadedCards()[static_cast<size_t>(clicked.childIndex)].EnsureDetailedParse();
+                LinkCardNode* childPtr = nullptr;
+                if (item.group->UsesPlaylistShelf() && clicked.tabIndex >= 0)
+                {
+                    LinkCardGroupNode* playlist = item.group->PlaylistShelfPlaylist(clicked.tabIndex);
+                    if (playlist != nullptr && clicked.childIndex < playlist->LoadedChildCount())
+                    {
+                        childPtr = &playlist->LoadedCards()[static_cast<size_t>(clicked.childIndex)];
+                    }
+                }
+                else if (clicked.tabIndex >= 0)
+                {
+                    childPtr =
+                        &item.group->ChannelTabLoadedCards(clicked.tabIndex)[static_cast<size_t>(clicked.childIndex)];
+                }
+                else
+                {
+                    childPtr = &item.group->LoadedCards()[static_cast<size_t>(clicked.childIndex)];
+                }
+                if (childPtr != nullptr)
+                {
+                    childPtr->SetSelected(true);
+                    if (!item.group->UsesPlaylistShelf())
+                    {
+                        childPtr->EnsureDetailedParse();
+                    }
+                    item.group->ClearPlaylistShelfSelection();
+                }
+            }
+            else if (clicked.tabIndex >= 0)
+            {
+                if (item.group->UsesPlaylistShelf())
+                {
+                    item.group->SetPlaylistShelfItemSelected(clicked.tabIndex, true);
+                }
+                else
+                {
+                    item.group->SetChannelTabSelected(clicked.tabIndex, true);
+                }
             }
             else
             {
                 item.group->SetHeaderSelected(true);
             }
-            lastDownloaderSelectionAnchor_ = clicked.itemIndex;
-            lastDownloaderSelectionFocus_ = clicked.itemIndex;
+            RememberDownloaderSelection(clickedPoint, true);
         }
     }
     else if (!cards_.empty() && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) &&
@@ -3517,14 +4715,87 @@ void DockArea::UpdateCards(Rectangle leftPanel, Font font)
                 }
                 if (cards_[index].group->IsExpanded())
                 {
-                    for (int childIndex = 0; childIndex < cards_[index].group->LoadedChildCount(); ++childIndex)
+                    LinkCardGroupNode& group = *cards_[index].group;
+                    if (group.UsesChannelTabs())
                     {
-                        if (CheckCollisionPointRec(
-                                GetMousePosition(),
-                                GetDownloaderGroupChildBounds(leftPanel, index, childIndex, downloaderScrollOffset_)))
+                        for (int tab = 0; tab < kChannelTabCount; ++tab)
                         {
-                            clickedAny = true;
-                            break;
+                            if (CheckCollisionPointRec(
+                                    GetMousePosition(),
+                                    GetDownloaderChannelTabBounds(leftPanel, index, tab, downloaderScrollOffset_)))
+                            {
+                                clickedAny = true;
+                                break;
+                            }
+                            if (!group.IsChannelTabExpanded(tab))
+                            {
+                                continue;
+                            }
+                            for (int childIndex = 0; childIndex < group.ChannelTabLoadedCount(tab); ++childIndex)
+                            {
+                                if (CheckCollisionPointRec(
+                                        GetMousePosition(),
+                                        GetDownloaderChannelTabChildBounds(
+                                            leftPanel, index, tab, childIndex, downloaderScrollOffset_)))
+                                {
+                                    clickedAny = true;
+                                    break;
+                                }
+                            }
+                            if (clickedAny)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    else if (group.UsesPlaylistShelf())
+                    {
+                        for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+                        {
+                            if (CheckCollisionPointRec(GetMousePosition(),
+                                                       GetDownloaderPlaylistShelfItemBounds(
+                                                           leftPanel, index, shelfIndex, downloaderScrollOffset_)))
+                            {
+                                clickedAny = true;
+                                break;
+                            }
+                            if (!group.IsPlaylistShelfItemExpanded(shelfIndex))
+                            {
+                                continue;
+                            }
+                            const LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+                            if (playlist == nullptr)
+                            {
+                                continue;
+                            }
+                            for (int childIndex = 0; childIndex < playlist->LoadedChildCount(); ++childIndex)
+                            {
+                                if (CheckCollisionPointRec(
+                                        GetMousePosition(),
+                                        GetDownloaderPlaylistShelfChildBounds(
+                                            leftPanel, index, shelfIndex, childIndex, downloaderScrollOffset_)))
+                                {
+                                    clickedAny = true;
+                                    break;
+                                }
+                            }
+                            if (clickedAny)
+                            {
+                                break;
+                            }
+                        }
+                    }
+                    else
+                    {
+                        for (int childIndex = 0; childIndex < group.LoadedChildCount(); ++childIndex)
+                        {
+                            if (CheckCollisionPointRec(GetMousePosition(),
+                                                       GetDownloaderGroupChildBounds(
+                                                           leftPanel, index, childIndex, downloaderScrollOffset_)))
+                            {
+                                clickedAny = true;
+                                break;
+                            }
                         }
                     }
                 }
@@ -3544,7 +4815,7 @@ void DockArea::UpdateCards(Rectangle leftPanel, Font font)
     }
 }
 
-void DockArea::CloseLinkCardAt(int index)
+void DockArea::CloseLinkCardAt(int index, bool allowHoverChildDelete)
 {
     if (index < 0 || index >= static_cast<int>(cards_.size()))
     {
@@ -3567,15 +4838,18 @@ void DockArea::CloseLinkCardAt(int index)
 
     LinkCardGroupNode& group = *cards_[index].group;
 
-    // If we are hovering a specific child card inside the group header, delete only that child.
+    // Hovered child under a group: X / Del removes only that child. Ctrl+Del/Ctrl+X clears whole cards.
     LinkCardNode* hoveredChild = nullptr;
-    for (LinkCardNode& child : group.LoadedCards())
+    if (allowHoverChildDelete)
     {
-        if (child.IsHovered())
-        {
-            hoveredChild = &child;
-            break;
-        }
+        group.ForEachLoadedCard(
+            [&](LinkCardNode& child)
+            {
+                if (hoveredChild == nullptr && child.IsHovered())
+                {
+                    hoveredChild = &child;
+                }
+            });
     }
 
     if (hoveredChild != nullptr && !group.IsHeaderHovered())
@@ -3614,16 +4888,66 @@ void DockArea::CloseLinkCardAt(int index)
     }
 
     // Otherwise delete the whole group card.
-    for (LinkCardNode& child : group.LoadedCards())
-    {
-        if (child.IsDownloading())
+    std::unordered_set<std::string> hostUrls;
+    group.ForEachLoadedCard(
+        [&](LinkCardNode& child)
         {
-            child.ClearDownloading();
-            child.ClearAutoConvertSnapshot();
-            child.ClearAutoConvertDelivery();
+            hostUrls.insert(child.Url());
+            if (child.IsDownloading())
+            {
+                child.ClearDownloading();
+                child.ClearAutoConvertSnapshot();
+                child.ClearAutoConvertDelivery();
+            }
+            OnCardClosed(child.Url());
+        });
+    // Also drop ephemeral hosts for non-materialized entries under this group / nested playlists.
+    if (group.UsesChannelTabs())
+    {
+        for (int tab = 0; tab < kChannelTabCount; ++tab)
+        {
+            for (int entryIndex = 0; entryIndex < group.ChannelTabEntryCount(tab); ++entryIndex)
+            {
+                if (const LinkGroupEntry* entry = group.ChannelTabEntryAt(tab, entryIndex))
+                {
+                    hostUrls.insert(entry->url);
+                }
+            }
         }
-        OnCardClosed(child.Url());
     }
+    else if (group.UsesPlaylistShelf())
+    {
+        for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+        {
+            LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+            if (playlist == nullptr)
+            {
+                continue;
+            }
+            for (int entryIndex = 0;; ++entryIndex)
+            {
+                const LinkGroupEntry* entry = playlist->EntryAt(entryIndex);
+                if (entry == nullptr)
+                {
+                    break;
+                }
+                hostUrls.insert(entry->url);
+            }
+        }
+    }
+    else
+    {
+        for (int entryIndex = 0;; ++entryIndex)
+        {
+            const LinkGroupEntry* entry = group.EntryAt(entryIndex);
+            if (entry == nullptr)
+            {
+                break;
+            }
+            hostUrls.insert(entry->url);
+        }
+    }
+    RemoveDownloadHostsMatchingUrls(hostUrls);
     OnCardClosed(group.Url());
     group.RequestClose();
 }
@@ -3858,6 +5182,7 @@ void DockArea::UndoRestoreLinkCard(const LinkCardUndoSnapshot& snapshot)
     }
     lastDownloaderSelectionAnchor_ = index;
     lastDownloaderSelectionFocus_ = index;
+    RememberDownloaderSelection(MakeTopLevelSelectionPoint(index), true);
 }
 
 void DockArea::UndoRemoveLinkCardByUrl(const std::string& url)
@@ -4248,89 +5573,424 @@ void DockArea::EnsureCardVisibleInList(Rectangle leftPanel, int index, float& sc
     scrollOffset = std::clamp(scrollOffset, 0.0f, maxScroll);
 }
 
-void DockArea::NavigateDownloaderSelection(int delta, Rectangle leftPanel, bool allowModifiers)
+void DockArea::EnsureDownloaderSelectionPointVisible(Rectangle leftPanel,
+                                                     const DownloaderSelectionPoint& point,
+                                                     float& scrollOffset) const
 {
-    const int count = static_cast<int>(cards_.size());
-    if (count <= 0 || delta == 0)
+    if (point.itemIndex < 0 || point.itemIndex >= static_cast<int>(cards_.size()))
     {
         return;
     }
 
-    int focus = lastDownloaderSelectionFocus_;
-    if (focus < 0 || focus >= count)
+    Rectangle bounds{};
+    if (cards_[static_cast<size_t>(point.itemIndex)].kind == DownloaderListItem::Kind::Single || point.isHeader ||
+        (point.tabIndex < 0 && point.childIndex < 0))
     {
-        focus = lastDownloaderSelectionAnchor_;
+        bounds = {leftPanel.x + 8.0f,
+                  GetDownloaderItemTop(leftPanel, point.itemIndex, scrollOffset),
+                  leftPanel.width - 16.0f,
+                  LinkCardGroupNode::kCardHeight};
     }
-    if (focus < 0 || focus >= count)
+    else if (point.itemIndex >= 0 && cards_[static_cast<size_t>(point.itemIndex)].group != nullptr)
     {
-        for (int index = 0; index < count; ++index)
+        const LinkCardGroupNode& group = *cards_[static_cast<size_t>(point.itemIndex)].group;
+        if (point.tabIndex >= 0 && point.childIndex < 0)
         {
-            if (cards_[index].IsSelected())
+            if (group.UsesPlaylistShelf())
             {
-                focus = index;
-                break;
+                bounds = GetDownloaderPlaylistShelfItemBounds(leftPanel, point.itemIndex, point.tabIndex, scrollOffset);
+            }
+            else
+            {
+                bounds = GetDownloaderChannelTabBounds(leftPanel, point.itemIndex, point.tabIndex, scrollOffset);
+            }
+        }
+        else if (point.childIndex >= 0)
+        {
+            if (group.UsesPlaylistShelf() && point.tabIndex >= 0)
+            {
+                bounds = GetDownloaderPlaylistShelfChildBounds(
+                    leftPanel, point.itemIndex, point.tabIndex, point.childIndex, scrollOffset);
+            }
+            else if (group.UsesChannelTabs() && point.tabIndex >= 0)
+            {
+                bounds = GetDownloaderChannelTabChildBounds(
+                    leftPanel, point.itemIndex, point.tabIndex, point.childIndex, scrollOffset);
+            }
+            else
+            {
+                bounds = GetDownloaderGroupChildBounds(leftPanel, point.itemIndex, point.childIndex, scrollOffset);
             }
         }
     }
 
-    bool anySelected = false;
-    for (int index = 0; index < count; ++index)
+    if (bounds.height <= 0.0f)
     {
-        if (cards_[index].IsSelected())
-        {
-            anySelected = true;
-            break;
-        }
-    }
-    if (!anySelected)
-    {
-        focus = -1;
+        EnsureCardVisibleInList(leftPanel, point.itemIndex, scrollOffset);
+        return;
     }
 
-    int next = focus;
-    if (focus < 0)
+    const float viewTop = leftPanel.y;
+    const float viewBottom = leftPanel.y + leftPanel.height;
+    if (bounds.y < viewTop)
     {
-        next = delta > 0 ? 0 : count - 1;
+        scrollOffset -= viewTop - bounds.y;
+    }
+    else if (bounds.y + bounds.height > viewBottom)
+    {
+        scrollOffset += (bounds.y + bounds.height) - viewBottom;
+    }
+
+    const float contentHeight = GetDownloaderListContentHeight();
+    const float maxScroll = GetMaxCardScroll(leftPanel, contentHeight, 0.0f);
+    scrollOffset = std::clamp(scrollOffset, 0.0f, maxScroll);
+}
+
+bool DockArea::IsDownloaderSelectionPointSelected(const DownloaderSelectionPoint& point) const
+{
+    if (point.itemIndex < 0 || point.itemIndex >= static_cast<int>(cards_.size()))
+    {
+        return false;
+    }
+
+    const DownloaderListItem& item = cards_[static_cast<size_t>(point.itemIndex)];
+    if (item.kind == DownloaderListItem::Kind::Single)
+    {
+        return item.single != nullptr && item.single->IsSelected();
+    }
+    if (item.group == nullptr)
+    {
+        return false;
+    }
+
+    const LinkCardGroupNode& group = *item.group;
+    if (point.isHeader)
+    {
+        return group.IsHeaderSelected();
+    }
+    if (point.tabIndex >= 0 && point.childIndex < 0)
+    {
+        if (group.UsesPlaylistShelf())
+        {
+            return group.IsPlaylistShelfItemSelected(point.tabIndex);
+        }
+        return group.IsChannelTabSelected(point.tabIndex);
+    }
+    if (point.childIndex < 0)
+    {
+        return false;
+    }
+    if (point.tabIndex >= 0)
+    {
+        if (group.UsesPlaylistShelf())
+        {
+            const LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(point.tabIndex);
+            return playlist != nullptr && point.childIndex < playlist->LoadedChildCount() &&
+                   playlist->LoadedCards()[static_cast<size_t>(point.childIndex)].IsSelected();
+        }
+        return point.childIndex < group.ChannelTabLoadedCount(point.tabIndex) &&
+               group.ChannelTabLoadedCards(point.tabIndex)[static_cast<size_t>(point.childIndex)].IsSelected();
+    }
+    return point.childIndex < group.LoadedChildCount() &&
+           group.LoadedCards()[static_cast<size_t>(point.childIndex)].IsSelected();
+}
+
+int DockArea::FindSelectedDownloaderOrderIndex(const std::vector<DownloaderSelectionPoint>& order) const
+{
+    // Prefer the remembered focus when it is still selected.
+    const int focusIndex = FindDownloaderSelectionIndex(order, lastDownloaderSelectionFocusPoint_);
+    if (focusIndex >= 0 && IsDownloaderSelectionPointSelected(order[static_cast<size_t>(focusIndex)]))
+    {
+        return focusIndex;
+    }
+    for (int index = 0; index < static_cast<int>(order.size()); ++index)
+    {
+        if (IsDownloaderSelectionPointSelected(order[static_cast<size_t>(index)]))
+        {
+            return index;
+        }
+    }
+    return -1;
+}
+
+DockArea::DownloaderSelectionPoint DockArea::MakeTopLevelSelectionPoint(int itemIndex) const
+{
+    DownloaderSelectionPoint point;
+    point.itemIndex = itemIndex;
+    if (itemIndex >= 0 && itemIndex < static_cast<int>(cards_.size()) &&
+        cards_[static_cast<size_t>(itemIndex)].kind == DownloaderListItem::Kind::Group)
+    {
+        point.isHeader = true;
+    }
+    return point;
+}
+
+void DockArea::RememberDownloaderSelection(const DownloaderSelectionPoint& point, bool updateAnchor)
+{
+    lastDownloaderSelectionFocusPoint_ = point;
+    lastDownloaderSelectionFocus_ = point.itemIndex;
+    if (updateAnchor)
+    {
+        lastDownloaderSelectionAnchorPoint_ = point;
+        lastDownloaderSelectionAnchor_ = point.itemIndex;
+    }
+}
+
+bool DockArea::SameDownloaderSelectionPoint(const DownloaderSelectionPoint& a, const DownloaderSelectionPoint& b)
+{
+    return a.itemIndex == b.itemIndex && a.tabIndex == b.tabIndex && a.childIndex == b.childIndex &&
+           a.isHeader == b.isHeader;
+}
+
+std::vector<DockArea::DownloaderSelectionPoint> DockArea::BuildDownloaderSelectionOrder() const
+{
+    std::vector<DownloaderSelectionPoint> order;
+    order.reserve(cards_.size() * 4);
+    for (int itemIndex = 0; itemIndex < static_cast<int>(cards_.size()); ++itemIndex)
+    {
+        const DownloaderListItem& item = cards_[static_cast<size_t>(itemIndex)];
+        if (item.kind == DownloaderListItem::Kind::Single)
+        {
+            DownloaderSelectionPoint point;
+            point.itemIndex = itemIndex;
+            order.push_back(point);
+            continue;
+        }
+        if (item.group == nullptr)
+        {
+            continue;
+        }
+
+        const LinkCardGroupNode& group = *item.group;
+        {
+            DownloaderSelectionPoint header;
+            header.itemIndex = itemIndex;
+            header.isHeader = true;
+            order.push_back(header);
+        }
+
+        if (!group.IsExpanded())
+        {
+            continue;
+        }
+
+        if (group.UsesChannelTabs())
+        {
+            for (int tab = 0; tab < kChannelTabCount; ++tab)
+            {
+                DownloaderSelectionPoint tabPoint;
+                tabPoint.itemIndex = itemIndex;
+                tabPoint.tabIndex = tab;
+                order.push_back(tabPoint);
+
+                if (!group.IsChannelTabExpanded(tab))
+                {
+                    continue;
+                }
+                for (int childIndex = 0; childIndex < group.ChannelTabLoadedCount(tab); ++childIndex)
+                {
+                    DownloaderSelectionPoint child;
+                    child.itemIndex = itemIndex;
+                    child.tabIndex = tab;
+                    child.childIndex = childIndex;
+                    order.push_back(child);
+                }
+            }
+        }
+        else if (group.UsesPlaylistShelf())
+        {
+            for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+            {
+                DownloaderSelectionPoint shelfPoint;
+                shelfPoint.itemIndex = itemIndex;
+                shelfPoint.tabIndex = shelfIndex;
+                order.push_back(shelfPoint);
+
+                if (!group.IsPlaylistShelfItemExpanded(shelfIndex))
+                {
+                    continue;
+                }
+                const LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+                if (playlist == nullptr)
+                {
+                    continue;
+                }
+                for (int childIndex = 0; childIndex < playlist->LoadedChildCount(); ++childIndex)
+                {
+                    DownloaderSelectionPoint child;
+                    child.itemIndex = itemIndex;
+                    child.tabIndex = shelfIndex;
+                    child.childIndex = childIndex;
+                    order.push_back(child);
+                }
+            }
+        }
+        else
+        {
+            for (int childIndex = 0; childIndex < group.LoadedChildCount(); ++childIndex)
+            {
+                DownloaderSelectionPoint child;
+                child.itemIndex = itemIndex;
+                child.childIndex = childIndex;
+                order.push_back(child);
+            }
+        }
+    }
+    return order;
+}
+
+int DockArea::FindDownloaderSelectionIndex(const std::vector<DownloaderSelectionPoint>& order,
+                                           const DownloaderSelectionPoint& point) const
+{
+    for (int index = 0; index < static_cast<int>(order.size()); ++index)
+    {
+        if (SameDownloaderSelectionPoint(order[static_cast<size_t>(index)], point))
+        {
+            return index;
+        }
+    }
+    return -1;
+}
+
+void DockArea::SelectDownloaderSelectionPoint(const DownloaderSelectionPoint& point, bool selected)
+{
+    if (point.itemIndex < 0 || point.itemIndex >= static_cast<int>(cards_.size()))
+    {
+        return;
+    }
+
+    DownloaderListItem& item = cards_[static_cast<size_t>(point.itemIndex)];
+    if (item.kind == DownloaderListItem::Kind::Single)
+    {
+        if (item.single != nullptr)
+        {
+            item.single->SetSelected(selected);
+        }
+        return;
+    }
+    if (item.group == nullptr)
+    {
+        return;
+    }
+
+    LinkCardGroupNode& group = *item.group;
+    if (point.isHeader)
+    {
+        group.SetHeaderSelected(selected);
+        return;
+    }
+    if (point.tabIndex >= 0 && point.childIndex < 0)
+    {
+        if (group.UsesPlaylistShelf())
+        {
+            group.SetPlaylistShelfItemSelected(point.tabIndex, selected);
+        }
+        else
+        {
+            group.SetChannelTabSelected(point.tabIndex, selected);
+        }
+        return;
+    }
+    if (point.childIndex < 0)
+    {
+        return;
+    }
+
+    if (point.tabIndex >= 0)
+    {
+        if (group.UsesPlaylistShelf())
+        {
+            LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(point.tabIndex);
+            if (playlist == nullptr || point.childIndex >= playlist->LoadedChildCount())
+            {
+                return;
+            }
+            playlist->LoadedCards()[static_cast<size_t>(point.childIndex)].SetSelected(selected);
+            if (selected)
+            {
+                group.SetHeaderSelected(false);
+                group.ClearPlaylistShelfSelection();
+            }
+            return;
+        }
+        if (point.childIndex >= group.ChannelTabLoadedCount(point.tabIndex))
+        {
+            return;
+        }
+        group.ChannelTabLoadedCards(point.tabIndex)[static_cast<size_t>(point.childIndex)].SetSelected(selected);
+        return;
+    }
+    if (point.childIndex >= group.LoadedChildCount())
+    {
+        return;
+    }
+    group.LoadedCards()[static_cast<size_t>(point.childIndex)].SetSelected(selected);
+}
+
+void DockArea::NavigateDownloaderSelection(int delta, Rectangle leftPanel, bool allowModifiers)
+{
+    const std::vector<DownloaderSelectionPoint> order = BuildDownloaderSelectionOrder();
+    if (order.empty() || delta == 0)
+    {
+        return;
+    }
+
+    int focusOrderIndex = FindSelectedDownloaderOrderIndex(order);
+    if (focusOrderIndex < 0 && lastDownloaderSelectionFocus_ >= 0)
+    {
+        focusOrderIndex =
+            FindDownloaderSelectionIndex(order, MakeTopLevelSelectionPoint(lastDownloaderSelectionFocus_));
+    }
+
+    int nextOrderIndex = focusOrderIndex;
+    if (focusOrderIndex < 0)
+    {
+        nextOrderIndex = delta > 0 ? 0 : static_cast<int>(order.size()) - 1;
     }
     else
     {
-        next = std::clamp(focus + delta, 0, count - 1);
+        nextOrderIndex = std::clamp(focusOrderIndex + delta, 0, static_cast<int>(order.size()) - 1);
     }
 
-    const bool ctrl = allowModifiers && ShortcutRouter::CtrlDown();
     const bool shift = allowModifiers && ShortcutRouter::ShiftDown();
-
     if (shift)
     {
-        if (lastDownloaderSelectionAnchor_ < 0 || lastDownloaderSelectionAnchor_ >= count)
+        DownloaderSelectionPoint anchorPoint = lastDownloaderSelectionAnchorPoint_;
+        int anchorOrderIndex = FindDownloaderSelectionIndex(order, anchorPoint);
+        if (anchorOrderIndex < 0)
         {
-            lastDownloaderSelectionAnchor_ = focus >= 0 ? focus : next;
+            anchorOrderIndex = focusOrderIndex >= 0 ? focusOrderIndex : nextOrderIndex;
+            if (anchorOrderIndex >= 0)
+            {
+                RememberDownloaderSelection(order[static_cast<size_t>(anchorOrderIndex)], true);
+            }
         }
-        const int a = std::min(lastDownloaderSelectionAnchor_, next);
-        const int b = std::max(lastDownloaderSelectionAnchor_, next);
-        for (int index = 0; index < count; ++index)
+
+        for (DownloaderListItem& item : cards_)
         {
-            cards_[index].SetSelected(index >= a && index <= b);
+            item.ClearSelection();
         }
-        lastDownloaderSelectionFocus_ = next;
-    }
-    else if (ctrl)
-    {
-        cards_[next].SetSelected(!cards_[next].IsSelected());
-        lastDownloaderSelectionAnchor_ = next;
-        lastDownloaderSelectionFocus_ = next;
+
+        const int a = std::min(anchorOrderIndex, nextOrderIndex);
+        const int b = std::max(anchorOrderIndex, nextOrderIndex);
+        for (int index = a; index <= b; ++index)
+        {
+            SelectDownloaderSelectionPoint(order[static_cast<size_t>(index)], true);
+        }
+        RememberDownloaderSelection(order[static_cast<size_t>(nextOrderIndex)], false);
     }
     else
     {
-        for (int index = 0; index < count; ++index)
+        for (DownloaderListItem& item : cards_)
         {
-            cards_[index].SetSelected(index == next);
+            item.ClearSelection();
         }
-        lastDownloaderSelectionAnchor_ = next;
-        lastDownloaderSelectionFocus_ = next;
+        SelectDownloaderSelectionPoint(order[static_cast<size_t>(nextOrderIndex)], true);
+        RememberDownloaderSelection(order[static_cast<size_t>(nextOrderIndex)], true);
     }
 
-    EnsureCardVisibleInList(leftPanel, next, downloaderScrollOffset_);
+    EnsureDownloaderSelectionPointVisible(
+        leftPanel, order[static_cast<size_t>(nextOrderIndex)], downloaderScrollOffset_);
 }
 
 void DockArea::NavigateConverterSelection(int delta, Rectangle leftPanel, bool allowModifiers)
@@ -4382,7 +6042,6 @@ void DockArea::NavigateConverterSelection(int delta, Rectangle leftPanel, bool a
         next = std::clamp(focus + delta, 0, count - 1);
     }
 
-    const bool ctrl = allowModifiers && ShortcutRouter::CtrlDown();
     const bool shift = allowModifiers && ShortcutRouter::ShiftDown();
 
     if (shift)
@@ -4397,12 +6056,6 @@ void DockArea::NavigateConverterSelection(int delta, Rectangle leftPanel, bool a
         {
             converterCards_[index].SetSelected(index >= a && index <= b);
         }
-        lastConverterSelectionFocus_ = next;
-    }
-    else if (ctrl)
-    {
-        converterCards_[next].SetSelected(!converterCards_[next].IsSelected());
-        lastConverterSelectionAnchor_ = next;
         lastConverterSelectionFocus_ = next;
     }
     else
@@ -4485,6 +6138,7 @@ void DockArea::HandleShortcuts(Rectangle leftPanel, Rectangle rightPanel)
 
                 lastDownloaderSelectionAnchor_ = hover.index;
                 lastDownloaderSelectionFocus_ = hover.index;
+                RememberDownloaderSelection(MakeTopLevelSelectionPoint(hover.index), true);
             }
             else
             {
@@ -4495,13 +6149,15 @@ void DockArea::HandleShortcuts(Rectangle leftPanel, Rectangle rightPanel)
 
                 if (!cards_.empty())
                 {
-                    lastDownloaderSelectionAnchor_ = 0;
-                    lastDownloaderSelectionFocus_ = static_cast<int>(cards_.size()) - 1;
+                    RememberDownloaderSelection(MakeTopLevelSelectionPoint(0), true);
+                    RememberDownloaderSelection(MakeTopLevelSelectionPoint(static_cast<int>(cards_.size()) - 1), false);
                 }
                 else
                 {
                     lastDownloaderSelectionAnchor_ = -1;
                     lastDownloaderSelectionFocus_ = -1;
+                    lastDownloaderSelectionAnchorPoint_ = {};
+                    lastDownloaderSelectionFocusPoint_ = {};
                 }
             }
         }
@@ -4635,7 +6291,7 @@ void DockArea::HandleShortcuts(Rectangle leftPanel, Rectangle rightPanel)
             suppressCardRemovalUndo_ = true;
             for (int index = static_cast<int>(cards_.size()) - 1; index >= 0; --index)
             {
-                CloseLinkCardAt(index);
+                CloseLinkCardAt(index, false);
             }
             return;
         }
@@ -4653,13 +6309,14 @@ void DockArea::HandleShortcuts(Rectangle leftPanel, Rectangle rightPanel)
         }
         if (ShortcutRouter::Pressed({KEY_ESCAPE, false, false, false}))
         {
-            ForEachLinkCard(
-                [&](LinkCardNode& card)
-                {
-                    card.SetSelected(false);
-                });
+            for (DownloaderListItem& item : cards_)
+            {
+                item.ClearSelection();
+            }
             lastDownloaderSelectionAnchor_ = -1;
             lastDownloaderSelectionFocus_ = -1;
+            lastDownloaderSelectionAnchorPoint_ = {};
+            lastDownloaderSelectionFocusPoint_ = {};
             return;
         }
     }
@@ -5340,11 +6997,13 @@ bool DockArea::UpdateConverterDefaultDock(Rectangle defaultDockPanel, Font font)
     const bool customContainerConsumed = consumedIdx == 2;
     const bool globalContainerConsumed = consumedIdx == 5;
 
-    if (globalSection && (!convertContainer_ || globalContainerConsumed))
+    // Only re-sync codecs when the container choice actually changed.
+    // Syncing every frame while Container is off resets Video/Audio after the user picks a codec.
+    if (globalSection && globalContainerConsumed)
     {
         syncGlobalCodecDropdowns();
     }
-    if (customSection && (!customOptions.convertContainer || customContainerConsumed))
+    if (customSection && customContainerConsumed)
     {
         syncCustomCodecDropdowns();
     }
@@ -5647,8 +7306,8 @@ void DockArea::UpdateConverterCardOptions(Rectangle settingsPanel, Font font, bo
     const Rectangle optionsViewport = GetOptionsScrollViewport(settingsPanel, convertButton.y);
     const float contentHeight = GetConverterOptionsContentHeight(settingsPanel.y, converterResultSection_.IsExpanded());
     const float maxOptionsScroll = std::max(0.0f, contentHeight - optionsViewport.height);
-
-    if (CheckCollisionPointRec(GetMousePosition(), optionsViewport))
+    if (CheckCollisionPointRec(GetMousePosition(), optionsViewport) && !converterOptionsScrollbar_.IsDragging() &&
+        !(IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)))
     {
         const float wheel = GetMouseWheelMove();
         if (wheel != 0.0f)
@@ -5657,7 +7316,13 @@ void DockArea::UpdateConverterCardOptions(Rectangle settingsPanel, Font font, bo
                 std::clamp(converterOptionsScrollOffset_ - wheel * 40.0f, 0.0f, maxOptionsScroll);
         }
     }
+    converterOptionsScrollbar_.Update(optionsViewport, converterOptionsScrollOffset_, maxOptionsScroll);
     converterOptionsScrollOffset_ = std::clamp(converterOptionsScrollOffset_, 0.0f, maxOptionsScroll);
+    if (converterOptionsScrollbar_.IsDragging())
+    {
+        overlayBlocksActions_ = true;
+        return;
+    }
 
     const Rectangle resultFoldoutBounds = GetConverterResultFoldoutBounds(
         settingsPanel, converterResultSection_.IsExpanded(), converterOptionsScrollOffset_);
@@ -5747,7 +7412,7 @@ void DockArea::DrawConverterCardOptions(Rectangle settingsPanel, Font font) cons
             DrawDownloadResultPreview(font, settingsPanel, prediction, resultLineY, false);
         }
 
-        DrawOptionsScrollbar(optionsViewport, scrollOffset, maxOptionsScroll);
+        converterOptionsScrollbar_.Draw(optionsViewport, scrollOffset, maxOptionsScroll);
         UiClip::Pop();
     }
 
@@ -6115,11 +7780,13 @@ bool DockArea::UpdateAutoConvertDock(Rectangle autoConvertPanel, Font font)
     const bool customContainerConsumed = consumedIdx == 2;
     const bool autoContainerConsumed = consumedIdx == 5;
 
-    if (autoSection && (!autoConvert.convertContainer || autoContainerConsumed))
+    // Only re-sync codecs when the container choice actually changed.
+    // Syncing every frame while Container is off resets Video/Audio after the user picks a codec.
+    if (autoSection && autoContainerConsumed)
     {
         syncAutoConvertCodecDropdowns();
     }
-    if (customSection && (!customConvert.convertContainer || customContainerConsumed))
+    if (customSection && customContainerConsumed)
     {
         syncCustomAutoConvertCodecDropdowns();
     }
@@ -6234,17 +7901,75 @@ void DockArea::UpdateRightPanel(Rectangle rightPanel, Font font, bool blockByUpp
     }
     LinkCardGroupNode* selectedGroup = GetSelectedGroupHeader();
     bool editingGroup = false;
+    int editingChannelTab = -1;
     std::vector<LinkCardNode*> groupCards;
 
-    // Group header selection: edit shared download options for the playlist/channel.
-    if (selectedCard == nullptr && selectedGroup != nullptr && selectedGroup->IsValid())
+    // Group header, channel tab, or playlist-shelf playlist: edit shared download options.
+    if (selectedCard == nullptr)
     {
-        selectedGroup->LoadAllPages();
-        for (LinkCardNode& child : selectedGroup->LoadedCards())
+        LinkCardGroupNode* tabGroup = nullptr;
+        int selectedTab = -1;
+        LinkCardGroupNode* shelfGroup = nullptr;
+        int selectedShelf = -1;
+        if (selectedGroup == nullptr)
         {
-            groupCards.push_back(&child);
+            for (DownloaderListItem& item : cards_)
+            {
+                if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr)
+                {
+                    continue;
+                }
+                const int tab = item.group->SelectedChannelTab();
+                if (tab >= 0)
+                {
+                    tabGroup = item.group.get();
+                    selectedTab = tab;
+                    break;
+                }
+                const int shelf = item.group->SelectedPlaylistShelfIndex();
+                if (shelf >= 0)
+                {
+                    shelfGroup = item.group.get();
+                    selectedShelf = shelf;
+                    break;
+                }
+            }
         }
-        editingGroup = true;
+
+        if (selectedGroup != nullptr && selectedGroup->IsValid())
+        {
+            // Keep left-list pagination (first 50 + Load more). Download paths still call LoadAllPages.
+            selectedGroup->ForEachLoadedCard(
+                [&](LinkCardNode& child)
+                {
+                    groupCards.push_back(&child);
+                });
+            editingGroup = true;
+        }
+        else if (tabGroup != nullptr && tabGroup->IsValid() && tabGroup->ChannelTabEntryCount(selectedTab) > 0)
+        {
+            for (LinkCardNode& child : tabGroup->ChannelTabLoadedCards(selectedTab))
+            {
+                groupCards.push_back(&child);
+            }
+            editingGroup = true;
+            editingChannelTab = selectedTab;
+            selectedGroup = tabGroup;
+        }
+        else if (shelfGroup != nullptr && shelfGroup->IsValid())
+        {
+            LinkCardGroupNode* playlist = shelfGroup->PlaylistShelfPlaylist(selectedShelf);
+            if (playlist != nullptr)
+            {
+                playlist->ForEachLoadedCard(
+                    [&](LinkCardNode& child)
+                    {
+                        groupCards.push_back(&child);
+                    });
+                editingGroup = true;
+                selectedGroup = playlist;
+            }
+        }
         if (!groupCards.empty())
         {
             selectedCard = groupCards.front();
@@ -6265,6 +7990,7 @@ void DockArea::UpdateRightPanel(Rectangle rightPanel, Font font, bool blockByUpp
     if (!editingGroup && selectedCard == nullptr)
     {
         optionsScrollOffset_ = 0.0f;
+        downloaderOptionsScrollbar_.Reset();
         return;
     }
 
@@ -6273,10 +7999,22 @@ void DockArea::UpdateRightPanel(Rectangle rightPanel, Font font, bool blockByUpp
         return;
     }
 
+    const Rectangle downloadButton = GetDownloadButtonBounds(settingsPanel);
+    const Rectangle optionsViewport = GetOptionsScrollViewport(settingsPanel, downloadButton.y);
+    const float optionsContentHeight =
+        GetDownloaderOptionsContentHeight(settingsPanel.y, downloadFoldout_.IsExpanded());
+    const float maxOptionsScroll = std::max(0.0f, optionsContentHeight - optionsViewport.height);
+    downloaderOptionsScrollbar_.Update(optionsViewport, optionsScrollOffset_, maxOptionsScroll);
+    optionsScrollOffset_ = std::clamp(optionsScrollOffset_, 0.0f, maxOptionsScroll);
+    if (downloaderOptionsScrollbar_.IsDragging())
+    {
+        overlayBlocksActions_ = true;
+        return;
+    }
+
     DownloadOptions& options = editingGroup ? selectedGroup->Options() : selectedCard->Options();
 
     std::vector<std::string> availableQualities;
-    bool usingProvisionalQualityCaps = false;
     if (editingGroup)
     {
         // Always offer fixed caps so users can limit quality before child formats are parsed.
@@ -6288,16 +8026,42 @@ void DockArea::UpdateRightPanel(Rectangle rightPanel, Font font, bool blockByUpp
         if (availableQualities.empty())
         {
             // Playlist children (and any card still in quiet detail-parse) have no ladder yet.
-            // Show the same fixed caps immediately instead of a blank Quality dropdown.
-            availableQualities = BuildGroupQualityCapItems();
-            usingProvisionalQualityCaps = true;
-            selectedCard->EnsureDetailedParse();
+            availableQualities = BuildVideoQualityItems();
+            bool selectedFromPlaylistShelf = false;
+            for (const DownloaderListItem& item : cards_)
+            {
+                if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr ||
+                    !item.group->UsesPlaylistShelf())
+                {
+                    continue;
+                }
+                item.group->ForEachLoadedCard(
+                    [&](const LinkCardNode& card)
+                    {
+                        if (&card == selectedCard)
+                        {
+                            selectedFromPlaylistShelf = true;
+                        }
+                    });
+            }
+            if (!selectedFromPlaylistShelf)
+            {
+                selectedCard->EnsureDetailedParse();
+            }
         }
+        // Video cards never offer a synthetic "Max" row — only real heights.
+        availableQualities.erase(std::remove(availableQualities.begin(), availableQualities.end(), "Max"),
+                                 availableQualities.end());
     }
     qualityDropdown_.SetItems(availableQualities);
     if (availableQualities.empty())
     {
         options.quality = 0;
+    }
+    else if (!options.qualityCap.empty())
+    {
+        // Keep the chosen cap across provisional→parsed ladder changes (index alone drifts).
+        options.quality = MapQualityCapToCardIndex(availableQualities, options.qualityCap);
     }
     else if (options.quality < 0 || options.quality >= static_cast<int>(availableQualities.size()))
     {
@@ -6358,16 +8122,40 @@ void DockArea::UpdateRightPanel(Rectangle rightPanel, Font font, bool blockByUpp
         optionsLocked = selectedCard->IsDownloading() || selectedCard->IsConverting();
     }
 
-    const Rectangle downloadButton = GetDownloadButtonBounds(settingsPanel);
-    const Rectangle optionsViewport = GetOptionsScrollViewport(settingsPanel, downloadButton.y);
-    const float contentHeight = GetDownloaderOptionsContentHeight(settingsPanel.y, downloadFoldout_.IsExpanded());
-    const float maxOptionsScroll = std::max(0.0f, contentHeight - optionsViewport.height);
+    const bool waitingForFormats =
+        !editingGroup && selectedCard != nullptr && (selectedCard->IsParsing() || selectedCard->NeedsDetailedParse());
+    if (waitingForFormats)
+    {
+        bool selectedFromPlaylistShelf = false;
+        for (const DownloaderListItem& item : cards_)
+        {
+            if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr ||
+                !item.group->UsesPlaylistShelf())
+            {
+                continue;
+            }
+            item.group->ForEachLoadedCard(
+                [&](const LinkCardNode& card)
+                {
+                    if (&card == selectedCard)
+                    {
+                        selectedFromPlaylistShelf = true;
+                    }
+                });
+        }
+        if (selectedCard->NeedsDetailedParse() && !selectedFromPlaylistShelf)
+        {
+            selectedCard->EnsureDetailedParse();
+        }
+        selectedCard->ApplyParseResultIfReady();
+    }
 
     const bool dropdownOpen = fileFormatDropdown_.IsOpen() || mediaModeDropdown_.IsOpen() || qualityDropdown_.IsOpen();
     const bool pathConsumesWheel = customPathField_.IsActive();
 
-    if ((!dropdownOpen || optionsLocked) && !pathConsumesWheel &&
-        CheckCollisionPointRec(GetMousePosition(), optionsViewport))
+    if ((!dropdownOpen || optionsLocked || waitingForFormats) && !pathConsumesWheel &&
+        !downloaderOptionsScrollbar_.IsDragging() && CheckCollisionPointRec(GetMousePosition(), optionsViewport) &&
+        !(IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)))
     {
         const float wheel = GetMouseWheelMove();
         if (wheel != 0.0f)
@@ -6377,11 +8165,15 @@ void DockArea::UpdateRightPanel(Rectangle rightPanel, Font font, bool blockByUpp
     }
     optionsScrollOffset_ = std::clamp(optionsScrollOffset_, 0.0f, maxOptionsScroll);
 
-    if (optionsLocked)
+    if (optionsLocked || waitingForFormats)
     {
         fileFormatDropdown_.Close();
         mediaModeDropdown_.Close();
         qualityDropdown_.Close();
+    }
+
+    if (optionsLocked)
+    {
         if (customPathField_.IsActive())
         {
             const DownloaderPanelLayout layout = GetDownloaderPanelLayout(settingsPanel.x,
@@ -6446,13 +8238,14 @@ void DockArea::UpdateRightPanel(Rectangle rightPanel, Font font, bool blockByUpp
     }
 
     const bool downloadSection = downloadFoldout_.IsExpanded();
+    const bool formatDropdownsEnabled = downloadSection && !waitingForFormats;
     Dropdown::Slot optionsStack[] = {
-        {&mediaModeDropdown_, mediaBounds, &options.mediaMode, downloadSection, &optionsViewport},
-        {&fileFormatDropdown_, formatBounds, &options.fileFormat, downloadSection, &optionsViewport},
+        {&mediaModeDropdown_, mediaBounds, &options.mediaMode, formatDropdownsEnabled, &optionsViewport},
+        {&fileFormatDropdown_, formatBounds, &options.fileFormat, formatDropdownsEnabled, &optionsViewport},
         {&qualityDropdown_,
          qualityBounds,
          &options.quality,
-         downloadSection && options.mediaMode != 2,
+         formatDropdownsEnabled && options.mediaMode != 2,
          &optionsViewport},
     };
 
@@ -6522,10 +8315,28 @@ void DockArea::UpdateRightPanel(Rectangle rightPanel, Font font, bool blockByUpp
         {
             customPathField_.Update(pathFieldBounds, font, options.customPath, options.useCustomPath);
         }
-        const Rectangle keepIndicesBounds = {settingsPanel.x + 14.0f, controlsLayout.keepIndicesRowY, 160.0f, 18.0f};
+        const Rectangle keepIndicesBounds = {settingsPanel.x + 14.0f, controlsLayout.keepIndicesRowY, 144.0f, 18.0f};
+        const float keepLabelReserve = 118.0f;
+        const float inverseBoxX = settingsPanel.x + 14.0f + 18.0f + 8.0f + keepLabelReserve + 10.0f;
+        const Rectangle inverseNumberingBounds = {
+            inverseBoxX,
+            controlsLayout.keepIndicesRowY,
+            std::max(18.0f, settingsPanel.x + settingsPanel.width - inverseBoxX - 12.0f),
+            18.0f};
         if (MouseHitsClippedControl(keepIndicesBounds, optionsViewport))
         {
-            keepIndicesCheckbox_.Update(keepIndicesBounds, keepDownloadIndices_);
+            bool& keepNumbering = (editingChannelTab >= 0) ? selectedGroup->ChannelTabKeepNumbering(editingChannelTab)
+                                                           : (editingGroup ? selectedGroup->Options().keepNumbering
+                                                                           : selectedCard->Options().keepNumbering);
+            keepIndicesCheckbox_.Update(keepIndicesBounds, keepNumbering);
+        }
+        if (MouseHitsClippedControl(inverseNumberingBounds, optionsViewport))
+        {
+            bool& inverseNumbering = (editingChannelTab >= 0)
+                                         ? selectedGroup->ChannelTabInverseNumbering(editingChannelTab)
+                                         : (editingGroup ? selectedGroup->Options().inverseNumbering
+                                                         : selectedCard->Options().inverseNumbering);
+            inverseNumberingCheckbox_.Update(inverseNumberingBounds, inverseNumbering);
         }
     }
     else if (customPathField_.IsActive())
@@ -6542,8 +8353,47 @@ void DockArea::UpdateRightPanel(Rectangle rightPanel, Font font, bool blockByUpp
                 std::clamp(options.quality, 0, static_cast<int>(availableQualities.size()) - 1))];
             options.qualityCap = (label == "Max") ? std::string{} : label;
         }
+
+        // Multi-select: Keep / Inverse numbering apply to every selected card.
+        const bool keepChanged = options.keepNumbering != optionsBeforeEdit.keepNumbering;
+        const bool inverseChanged = options.inverseNumbering != optionsBeforeEdit.inverseNumbering;
+        if ((keepChanged || inverseChanged) && selectedCard != nullptr)
+        {
+            ForEachLinkCard(
+                [&](LinkCardNode& card)
+                {
+                    if (&card == selectedCard || !card.IsSelected() || !card.IsValid())
+                    {
+                        return;
+                    }
+                    if (card.IsDownloading() || card.IsConverting())
+                    {
+                        return;
+                    }
+
+                    const DownloadOptions before = card.Options();
+                    if (keepChanged)
+                    {
+                        card.Options().keepNumbering = options.keepNumbering;
+                    }
+                    if (inverseChanged)
+                    {
+                        card.Options().inverseNumbering = options.inverseNumbering;
+                    }
+                    PushUndo(MakeCardOptionsCommand(card.Url(), before, card.Options()));
+                });
+        }
+
         PushUndo(MakeCardOptionsCommand(cardUrl, optionsBeforeEdit, options));
         return;
+    }
+
+    // Playlist/channel tab edits: keep the same qualityCap token on the group options.
+    if (optionsBeforeEdit != options && !availableQualities.empty())
+    {
+        const std::string label = availableQualities[static_cast<size_t>(
+            std::clamp(options.quality, 0, static_cast<int>(availableQualities.size()) - 1))];
+        options.qualityCap = (label == "Max") ? std::string{} : label;
     }
 
     // Playlist/channel edits force the same settings onto every child video.
@@ -6585,50 +8435,154 @@ void DockArea::PrepareGroupsForBatchDownload()
         {
             continue;
         }
-        item.group->LoadAllPages();
+        if (item.group->UsesPlaylistShelf())
+        {
+            item.group->LoadAllPlaylistShelfPlaylists();
+            RegisterPendingPlaylistShelfDownload(*item.group, -1);
+        }
+        // Do not LoadAllPages — batch enqueue walks entries and uses ephemeral hosts for non-UI rows.
+    }
+}
+
+void DockArea::RegisterPendingPlaylistShelfDownload(const LinkCardGroupNode& group, int shelfIndex)
+{
+    if (!group.UsesPlaylistShelf() || group.Url().empty())
+    {
+        return;
+    }
+    for (const PendingPlaylistShelfDownload& pending : pendingPlaylistShelfDownloads_)
+    {
+        if (pending.groupUrl == group.Url() && pending.shelfIndex == shelfIndex)
+        {
+            return;
+        }
+    }
+    pendingPlaylistShelfDownloads_.push_back(PendingPlaylistShelfDownload{group.Url(), shelfIndex});
+}
+
+void DockArea::TryFlushPlaylistShelfDownloads()
+{
+    if (pendingPlaylistShelfDownloads_.empty())
+    {
+        return;
+    }
+
+    const auto findGroupByUrl = [&](const std::string& url) -> LinkCardGroupNode*
+    {
+        for (DownloaderListItem& item : cards_)
+        {
+            if (item.kind == DownloaderListItem::Kind::Group && item.group != nullptr && item.group->Url() == url)
+            {
+                return item.group.get();
+            }
+        }
+        return nullptr;
+    };
+
+    std::unordered_set<std::string> claimedIdentities;
+    FillBusyDownloadIdentities(claimedIdentities);
+    bool addedAny = false;
+    bool skippedDuplicate = false;
+
+    for (auto it = pendingPlaylistShelfDownloads_.begin(); it != pendingPlaylistShelfDownloads_.end();)
+    {
+        LinkCardGroupNode* group = findGroupByUrl(it->groupUrl);
+        if (group == nullptr || !group->UsesPlaylistShelf())
+        {
+            it = pendingPlaylistShelfDownloads_.erase(it);
+            continue;
+        }
+
+        bool stillWaiting = false;
+        if (!group->IsPlaylistShelfReady())
+        {
+            stillWaiting = true;
+        }
+        else if (it->shelfIndex < 0)
+        {
+            for (int shelfIndex = 0; shelfIndex < group->PlaylistShelfLoadedCount(); ++shelfIndex)
+            {
+                LinkCardGroupNode* playlist = group->PlaylistShelfPlaylist(shelfIndex);
+                if (playlist == nullptr || playlist->IsParsing())
+                {
+                    stillWaiting = true;
+                    continue;
+                }
+                if (!playlist->IsValid())
+                {
+                    continue;
+                }
+                for (int index = 0;; ++index)
+                {
+                    const LinkGroupEntry* entry = playlist->EntryAt(index);
+                    if (entry == nullptr)
+                    {
+                        break;
+                    }
+                    TryEnqueueGroupEntry(
+                        *playlist, group, *entry, index, -1, claimedIdentities, addedAny, skippedDuplicate);
+                }
+            }
+        }
+        else
+        {
+            LinkCardGroupNode* playlist = group->PlaylistShelfPlaylist(it->shelfIndex);
+            if (playlist == nullptr || playlist->IsParsing())
+            {
+                stillWaiting = true;
+            }
+            else if (playlist->IsValid())
+            {
+                for (int index = 0;; ++index)
+                {
+                    const LinkGroupEntry* entry = playlist->EntryAt(index);
+                    if (entry == nullptr)
+                    {
+                        break;
+                    }
+                    TryEnqueueGroupEntry(
+                        *playlist, group, *entry, index, -1, claimedIdentities, addedAny, skippedDuplicate);
+                }
+            }
+        }
+
+        if (!stillWaiting)
+        {
+            it = pendingPlaylistShelfDownloads_.erase(it);
+        }
+        else
+        {
+            ++it;
+        }
+    }
+
+    if (!addedAny)
+    {
+        return;
+    }
+
+    SetGroupDurationFillSuspended(true);
+    isBatchDownloading_ = true;
+    if (!AnyDownloadRunning())
+    {
+        nextDownloadStartTime_ = GetTime();
+    }
+    StartNextPendingDownload();
+}
+
+void DockArea::SetGroupDurationFillSuspended(bool suspended)
+{
+    for (DownloaderListItem& item : cards_)
+    {
+        if (item.kind == DownloaderListItem::Kind::Group && item.group != nullptr)
+        {
+            item.group->SetDurationFillSuspended(suspended);
+        }
     }
 }
 
 void DockArea::HandleDownloadRequest()
 {
-    std::vector<LinkCardNode*> selectedIdle;
-    ForEachLinkCard(
-        [&](LinkCardNode& card)
-        {
-            if (!card.IsSelected() || !card.IsValid() || card.IsDownloading() || card.IsInQueue() ||
-                card.IsConverting())
-            {
-                return;
-            }
-            card.EnsureDetailedParse();
-            selectedIdle.push_back(&card);
-        });
-
-    for (DownloaderListItem& item : cards_)
-    {
-        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr || !item.group->IsHeaderSelected())
-        {
-            continue;
-        }
-        item.group->SetExpanded(true);
-        item.group->LoadAllPages();
-
-        for (LinkCardNode& child : item.group->LoadedCards())
-        {
-            if (!child.IsValid() || child.IsDownloading() || child.IsInQueue() || child.IsConverting())
-            {
-                continue;
-            }
-            child.EnsureDetailedParse();
-            selectedIdle.push_back(&child);
-        }
-    }
-
-    if (selectedIdle.empty())
-    {
-        return;
-    }
-
     const bool appendToActiveBatch = AnyDownloadRunning() || isBatchDownloading_;
     if (!appendToActiveBatch)
     {
@@ -6640,32 +8594,145 @@ void DockArea::HandleDownloadRequest()
             {
                 card.ClearQueueState();
             });
+        ReleaseIdleDownloadHosts();
     }
 
+    std::unordered_set<std::string> claimedIdentities;
+    FillBusyDownloadIdentities(claimedIdentities);
     bool addedAny = false;
-    for (LinkCardNode* card : selectedIdle)
+    bool skippedDuplicate = false;
+
+    for (DownloaderListItem& item : cards_)
     {
-        DownloadRequest request;
-        if (!BuildDownloadRequestForCard(*card, request))
+        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr)
         {
             continue;
         }
-        pendingDownloadQueue_.push_back(std::move(request));
-        card->SetQueued();
-        addedAny = true;
+        LinkCardGroupNode& group = *item.group;
+        if (group.IsHeaderSelected())
+        {
+            if (group.UsesPlaylistShelf())
+            {
+                group.LoadAllPlaylistShelfPlaylists();
+                RegisterPendingPlaylistShelfDownload(group, -1);
+            }
+            else if (EnqueueAllEntriesForGroup(group, claimedIdentities, skippedDuplicate) > 0)
+            {
+                addedAny = true;
+            }
+            continue;
+        }
+
+        if (group.UsesPlaylistShelf())
+        {
+            const int shelfIndex = group.SelectedPlaylistShelfIndex();
+            if (shelfIndex >= 0)
+            {
+                group.EnsurePlaylistShelfItemLoaded(shelfIndex);
+                LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+                RegisterPendingPlaylistShelfDownload(group, shelfIndex);
+                if (playlist != nullptr && !playlist->IsParsing() && playlist->IsValid())
+                {
+                    for (int index = 0;; ++index)
+                    {
+                        const LinkGroupEntry* entry = playlist->EntryAt(index);
+                        if (entry == nullptr)
+                        {
+                            break;
+                        }
+                        TryEnqueueGroupEntry(
+                            *playlist, &group, *entry, index, -1, claimedIdentities, addedAny, skippedDuplicate);
+                    }
+                }
+            }
+            continue;
+        }
+
+        const int tab = group.SelectedChannelTab();
+        if (tab < 0 || group.ChannelTabEntryCount(tab) <= 0)
+        {
+            continue;
+        }
+        for (int index = 0; index < group.ChannelTabEntryCount(tab); ++index)
+        {
+            const LinkGroupEntry* entry = group.ChannelTabEntryAt(tab, index);
+            if (entry == nullptr)
+            {
+                continue;
+            }
+            TryEnqueueGroupEntry(group, nullptr, *entry, index, tab, claimedIdentities, addedAny, skippedDuplicate);
+        }
+    }
+
+    ForEachLinkCard(
+        [&](LinkCardNode& card)
+        {
+            if (!card.IsSelected() || !card.IsValid() || card.IsDownloading() || card.IsInQueue() ||
+                card.IsConverting() || IsDownloadHostCard(&card))
+            {
+                return;
+            }
+            // Skip cards that belong to a selected group header/tab — already enqueued via entries.
+            bool coveredByGroupSelection = false;
+            for (DownloaderListItem& item : cards_)
+            {
+                if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr)
+                {
+                    continue;
+                }
+                if (item.group->IsHeaderSelected() || item.group->SelectedChannelTab() >= 0 ||
+                    item.group->SelectedPlaylistShelfIndex() >= 0)
+                {
+                    if (item.group->FindLoadedCardByUrl(card.Url()) == &card)
+                    {
+                        coveredByGroupSelection = true;
+                        break;
+                    }
+                }
+            }
+            if (coveredByGroupSelection)
+            {
+                return;
+            }
+
+            DownloadRequest request;
+            if (!BuildDownloadRequestForCard(card, request))
+            {
+                return;
+            }
+            const std::string identity = DownloadRunner::MakeOutputIdentity(request);
+            if (!claimedIdentities.insert(identity).second)
+            {
+                card.TriggerPulse();
+                skippedDuplicate = true;
+                return;
+            }
+            pendingDownloadQueue_.push_back(std::move(request));
+            card.SetQueued();
+            addedAny = true;
+        });
+
+    if (skippedDuplicate)
+    {
+        ShowFooterNotification("Already downloading this file", FooterNotificationScope::Downloader);
     }
 
     if (!addedAny)
     {
+        if (!pendingPlaylistShelfDownloads_.empty())
+        {
+            SetGroupDurationFillSuspended(true);
+        }
         return;
     }
 
+    SetGroupDurationFillSuspended(true);
+    isBatchDownloading_ = true;
     if (!appendToActiveBatch)
     {
-        isBatchDownloading_ = true;
         nextDownloadStartTime_ = GetTime();
-        StartNextPendingDownload();
     }
+    StartNextPendingDownload();
 }
 
 void DockArea::HandleDownloadAllRequest()
@@ -6686,32 +8753,64 @@ void DockArea::HandleDownloadAllRequest()
             {
                 card.ClearQueueState();
             });
+        ReleaseIdleDownloadHosts();
     }
 
     bool addedAny = false;
+    bool skippedDuplicate = false;
+    std::unordered_set<std::string> claimedIdentities;
+    FillBusyDownloadIdentities(claimedIdentities);
     WriteDebugLog(appendToActiveBatch ? "Download All append clicked" : "Download All clicked");
     PrepareGroupsForBatchDownload();
 
-    ForEachLinkCard(
-        [&](LinkCardNode& card)
+    for (DownloaderListItem& item : cards_)
+    {
+        if (item.kind == DownloaderListItem::Kind::Group && item.group != nullptr && item.group->IsValid())
         {
-            if (!card.IsValid() || card.IsDownloading() || card.IsInQueue() || card.IsConverting())
+            if (EnqueueAllEntriesForGroup(*item.group, claimedIdentities, skippedDuplicate) > 0)
             {
-                return;
-            }
-
-            card.EnsureDetailedParse();
-            DownloadRequest request;
-            if (BuildDownloadRequestForCard(card, request))
-            {
-                pendingDownloadQueue_.push_back(std::move(request));
-                card.SetQueued();
                 addedAny = true;
             }
-        });
+            continue;
+        }
+        if (item.kind != DownloaderListItem::Kind::Single || item.single == nullptr)
+        {
+            continue;
+        }
+        LinkCardNode& card = *item.single;
+        if (!card.IsValid() || card.IsDownloading() || card.IsInQueue() || card.IsConverting())
+        {
+            continue;
+        }
+        DownloadRequest request;
+        if (!BuildDownloadRequestForCard(card, request))
+        {
+            continue;
+        }
+        const std::string identity = DownloadRunner::MakeOutputIdentity(request);
+        if (!claimedIdentities.insert(identity).second)
+        {
+            card.TriggerPulse();
+            skippedDuplicate = true;
+            continue;
+        }
+        pendingDownloadQueue_.push_back(std::move(request));
+        card.SetQueued();
+        addedAny = true;
+    }
+
+    if (skippedDuplicate)
+    {
+        ShowFooterNotification("Already downloading this file", FooterNotificationScope::Downloader);
+    }
 
     if (!addedAny)
     {
+        if (!pendingPlaylistShelfDownloads_.empty())
+        {
+            SetGroupDurationFillSuspended(true);
+            return;
+        }
         if (!AnyDownloadRunning())
         {
             ShowFooterNotification("No videos to download.", FooterNotificationScope::Downloader);
@@ -6719,20 +8818,18 @@ void DockArea::HandleDownloadAllRequest()
         return;
     }
 
+    SetGroupDurationFillSuspended(true);
+    isBatchDownloading_ = true;
     if (!appendToActiveBatch)
     {
-        isBatchDownloading_ = true;
         nextDownloadStartTime_ = GetTime();
         WriteDebugLog("batch start count=" + std::to_string(pendingDownloadQueue_.size()));
-        StartNextPendingDownload();
     }
     else
     {
-        isBatchDownloading_ = true;
         WriteDebugLog("batch append count=" + std::to_string(pendingDownloadQueue_.size()));
-        StartNextPendingDownload();
     }
-
+    StartNextPendingDownload();
     PushUndo(MakeDownloadAllCommand());
 }
 
@@ -6798,19 +8895,52 @@ bool DockArea::CanDownloadSelected() const
     }
     for (const DownloaderListItem& item : cards_)
     {
-        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr || !item.group->IsHeaderSelected() ||
-            !item.group->IsValid())
+        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr || !item.group->IsValid())
         {
             continue;
         }
-        for (const LinkCardNode& child : item.group->LoadedCards())
+        const LinkCardGroupNode& group = *item.group;
+        if (group.IsHeaderSelected())
         {
-            if (child.IsValid() && !child.IsDownloading() && !child.IsInQueue() && !child.IsConverting())
+            if (group.UsesChannelTabs())
+            {
+                for (int tab = 0; tab < kChannelTabCount; ++tab)
+                {
+                    if (group.ChannelTabEntryCount(tab) > 0)
+                    {
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if (group.UsesPlaylistShelf())
+            {
+                if (group.EntryCount() > 0)
+                {
+                    return true;
+                }
+                continue;
+            }
+            bool hasIdle = false;
+            group.ForEachLoadedCard(
+                [&](const LinkCardNode& child)
+                {
+                    if (child.IsValid() && !child.IsDownloading() && !child.IsInQueue() && !child.IsConverting())
+                    {
+                        hasIdle = true;
+                    }
+                });
+            if (hasIdle || group.EntryCount() > group.LoadedChildCount())
             {
                 return true;
             }
         }
-        if (item.group->EntryCount() > item.group->LoadedChildCount())
+        if (group.UsesPlaylistShelf() && group.SelectedPlaylistShelfIndex() >= 0)
+        {
+            return true;
+        }
+        const int tab = group.SelectedChannelTab();
+        if (tab >= 0 && group.ChannelTabEntryCount(tab) > 0)
         {
             return true;
         }
@@ -6890,6 +9020,7 @@ void DockArea::HandleCancelAllDownloadsRequest()
     pendingDownloadQueue_.clear();
     isBatchDownloading_ = false;
     overwriteAllExisting_ = false;
+    SetGroupDurationFillSuspended(false);
 
     ForEachLinkCard(
         [&](LinkCardNode& card)
@@ -6908,6 +9039,25 @@ void DockArea::HandleCancelAllDownloadsRequest()
 
     CancelAllDownloads();
     CancelAllDownloadAutoConverts();
+    ClearDownloadHostCards();
+    for (DownloaderListItem& item : cards_)
+    {
+        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr)
+        {
+            continue;
+        }
+        item.group->ClearDownloadBatch();
+        if (item.group->UsesPlaylistShelf())
+        {
+            for (int shelfIndex = 0; shelfIndex < item.group->PlaylistShelfLoadedCount(); ++shelfIndex)
+            {
+                if (LinkCardGroupNode* playlist = item.group->PlaylistShelfPlaylist(shelfIndex))
+                {
+                    playlist->ClearDownloadBatch();
+                }
+            }
+        }
+    }
 
     if (hadWork)
     {
@@ -6949,8 +9099,16 @@ void DockArea::RemoveFromDownloadQueue(const std::string& url)
 
 void DockArea::PrioritizeDownload(const std::string& url)
 {
-    LinkCardNode* card = FindLinkCardByUrl(url);
-    if (card == nullptr || !card->IsInQueue())
+    LinkCardNode* card = nullptr;
+    ForEachLinkCard(
+        [&](LinkCardNode& candidate)
+        {
+            if (card == nullptr && candidate.HasUrl(url) && candidate.IsInQueue())
+            {
+                card = &candidate;
+            }
+        });
+    if (card == nullptr)
     {
         return;
     }
@@ -7063,10 +9221,583 @@ void DockArea::ClearBatchQueueStates()
         {
             card.ClearQueueState();
         });
+    // Keep group batchExpected/completed so the header can show "N/N finished · took …".
+    SetGroupDurationFillSuspended(false);
+    ReleaseIdleDownloadHosts();
+}
+
+bool DockArea::IsDownloadHostCard(const LinkCardNode* card) const
+{
+    if (card == nullptr)
+    {
+        return false;
+    }
+    for (const DownloadHostCard& host : downloadHostCards_)
+    {
+        if (host.card.get() == card)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+void DockArea::MaybeReleaseDownloadHost(LinkCardNode* card)
+{
+    if (card == nullptr || !IsDownloadHostCard(card))
+    {
+        return;
+    }
+    if (card->IsDownloading() || card->IsInQueue() || card->IsConverting() || card->HasAutoConvertDelivery())
+    {
+        return;
+    }
+    downloadHostCards_.erase(std::remove_if(downloadHostCards_.begin(),
+                                            downloadHostCards_.end(),
+                                            [card](const DownloadHostCard& host)
+                                            {
+                                                return host.card.get() == card;
+                                            }),
+                             downloadHostCards_.end());
+}
+
+void DockArea::ReleaseIdleDownloadHosts()
+{
+    downloadHostCards_.erase(std::remove_if(downloadHostCards_.begin(),
+                                            downloadHostCards_.end(),
+                                            [](const DownloadHostCard& host)
+                                            {
+                                                if (host.card == nullptr)
+                                                {
+                                                    return true;
+                                                }
+                                                return !host.card->IsDownloading() && !host.card->IsInQueue() &&
+                                                       !host.card->IsConverting() &&
+                                                       !host.card->HasAutoConvertDelivery();
+                                            }),
+                             downloadHostCards_.end());
+}
+
+void DockArea::ClearDownloadHostCards()
+{
+    downloadHostCards_.clear();
+}
+
+void DockArea::SyncGroupLoadedCompletionsFromDisk(LinkCardGroupNode& group, LinkCardGroupNode* shelfParent)
+{
+    auto tryHydrate = [&](LinkCardNode& card, const LinkGroupEntry& entry, int entryIndex, int channelTab)
+    {
+        if (card.HasCompletedDownload() || entry.url.empty())
+        {
+            return;
+        }
+        DownloadRequest request;
+        if (!BuildDownloadRequestForGroupEntry(group, shelfParent, entry, entryIndex, channelTab, request))
+        {
+            return;
+        }
+        std::string title =
+            !request.originalNormalizedTitle.empty() ? request.originalNormalizedTitle : request.normalizedTitle;
+        constexpr char kSuffix[] = "_downloaded";
+        constexpr size_t kSuffixLen = sizeof(kSuffix) - 1;
+        if (title.size() > kSuffixLen && title.compare(title.size() - kSuffixLen, kSuffixLen, kSuffix) == 0)
+        {
+            title.erase(title.size() - kSuffixLen);
+        }
+        const std::filesystem::path searchDir = std::filesystem::u8path(
+            !request.finalOutputDirectory.empty() ? request.finalOutputDirectory : request.outputDirectory);
+        std::filesystem::path found = FindExistingOutputFile(searchDir, title, request.fileFormat);
+        if (found.empty())
+        {
+            found = FindExistingOutputFile(searchDir, title, {});
+        }
+        if (found.empty())
+        {
+            return;
+        }
+        const std::string foundPath = PathUtf8(found);
+        // Path-only: checkmark without inventing a "took 0:00" elapsed.
+        card.SetLastDownloadedPath(foundPath);
+        group.CaptureCardCompletion(card);
+    };
+
+    if (group.UsesChannelTabs())
+    {
+        for (int tab = 0; tab < kChannelTabCount; ++tab)
+        {
+            std::vector<LinkCardNode>& loaded = group.ChannelTabLoadedCards(tab);
+            for (size_t i = 0; i < loaded.size(); ++i)
+            {
+                const LinkGroupEntry* entry = group.ChannelTabEntryAt(tab, static_cast<int>(i));
+                if (entry != nullptr)
+                {
+                    tryHydrate(loaded[i], *entry, static_cast<int>(i), tab);
+                }
+            }
+        }
+        return;
+    }
+
+    std::vector<LinkCardNode>& loaded = group.LoadedCards();
+    for (size_t i = 0; i < loaded.size(); ++i)
+    {
+        const LinkGroupEntry* entry = group.EntryAt(static_cast<int>(i));
+        if (entry != nullptr)
+        {
+            tryHydrate(loaded[i], *entry, static_cast<int>(i), -1);
+        }
+    }
+}
+
+void DockArea::RemoveDownloadHostsMatchingUrls(const std::unordered_set<std::string>& urls)
+{
+    if (urls.empty())
+    {
+        return;
+    }
+    downloadHostCards_.erase(std::remove_if(downloadHostCards_.begin(),
+                                            downloadHostCards_.end(),
+                                            [&](const DownloadHostCard& host)
+                                            {
+                                                return host.card != nullptr && urls.count(host.card->Url()) > 0;
+                                            }),
+                             downloadHostCards_.end());
+}
+
+bool DockArea::FindGroupEntryByUrl(const std::string& url, GroupEntryRef& out)
+{
+    out = {};
+    for (DownloaderListItem& item : cards_)
+    {
+        if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr)
+        {
+            continue;
+        }
+        LinkCardGroupNode& group = *item.group;
+        if (group.UsesChannelTabs())
+        {
+            for (int tab = 0; tab < kChannelTabCount; ++tab)
+            {
+                for (int index = 0; index < group.ChannelTabEntryCount(tab); ++index)
+                {
+                    const LinkGroupEntry* entry = group.ChannelTabEntryAt(tab, index);
+                    if (entry == nullptr || entry->url != url)
+                    {
+                        continue;
+                    }
+                    out.ownerGroup = &group;
+                    out.shelfParent = nullptr;
+                    out.entry = *entry;
+                    out.entryIndex = index;
+                    out.channelTab = tab;
+                    return true;
+                }
+            }
+            continue;
+        }
+        if (group.UsesPlaylistShelf())
+        {
+            for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+            {
+                LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+                if (playlist == nullptr)
+                {
+                    continue;
+                }
+                for (int entryIndex = 0;; ++entryIndex)
+                {
+                    const LinkGroupEntry* entry = playlist->EntryAt(entryIndex);
+                    if (entry == nullptr)
+                    {
+                        break;
+                    }
+                    if (entry->url != url)
+                    {
+                        continue;
+                    }
+                    out.ownerGroup = playlist;
+                    out.shelfParent = &group;
+                    out.entry = *entry;
+                    out.entryIndex = entryIndex;
+                    out.channelTab = -1;
+                    return true;
+                }
+            }
+            continue;
+        }
+        for (int index = 0;; ++index)
+        {
+            const LinkGroupEntry* entry = group.EntryAt(index);
+            if (entry == nullptr)
+            {
+                break;
+            }
+            if (entry->url != url)
+            {
+                continue;
+            }
+            out.ownerGroup = &group;
+            out.shelfParent = nullptr;
+            out.entry = *entry;
+            out.entryIndex = index;
+            out.channelTab = -1;
+            return true;
+        }
+    }
+    return false;
+}
+
+bool DockArea::BuildDownloadRequestForGroupEntry(LinkCardGroupNode& ownerGroup,
+                                                 LinkCardGroupNode* shelfParent,
+                                                 const LinkGroupEntry& entry,
+                                                 int entryIndex,
+                                                 int channelTab,
+                                                 DownloadRequest& request)
+{
+    if (entry.url.empty())
+    {
+        return false;
+    }
+
+    const DownloadOptions& options = ownerGroup.Options();
+    std::string qualityCap = GroupQualityCapFromOptions(options);
+    if (qualityCap == "Max")
+    {
+        qualityCap.clear();
+    }
+
+    std::string selectedQuality = qualityCap;
+    std::vector<std::string> availableFormats;
+    availableFormats.push_back(options.mediaMode == 2 ? "M4A" : "MP4");
+    availableFormats = BuildFormatItemsForQuality(availableFormats, {}, selectedQuality, options.mediaMode);
+
+    const std::vector<std::string> mediaModes = {"Both", "Video only", "Audio only"};
+    int formatIndex = std::clamp(options.fileFormat, 0, static_cast<int>(availableFormats.size()) - 1);
+    if (availableFormats.empty() || Dropdown::IsInactiveItem(availableFormats[formatIndex]))
+    {
+        formatIndex = FirstActiveFormatIndex(availableFormats);
+    }
+    const int mediaIndex = std::clamp(options.mediaMode, 0, static_cast<int>(mediaModes.size()) - 1);
+
+    request.url = entry.url;
+    request.title = entry.title.empty() ? entry.url : entry.title;
+    request.normalizedTitle = NormalizeVideoTitle(request.title);
+
+    const bool keepNumbering = options.keepNumbering ||
+                               (channelTab >= 0 && ownerGroup.ChannelTabKeepNumbering(channelTab)) ||
+                               (shelfParent != nullptr && shelfParent->Options().keepNumbering);
+    if (keepNumbering)
+    {
+        const bool inverseNumbering = options.inverseNumbering ||
+                                      (channelTab >= 0 && ownerGroup.ChannelTabInverseNumbering(channelTab)) ||
+                                      (shelfParent != nullptr && shelfParent->Options().inverseNumbering);
+        const bool playlistOrder = channelTab < 0;
+        const int total = channelTab >= 0 ? ownerGroup.ChannelTabEntryCount(channelTab) : ownerGroup.EntryCount();
+        const int displayIndex = GroupChildDisplayIndex(entryIndex, total, inverseNumbering, playlistOrder);
+        if (displayIndex > 0)
+        {
+            request.normalizedTitle = std::to_string(displayIndex) + ". " + request.normalizedTitle;
+        }
+    }
+
+    const std::string baseOutputDirectory =
+        options.useCustomPath && !options.customPath.empty() ? options.customPath : globalDownloadPath_;
+    std::filesystem::path resolvedUserPath = std::filesystem::u8path(baseOutputDirectory);
+    if (channelTab >= 0)
+    {
+        std::string channelFolder = NormalizeVideoTitle(ownerGroup.Title());
+        if (channelFolder.empty())
+        {
+            channelFolder = "Channel";
+        }
+        const char* category = "Videos";
+        if (channelTab == static_cast<int>(ChannelContentTab::Shorts))
+        {
+            category = "Shorts";
+        }
+        else if (channelTab == static_cast<int>(ChannelContentTab::Lives))
+        {
+            category = "Lives";
+        }
+        resolvedUserPath /= std::filesystem::u8path(channelFolder);
+        resolvedUserPath /= category;
+    }
+    else if (shelfParent != nullptr)
+    {
+        std::string channelFolder = NormalizeVideoTitle(shelfParent->Title());
+        if (channelFolder.empty())
+        {
+            channelFolder = "Channel";
+        }
+        std::string playlistFolder = NormalizeVideoTitle(ownerGroup.Title());
+        if (playlistFolder.empty())
+        {
+            playlistFolder = "Playlist";
+        }
+        resolvedUserPath /= std::filesystem::u8path(channelFolder);
+        resolvedUserPath /= std::filesystem::u8path(playlistFolder);
+    }
+    else
+    {
+        std::string playlistFolder = NormalizeVideoTitle(ownerGroup.Title());
+        if (playlistFolder.empty())
+        {
+            playlistFolder = "Playlist";
+        }
+        resolvedUserPath /= std::filesystem::u8path(playlistFolder);
+    }
+
+    const std::string userOutputDirectory = PathUtf8(resolvedUserPath);
+    request.originalNormalizedTitle = request.normalizedTitle;
+    request.finalOutputDirectory.clear();
+    request.autoConvertActive = false;
+
+    // Ephemeral hosts use default custom auto-convert (global settings apply).
+    LinkCardNode probeCard(BuildPartialLinkInfoFromEntry(entry));
+    probeCard.Options() = options;
+    const AutoConvertOptions resolvedAutoConvert = ResolveAutoConvertOptionsForCard(probeCard);
+    if (resolvedAutoConvert.IsActive())
+    {
+        request.outputDirectory = GetAutoConvertStagingPath();
+        request.normalizedTitle += "_downloaded";
+        request.finalOutputDirectory = userOutputDirectory;
+        request.autoConvertActive = true;
+    }
+    else
+    {
+        request.outputDirectory = userOutputDirectory;
+    }
+    request.fileFormat = availableFormats.empty() ? (options.mediaMode == 2 ? "M4A" : "MP4")
+                                                  : StripFormatItemLabel(availableFormats[formatIndex]);
+    request.mediaMode = mediaModes[mediaIndex];
+    request.quality = selectedQuality;
+    request.estimatedBytes = EstimateDownloadBytes({}, request.fileFormat, request.mediaMode, request.quality);
+    request.singleMainPartDiskProgress =
+        PredictSingleMainPartDiskProgress({}, request.fileFormat, request.mediaMode, request.quality);
+    return true;
+}
+
+bool DockArea::TryEnqueueGroupEntry(LinkCardGroupNode& ownerGroup,
+                                    LinkCardGroupNode* shelfParent,
+                                    const LinkGroupEntry& entry,
+                                    int entryIndex,
+                                    int channelTab,
+                                    std::unordered_set<std::string>& claimedIdentities,
+                                    bool& addedAny,
+                                    bool& skippedDuplicate)
+{
+    if (entry.url.empty())
+    {
+        return false;
+    }
+
+    LinkCardNode* uiCard = ownerGroup.FindLoadedCardByUrl(entry.url);
+    if (uiCard != nullptr &&
+        (uiCard->IsDownloading() || uiCard->IsInQueue() || uiCard->IsConverting() || !uiCard->IsValid()))
+    {
+        return false;
+    }
+    if (uiCard == nullptr)
+    {
+        for (const DownloadHostCard& host : downloadHostCards_)
+        {
+            if (host.card != nullptr && host.card->HasUrl(entry.url) &&
+                (host.card->IsDownloading() || host.card->IsInQueue() || host.card->IsConverting()))
+            {
+                return false;
+            }
+        }
+    }
+
+    DownloadRequest request;
+    if (uiCard != nullptr)
+    {
+        if (!BuildDownloadRequestForCard(*uiCard, request))
+        {
+            return false;
+        }
+    }
+    else if (!BuildDownloadRequestForGroupEntry(ownerGroup, shelfParent, entry, entryIndex, channelTab, request))
+    {
+        return false;
+    }
+
+    const std::string identity = DownloadRunner::MakeOutputIdentity(request);
+    if (!claimedIdentities.insert(identity).second)
+    {
+        if (uiCard != nullptr)
+        {
+            uiCard->TriggerPulse();
+        }
+        skippedDuplicate = true;
+        return false;
+    }
+
+    pendingDownloadQueue_.push_back(std::move(request));
+    if (uiCard != nullptr)
+    {
+        uiCard->SetQueued();
+    }
+    ownerGroup.RegisterBatchDownload(entry.url);
+    addedAny = true;
+    return true;
+}
+
+int DockArea::EnqueueAllEntriesForGroup(LinkCardGroupNode& group,
+                                        std::unordered_set<std::string>& claimedIdentities,
+                                        bool& skippedDuplicate)
+{
+    int added = 0;
+    bool addedAny = false;
+    if (group.UsesChannelTabs())
+    {
+        for (int tab = 0; tab < kChannelTabCount; ++tab)
+        {
+            for (int index = 0; index < group.ChannelTabEntryCount(tab); ++index)
+            {
+                const LinkGroupEntry* entry = group.ChannelTabEntryAt(tab, index);
+                if (entry == nullptr)
+                {
+                    continue;
+                }
+                if (TryEnqueueGroupEntry(
+                        group, nullptr, *entry, index, tab, claimedIdentities, addedAny, skippedDuplicate))
+                {
+                    ++added;
+                }
+            }
+        }
+        return added;
+    }
+    if (group.UsesPlaylistShelf())
+    {
+        for (int shelfIndex = 0; shelfIndex < group.PlaylistShelfLoadedCount(); ++shelfIndex)
+        {
+            LinkCardGroupNode* playlist = group.PlaylistShelfPlaylist(shelfIndex);
+            if (playlist == nullptr || playlist->IsParsing() || !playlist->IsValid())
+            {
+                continue;
+            }
+            for (int index = 0;; ++index)
+            {
+                const LinkGroupEntry* entry = playlist->EntryAt(index);
+                if (entry == nullptr)
+                {
+                    break;
+                }
+                if (TryEnqueueGroupEntry(
+                        *playlist, &group, *entry, index, -1, claimedIdentities, addedAny, skippedDuplicate))
+                {
+                    ++added;
+                }
+            }
+        }
+        return added;
+    }
+
+    for (int index = 0;; ++index)
+    {
+        const LinkGroupEntry* entry = group.EntryAt(index);
+        if (entry == nullptr)
+        {
+            break;
+        }
+        if (TryEnqueueGroupEntry(group, nullptr, *entry, index, -1, claimedIdentities, addedAny, skippedDuplicate))
+        {
+            ++added;
+        }
+    }
+    return added;
+}
+
+LinkCardNode* DockArea::EnsureDownloadHostForRequest(const DownloadRequest& request)
+{
+    for (DownloadHostCard& host : downloadHostCards_)
+    {
+        if (host.card != nullptr && host.card->HasUrl(request.url))
+        {
+            return host.card.get();
+        }
+    }
+
+    GroupEntryRef ref;
+    if (!FindGroupEntryByUrl(request.url, ref) || ref.ownerGroup == nullptr)
+    {
+        return nullptr;
+    }
+
+    DownloadHostCard host;
+    host.ownerGroupUrl = ref.ownerGroup->Url();
+    host.shelfParentUrl = ref.shelfParent != nullptr ? ref.shelfParent->Url() : std::string{};
+    host.channelTab = ref.channelTab;
+    host.entryIndex = ref.entryIndex;
+    host.card = std::make_unique<LinkCardNode>(BuildPartialLinkInfoFromEntry(ref.entry));
+    host.card->Options() = ref.ownerGroup->Options();
+    LinkCardNode* card = host.card.get();
+    downloadHostCards_.push_back(std::move(host));
+    return card;
 }
 
 bool DockArea::BuildDownloadRequestForCard(LinkCardNode& card, DownloadRequest& request)
 {
+    for (DownloadHostCard& host : downloadHostCards_)
+    {
+        if (host.card.get() != &card)
+        {
+            continue;
+        }
+        GroupEntryRef ref;
+        if (!FindGroupEntryByUrl(card.Url(), ref) || ref.ownerGroup == nullptr)
+        {
+            // Fall back to reconstructing from stored host metadata when group still exists by URL.
+            for (DownloaderListItem& item : cards_)
+            {
+                if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr)
+                {
+                    continue;
+                }
+                if (item.group->Url() == host.ownerGroupUrl)
+                {
+                    ref.ownerGroup = item.group.get();
+                    ref.channelTab = host.channelTab;
+                    ref.entryIndex = host.entryIndex;
+                    break;
+                }
+                if (item.group->UsesPlaylistShelf())
+                {
+                    for (int shelfIndex = 0; shelfIndex < item.group->PlaylistShelfLoadedCount(); ++shelfIndex)
+                    {
+                        LinkCardGroupNode* playlist = item.group->PlaylistShelfPlaylist(shelfIndex);
+                        if (playlist != nullptr && playlist->Url() == host.ownerGroupUrl)
+                        {
+                            ref.ownerGroup = playlist;
+                            ref.shelfParent = item.group.get();
+                            ref.channelTab = -1;
+                            ref.entryIndex = host.entryIndex;
+                            break;
+                        }
+                    }
+                }
+                if (ref.ownerGroup != nullptr)
+                {
+                    break;
+                }
+            }
+            if (ref.ownerGroup == nullptr)
+            {
+                return false;
+            }
+            LinkGroupEntry entry;
+            entry.url = card.Url();
+            entry.title = card.Title();
+            entry.thumbnailPath = card.Info().thumbnailPath;
+            entry.duration = card.Info().duration;
+            ref.entry = entry;
+        }
+        return BuildDownloadRequestForGroupEntry(
+            *ref.ownerGroup, ref.shelfParent, ref.entry, ref.entryIndex, ref.channelTab, request);
+    }
+
     const DownloadOptions& options = card.Options();
     std::vector<std::string> availableQualities = card.AvailableQualities();
     const int qualityIndex = availableQualities.empty()
@@ -7084,14 +9815,14 @@ bool DockArea::BuildDownloadRequestForCard(LinkCardNode& card, DownloadRequest& 
                 continue;
             }
             bool belongs = false;
-            for (const LinkCardNode& child : item.group->LoadedCards())
-            {
-                if (&child == &card)
+            item.group->ForEachLoadedCard(
+                [&](const LinkCardNode& child)
                 {
-                    belongs = true;
-                    break;
-                }
-            }
+                    if (&child == &card)
+                    {
+                        belongs = true;
+                    }
+                });
             if (!belongs)
             {
                 continue;
@@ -7171,8 +9902,9 @@ bool DockArea::BuildDownloadRequestForCard(LinkCardNode& card, DownloadRequest& 
     {
         request.normalizedTitle = NormalizeVideoTitle(request.title);
     }
-    if (keepDownloadIndices_)
+    if (ResolveKeepDownloadNumbering(cards_, card))
     {
+        const bool inverseNumbering = ResolveInverseDownloadNumbering(cards_, card);
         int displayIndex = 0;
         bool found = false;
         for (const DownloaderListItem& item : cards_)
@@ -7193,16 +9925,69 @@ bool DockArea::BuildDownloadRequestForCard(LinkCardNode& card, DownloadRequest& 
                 continue;
             }
 
-            // Playlist/channel children use a local 1-based index inside their group.
-            int localIndex = 0;
-            for (const LinkCardNode& child : item.group->LoadedCards())
+            // Filename index: channels default N…1; playlists default 1…N (Inverse flips each).
+            if (item.group->UsesChannelTabs())
             {
-                ++localIndex;
-                if (&child == &card)
+                for (int tab = 0; tab < kChannelTabCount; ++tab)
                 {
-                    displayIndex = localIndex;
-                    found = true;
-                    break;
+                    int localIndex = 0;
+                    for (const LinkCardNode& child : item.group->ChannelTabLoadedCards(tab))
+                    {
+                        if (&child == &card)
+                        {
+                            displayIndex = GroupChildDisplayIndex(
+                                localIndex, item.group->ChannelTabEntryCount(tab), inverseNumbering);
+                            found = true;
+                            break;
+                        }
+                        ++localIndex;
+                    }
+                    if (found)
+                    {
+                        break;
+                    }
+                }
+            }
+            else if (item.group->UsesPlaylistShelf())
+            {
+                for (int shelfIndex = 0; shelfIndex < item.group->PlaylistShelfLoadedCount(); ++shelfIndex)
+                {
+                    const LinkCardGroupNode* playlist = item.group->PlaylistShelfPlaylist(shelfIndex);
+                    if (playlist == nullptr)
+                    {
+                        continue;
+                    }
+                    int localIndex = 0;
+                    for (const LinkCardNode& child : playlist->LoadedCards())
+                    {
+                        if (&child == &card)
+                        {
+                            displayIndex =
+                                GroupChildDisplayIndex(localIndex, playlist->EntryCount(), inverseNumbering, true);
+                            found = true;
+                            break;
+                        }
+                        ++localIndex;
+                    }
+                    if (found)
+                    {
+                        break;
+                    }
+                }
+            }
+            else
+            {
+                int localIndex = 0;
+                for (const LinkCardNode& child : item.group->LoadedCards())
+                {
+                    if (&child == &card)
+                    {
+                        displayIndex =
+                            GroupChildDisplayIndex(localIndex, item.group->EntryCount(), inverseNumbering, true);
+                        found = true;
+                        break;
+                    }
+                    ++localIndex;
                 }
             }
             if (found)
@@ -7215,8 +10000,14 @@ bool DockArea::BuildDownloadRequestForCard(LinkCardNode& card, DownloadRequest& 
             request.normalizedTitle = std::to_string(displayIndex) + ". " + request.normalizedTitle;
         }
     }
-    const std::string userOutputDirectory =
+    const std::string baseOutputDirectory =
         options.useCustomPath && !options.customPath.empty() ? options.customPath : globalDownloadPath_;
+    std::filesystem::path resolvedUserPath = std::filesystem::u8path(baseOutputDirectory);
+    if (!AppendChannelCategoryOutputSubdirs(cards_, card, resolvedUserPath))
+    {
+        AppendPlaylistOutputSubdir(cards_, card, resolvedUserPath);
+    }
+    const std::string userOutputDirectory = PathUtf8(resolvedUserPath);
     request.originalNormalizedTitle = request.normalizedTitle;
     request.finalOutputDirectory.clear();
     request.autoConvertActive = false;
@@ -7237,7 +10028,27 @@ bool DockArea::BuildDownloadRequestForCard(LinkCardNode& card, DownloadRequest& 
                                                   : StripFormatItemLabel(availableFormats[formatIndex]);
     request.mediaMode = mediaModes[mediaIndex];
     request.quality = selectedQuality;
+    request.estimatedBytes =
+        EstimateDownloadBytes(card.FormatStreams(), request.fileFormat, request.mediaMode, request.quality);
+    request.singleMainPartDiskProgress =
+        PredictSingleMainPartDiskProgress(card.FormatStreams(), request.fileFormat, request.mediaMode, request.quality);
     return true;
+}
+
+void DockArea::FillBusyDownloadIdentities(std::unordered_set<std::string>& claimed) const
+{
+    for (const DownloadRequest& request : pendingDownloadQueue_)
+    {
+        claimed.insert(DownloadRunner::MakeOutputIdentity(request));
+    }
+    for (const DownloadRunner& runner : downloadRunners_)
+    {
+        if (!runner.IsRunning() || runner.OutputIdentity().empty())
+        {
+            continue;
+        }
+        claimed.insert(runner.OutputIdentity());
+    }
 }
 
 bool DockArea::PrepareDownloadRequest(DownloadRequest& request)
@@ -7303,7 +10114,11 @@ bool DockArea::PrepareDownloadRequest(DownloadRequest& request)
                     return false;
                 }
 
-                LinkCardNode* card = FindLinkCardByUrl(request.url);
+                LinkCardNode* card = FindQueuedLinkCardForRequest(request);
+                if (card == nullptr)
+                {
+                    card = FindLinkCardByUrl(request.url);
+                }
                 const AutoConvertOptions convertOptions =
                     card != nullptr ? (card->HasAutoConvertSnapshot() ? card->AutoConvertSnapshot()
                                                                       : ResolveAutoConvertOptionsForCard(*card))
@@ -7349,6 +10164,9 @@ bool DockArea::PrepareDownloadRequest(DownloadRequest& request)
                 FindExistingOutputFile(outputPath, request.normalizedTitle, request.fileFormat);
             if (!existingFile.empty())
             {
+                // Do not run ffprobe here — ProbeMediaFileAudio blocks the UI thread and delays the
+                // "Replace this file?" modal. Incomplete Both leftovers without audio still get a
+                // Replace prompt (or are fixed post-download by BothOutputMissingAudio).
                 if (overwriteAllExisting_)
                 {
                     request.overwriteExisting = true;
@@ -7398,9 +10216,27 @@ bool DockArea::StartNextPendingDownload()
         pendingDownloadQueue_.erase(pendingDownloadQueue_.begin());
         const bool overwriteExisting = queued.overwriteExisting;
 
+        LinkCardNode* card = FindQueuedLinkCardForRequest(queued);
+        if (card == nullptr)
+        {
+            card = FindLinkCardByUrl(queued.url);
+            if (card == nullptr)
+            {
+                card = EnsureDownloadHostForRequest(queued);
+            }
+            if (card != nullptr && !card->IsInQueue() && !card->IsDownloading())
+            {
+                card->SetQueued();
+            }
+        }
+        if (card == nullptr)
+        {
+            WriteDebugLog("prepare failed, no queued card: " + queued.url);
+            continue;
+        }
+
         DownloadRequest request;
-        LinkCardNode* card = FindLinkCardByUrl(queued.url);
-        if (card == nullptr || !BuildDownloadRequestForCard(*card, request))
+        if (!BuildDownloadRequestForCard(*card, request))
         {
             WriteDebugLog("prepare failed, skipping: " + queued.url);
             continue;
@@ -7420,7 +10256,7 @@ bool DockArea::StartNextPendingDownload()
         }
 
         WriteDebugLog("start download: " + request.url);
-        StartDownload(std::move(request));
+        StartDownload(std::move(request), card);
         startedAny = true;
     }
 
@@ -7439,7 +10275,7 @@ bool DockArea::StartNextPendingDownload()
     return startedAny;
 }
 
-void DockArea::StartDownload(DownloadRequest request)
+void DockArea::StartDownload(DownloadRequest request, LinkCardNode* targetCard)
 {
     DownloadRunner* runner = FirstFreeDownloadRunner();
     if (runner == nullptr)
@@ -7450,47 +10286,48 @@ void DockArea::StartDownload(DownloadRequest request)
 
     ClearFooterNotification();
 
-    const std::string url = request.url;
-    const std::string outputDirectory = request.outputDirectory;
-    const std::string fileFormat = request.fileFormat;
-    const std::string normalizedTitle = request.normalizedTitle;
-    ForEachLinkCard(
-        [&](LinkCardNode& card)
+    LinkCardNode* card = targetCard;
+    if (card == nullptr || !card->HasUrl(request.url))
+    {
+        card = FindQueuedLinkCardForRequest(request);
+    }
+    if (card == nullptr)
+    {
+        card = FindLinkCardByUrl(request.url);
+    }
+
+    if (card != nullptr)
+    {
+        card->SetExpectedDownloadOutput(request.outputDirectory, request.fileFormat, request.normalizedTitle);
+        if (request.autoConvertActive)
         {
-            if (card.HasUrl(url))
-            {
-                card.SetExpectedDownloadOutput(outputDirectory, fileFormat, normalizedTitle);
-                if (request.autoConvertActive)
-                {
-                    card.SetAutoConvertSnapshot(ResolveAutoConvertOptionsForCard(card));
-                    card.SetAutoConvertDelivery(request.finalOutputDirectory, request.originalNormalizedTitle);
-                }
-                else
-                {
-                    card.ClearAutoConvertSnapshot();
-                    card.ClearAutoConvertDelivery();
-                }
-                card.SetDownloading();
-                return;
-            }
-        });
+            card->SetAutoConvertSnapshot(ResolveAutoConvertOptionsForCard(*card));
+            card->SetAutoConvertDelivery(request.finalOutputDirectory, request.originalNormalizedTitle);
+        }
+        else
+        {
+            card->ClearAutoConvertSnapshot();
+            card->ClearAutoConvertDelivery();
+        }
+        card->SetDownloading();
+    }
 
     try
     {
+        if (!downloadSpeedHistory_.IsRecording())
+        {
+            downloadSpeedHistory_.BeginSession(request);
+        }
         runner->Start(std::move(request));
     }
     catch (...)
     {
-        ForEachLinkCard(
-            [&](LinkCardNode& card)
-            {
-                if (card.HasUrl(url))
-                {
-                    card.ClearDownloading();
-                    card.ClearAutoConvertSnapshot();
-                    card.ClearAutoConvertDelivery();
-                }
-            });
+        if (card != nullptr)
+        {
+            card->ClearDownloading();
+            card->ClearAutoConvertSnapshot();
+            card->ClearAutoConvertDelivery();
+        }
         ShowFooterNotification("Download failed: could not start download.",
                                FooterNotificationScope::Downloader,
                                "Download failed: could not start download.");
@@ -8314,7 +11151,8 @@ void DockArea::UpdateOverwritePrompt(int windowWidth, int windowHeight)
                 overwriteAllExisting_ = true;
             }
             pendingOverwriteRequest_.overwriteExisting = true;
-            StartDownload(std::move(pendingOverwriteRequest_));
+            LinkCardNode* overwriteCard = FindQueuedLinkCardForRequest(pendingOverwriteRequest_);
+            StartDownload(std::move(pendingOverwriteRequest_), overwriteCard);
             pendingOverwriteRequest_ = {};
             pendingOverwriteFileName_.clear();
             isOverwritePromptOpen_ = false;
@@ -8683,12 +11521,75 @@ void DockArea::DrawRightPanel(Rectangle rightPanel, Font font) const
     }
     const LinkCardGroupNode* selectedGroup = GetSelectedGroupHeader();
     bool drawingGroup = false;
-    if (selectedCard == nullptr && selectedGroup != nullptr && selectedGroup->IsValid())
+    int drawingChannelTab = -1;
+    if (selectedCard == nullptr)
     {
-        drawingGroup = true;
-        if (!selectedGroup->LoadedCards().empty())
+        const LinkCardGroupNode* tabGroup = nullptr;
+        int selectedTab = -1;
+        const LinkCardGroupNode* shelfGroup = nullptr;
+        int selectedShelf = -1;
+        if (selectedGroup == nullptr)
         {
-            selectedCard = &selectedGroup->LoadedCards().front();
+            for (const DownloaderListItem& item : cards_)
+            {
+                if (item.kind != DownloaderListItem::Kind::Group || item.group == nullptr)
+                {
+                    continue;
+                }
+                const int tab = item.group->SelectedChannelTab();
+                if (tab >= 0)
+                {
+                    tabGroup = item.group.get();
+                    selectedTab = tab;
+                    break;
+                }
+                const int shelf = item.group->SelectedPlaylistShelfIndex();
+                if (shelf >= 0)
+                {
+                    shelfGroup = item.group.get();
+                    selectedShelf = shelf;
+                    break;
+                }
+            }
+        }
+        if (selectedGroup != nullptr && selectedGroup->IsValid())
+        {
+            drawingGroup = true;
+            selectedGroup->ForEachLoadedCard(
+                [&](const LinkCardNode& child)
+                {
+                    if (selectedCard == nullptr)
+                    {
+                        selectedCard = &child;
+                    }
+                });
+        }
+        else if (tabGroup != nullptr && tabGroup->IsValid() && tabGroup->ChannelTabEntryCount(selectedTab) > 0)
+        {
+            drawingGroup = true;
+            drawingChannelTab = selectedTab;
+            selectedGroup = tabGroup;
+            if (!tabGroup->ChannelTabLoadedCards(selectedTab).empty())
+            {
+                selectedCard = &tabGroup->ChannelTabLoadedCards(selectedTab).front();
+            }
+        }
+        else if (shelfGroup != nullptr && shelfGroup->IsValid())
+        {
+            const LinkCardGroupNode* playlist = shelfGroup->PlaylistShelfPlaylist(selectedShelf);
+            if (playlist != nullptr)
+            {
+                drawingGroup = true;
+                selectedGroup = playlist;
+                playlist->ForEachLoadedCard(
+                    [&](const LinkCardNode& child)
+                    {
+                        if (selectedCard == nullptr)
+                        {
+                            selectedCard = &child;
+                        }
+                    });
+            }
         }
     }
     const Color text = {224, 230, 224, 255};
@@ -8723,19 +11624,21 @@ void DockArea::DrawRightPanel(Rectangle rightPanel, Font font) const
         bool optionsEnabled = true;
         if (drawingGroup)
         {
-            for (const LinkCardNode& child : selectedGroup->LoadedCards())
-            {
-                if (child.IsDownloading() || child.IsConverting())
+            selectedGroup->ForEachLoadedCard(
+                [&](const LinkCardNode& child)
                 {
-                    optionsEnabled = false;
-                    break;
-                }
-            }
+                    if (child.IsDownloading() || child.IsConverting())
+                    {
+                        optionsEnabled = false;
+                    }
+                });
         }
         else
         {
             optionsEnabled = !selectedCard->IsDownloading() && !selectedCard->IsConverting();
         }
+        const bool waitingForFormats = !drawingGroup && selectedCard != nullptr &&
+                                       (selectedCard->IsParsing() || selectedCard->NeedsDetailedParse());
         const Rectangle optionsViewport = GetOptionsScrollViewport(settingsPanel, downloadButton.y);
         const float contentHeight = GetDownloaderOptionsContentHeight(settingsPanel.y, downloadFoldout_.IsExpanded());
         const float maxOptionsScroll = std::max(0.0f, contentHeight - optionsViewport.height);
@@ -8750,10 +11653,23 @@ void DockArea::DrawRightPanel(Rectangle rightPanel, Font font) const
             fileFormatDropdown_.IsOpen() || mediaModeDropdown_.IsOpen() || qualityDropdown_.IsOpen();
 
         const Rectangle keepIndicesBounds = {settingsPanel.x + 14.0f, layout.keepIndicesRowY, 18.0f, 18.0f};
-        const float optionsLabelMax =
-            std::max(4.0f, settingsPanel.x + settingsPanel.width - (keepIndicesBounds.x + 18.0f + 8.0f) - 12.0f);
+        const float keepLabelReserve = 118.0f;
+        const float inverseBoxX = keepIndicesBounds.x + 18.0f + 8.0f + keepLabelReserve + 10.0f;
+        const Rectangle inverseNumberingBounds = {inverseBoxX, layout.keepIndicesRowY, 18.0f, 18.0f};
+        const float keepLabelMax = keepLabelReserve;
+        const float inverseLabelMax =
+            std::max(4.0f, settingsPanel.x + settingsPanel.width - (inverseBoxX + 18.0f + 8.0f) - 12.0f);
+        const bool keepNumbering = (drawingChannelTab >= 0) ? selectedGroup->ChannelTabKeepNumbering(drawingChannelTab)
+                                                            : (drawingGroup ? selectedGroup->Options().keepNumbering
+                                                                            : selectedCard->Options().keepNumbering);
+        const bool inverseNumbering =
+            (drawingChannelTab >= 0)
+                ? selectedGroup->ChannelTabInverseNumbering(drawingChannelTab)
+                : (drawingGroup ? selectedGroup->Options().inverseNumbering : selectedCard->Options().inverseNumbering);
         keepIndicesCheckbox_.Draw(
-            keepIndicesBounds, font, "Keep numbering", keepDownloadIndices_, optionsEnabled, optionsLabelMax);
+            keepIndicesBounds, font, "Keep numbering", keepNumbering, optionsEnabled, keepLabelMax);
+        inverseNumberingCheckbox_.Draw(
+            inverseNumberingBounds, font, "Inverse numbering", inverseNumbering, optionsEnabled, inverseLabelMax);
 
         downloadFoldout_.Draw(layout.foldoutPanelBounds, font, optionsEnabled);
 
@@ -8774,21 +11690,30 @@ void DockArea::DrawRightPanel(Rectangle rightPanel, Font font) const
             const Rectangle mediaBounds = {
                 settingsPanel.x + 94.0f, layout.mediaDropdownY, settingsPanel.width - 108.0f, 25.0f};
 
-            qualityDropdown_.DrawControl(qualityBounds,
-                                         font,
-                                         options.quality,
-                                         optionsEnabled && options.mediaMode != 2,
-                                         !anyOptionsDropdownOpen || qualityDropdown_.IsOpen());
-            fileFormatDropdown_.DrawControl(formatBounds,
-                                            font,
-                                            options.fileFormat,
-                                            optionsEnabled,
-                                            !anyOptionsDropdownOpen || fileFormatDropdown_.IsOpen());
-            mediaModeDropdown_.DrawControl(mediaBounds,
-                                           font,
-                                           options.mediaMode,
-                                           optionsEnabled,
-                                           !anyOptionsDropdownOpen || mediaModeDropdown_.IsOpen());
+            if (waitingForFormats)
+            {
+                qualityDropdown_.DrawBusyControl(qualityBounds, font, "Parsing");
+                fileFormatDropdown_.DrawBusyControl(formatBounds, font, "Parsing");
+                mediaModeDropdown_.DrawBusyControl(mediaBounds, font, "Parsing");
+            }
+            else
+            {
+                qualityDropdown_.DrawControl(qualityBounds,
+                                             font,
+                                             options.quality,
+                                             optionsEnabled && options.mediaMode != 2,
+                                             !anyOptionsDropdownOpen || qualityDropdown_.IsOpen());
+                fileFormatDropdown_.DrawControl(formatBounds,
+                                                font,
+                                                options.fileFormat,
+                                                optionsEnabled,
+                                                !anyOptionsDropdownOpen || fileFormatDropdown_.IsOpen());
+                mediaModeDropdown_.DrawControl(mediaBounds,
+                                               font,
+                                               options.mediaMode,
+                                               optionsEnabled,
+                                               !anyOptionsDropdownOpen || mediaModeDropdown_.IsOpen());
+            }
         }
 
         DrawTextEx(font,
@@ -8870,10 +11795,10 @@ void DockArea::DrawRightPanel(Rectangle rightPanel, Font font) const
         downloadResultSection_.Draw(layout.resultPanelBounds, font, optionsEnabled);
         DrawDownloadResultPreview(font, settingsPanel, prediction, layout.resultLineY);
 
-        DrawOptionsScrollbar(optionsViewport, scrollOffset, maxOptionsScroll);
+        downloaderOptionsScrollbar_.Draw(optionsViewport, scrollOffset, maxOptionsScroll);
         UiClip::Pop();
 
-        if (downloadFoldout_.IsExpanded())
+        if (downloadFoldout_.IsExpanded() && !waitingForFormats)
         {
             const Rectangle qualityBounds = {
                 settingsPanel.x + 94.0f, layout.qualityDropdownY, settingsPanel.width - 108.0f, 25.0f};
@@ -9062,7 +11987,10 @@ void DockArea::UpdateFooterNotificationTimer()
     {
         footerNotificationVisible_ = true;
         footerNotificationShowTime_ = -1.0;
-        footerNotificationHideTime_ = GetTime() + kFooterNotificationAutoHideSeconds;
+        if (kFooterNotificationAutoHideSeconds > 0.0)
+        {
+            footerNotificationHideTime_ = GetTime() + kFooterNotificationAutoHideSeconds;
+        }
     }
 
     if (footerNotificationVisible_ && footerNotificationHideTime_ > 0.0 && GetTime() >= footerNotificationHideTime_)
@@ -9163,6 +12091,66 @@ void DockArea::CollectParseFailures()
 
 bool DockArea::BuildFooterNotification(std::string& status, bool& useConvertStatus, bool& isRunning) const
 {
+    // Live convert ETA: only when exactly one card is selected and it is converting.
+    if (!footerNotificationDismissed_ && AnyConvertRunning())
+    {
+        const ConvertRunner* activeRunner = nullptr;
+
+        if (activeWorkspace_ == Workspace::Converter)
+        {
+            if (CountSelectedConverterCards() == 1)
+            {
+                const ConverterFileCardNode* selectedCard = GetSelectedConverterCard();
+                if (selectedCard != nullptr && selectedCard->IsConverting())
+                {
+                    for (const ConvertRunner& runner : convertRunners_)
+                    {
+                        if (runner.IsRunning() && selectedCard->HasFilePath(runner.CurrentInputPath()))
+                        {
+                            activeRunner = &runner;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        else if (activeWorkspace_ == Workspace::Downloader)
+        {
+            int selectedCount = 0;
+            const LinkCardNode* soleSelected = nullptr;
+            ForEachLinkCard(
+                [&](const LinkCardNode& card)
+                {
+                    if (!card.IsSelected())
+                    {
+                        return;
+                    }
+                    ++selectedCount;
+                    soleSelected = &card;
+                });
+
+            if (selectedCount == 1 && soleSelected != nullptr && soleSelected->IsConverting())
+            {
+                for (const ConvertRunner& runner : convertRunners_)
+                {
+                    if (runner.IsRunning() && soleSelected->HasDownloadedPath(runner.CurrentInputPath()))
+                    {
+                        activeRunner = &runner;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (activeRunner != nullptr)
+        {
+            status = BuildEstimatedFooterStatus(ComputeConvertEtaSeconds(*activeRunner));
+            useConvertStatus = true;
+            isRunning = true;
+            return true;
+        }
+    }
+
     if (AnyDownloadRunning() || AnyConvertRunning())
     {
         return false;
@@ -9205,6 +12193,17 @@ void DockArea::UpdateFooter()
         return;
     }
 
+    if (downloadSpeedHistory_.HasSamples() &&
+        CheckCollisionPointRec(GetMousePosition(), footerSpeedCopyButtonBounds_) &&
+        IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
+    {
+        const std::string text = downloadSpeedHistory_.BuildClipboardText();
+        if (!text.empty())
+        {
+            SetClipboardText(text.c_str());
+        }
+    }
+
     if (footerNotificationDismissed_ || !footerNotificationShown_)
     {
         return;
@@ -9221,6 +12220,14 @@ void DockArea::UpdateFooter()
     if (CheckCollisionPointRec(GetMousePosition(), footerCloseButtonBounds_) &&
         IsMouseButtonReleased(MOUSE_BUTTON_LEFT))
     {
+        // Live ETA plates are rebuilt every frame — mark dismissed so they stay hidden
+        // until the next ShowFooterNotification (finished / error / etc.).
+        if (status.rfind("estimated:", 0) == 0)
+        {
+            footerNotificationDismissed_ = true;
+            footerNotificationShown_ = false;
+            return;
+        }
         ClearFooterNotification();
         return;
     }
@@ -9252,9 +12259,10 @@ void DockArea::DrawFooterCloseIcon(Rectangle bounds, bool hovered) const
                crossColor);
 }
 
-void DockArea::DrawFooterCopyIcon(Rectangle bounds, bool hovered) const
+void DockArea::DrawFooterCopyIcon(Rectangle bounds, bool hovered, bool enabled) const
 {
-    const Color iconColor = hovered ? Color{255, 244, 242, 255} : Color{244, 244, 244, 255};
+    Color iconColor =
+        enabled ? (hovered ? Color{255, 244, 242, 255} : Color{244, 244, 244, 255}) : Color{96, 100, 96, 255};
     const float pad = bounds.width * 0.24f;
     const float sheetWidth = bounds.width - pad * 2.0f - 3.0f;
     const float sheetHeight = bounds.height - pad * 2.0f - 3.0f;
@@ -9293,19 +12301,100 @@ void DockArea::DrawFooter(Rectangle footer, Font font, Font fontFooterAa) const
             fpsElapsedSeconds_ = 0.0f;
         }
 
-        char meta[64];
-        std::snprintf(meta, sizeof(meta), "%d FPS | %s", displayFps_, FOURKDOWNER_VERSION);
-        const float fontSize = 12.0f;
+        char fpsNumber[8];
+        std::snprintf(fpsNumber, sizeof(fpsNumber), "%d", displayFps_);
+        const float fontSize = kFooterMetaFontSize;
         const Color metaColor = {168, 174, 168, 255};
         const bool hasAa = fontFooterAa.glyphCount > 0 && fontFooterAa.texture.id != 0;
         const Font& metaFont = hasAa ? fontFooterAa : font;
-        const Vector2 metaSize = MeasureTextEx(metaFont, meta, fontSize, 0.0f);
-        DrawTextEx(metaFont,
-                   meta,
-                   {footer.x + footer.width - metaSize.x - 10.0f, footer.y + (footer.height - metaSize.y) * 0.5f},
-                   fontSize,
-                   0.0f,
-                   metaColor);
+        const float textY = footer.y + (footer.height - MeasureTextEx(metaFont, "0", fontSize, 0.0f).y) * 0.5f;
+        const float rightPad = 10.0f;
+        const auto measureFooter = [&](const char* text)
+        {
+            return MeasureTextEx(metaFont, text, fontSize, 0.0f).x;
+        };
+        const auto drawFooterAt = [&](const char* text, float x)
+        {
+            DrawTextEx(metaFont, text, {x, textY}, fontSize, 0.0f, metaColor);
+        };
+        const auto drawFooterRight = [&](const char* text, float rightX)
+        {
+            drawFooterAt(text, rightX - measureFooter(text));
+        };
+
+        static constexpr const char* kFooterSeparator = " | ";
+        static constexpr const char* kNetPrefix = "net ";
+        static constexpr const char* kNetSuffix = " Mbit/s";
+        static constexpr const char* kDiskPrefix = "disk ";
+        static constexpr const char* kDiskSuffix = " MB/s";
+        static constexpr const char* kFpsSuffix = "FPS";
+        static constexpr const char* kFpsValueBoxSample = "999";
+        static constexpr const char* kNetValueBoxSample = "9999.9";
+        static constexpr const char* kDiskValueBoxSample = "999.9";
+
+        const float separatorWidth = measureFooter(kFooterSeparator);
+        const float versionWidth = measureFooter(FOURKDOWNER_VERSION);
+        const float fpsSuffixWidth = measureFooter(kFpsSuffix);
+        const float fpsValueBoxWidth = measureFooter(kFpsValueBoxSample);
+        const float netPrefixWidth = measureFooter(kNetPrefix);
+        const float netValueBoxWidth = measureFooter(kNetValueBoxSample);
+        const float netSuffixWidth = measureFooter(kNetSuffix);
+        const float diskPrefixWidth = measureFooter(kDiskPrefix);
+        const float diskValueBoxWidth = measureFooter(kDiskValueBoxSample);
+        const float diskSuffixWidth = measureFooter(kDiskSuffix);
+        const float speedBlockWidth = netPrefixWidth + netValueBoxWidth + netSuffixWidth + separatorWidth +
+                                      diskPrefixWidth + diskValueBoxWidth + diskSuffixWidth;
+        const float copyButtonSize = 16.0f;
+        const float copyGap = 6.0f;
+
+        footerDownloadSpeedMeter_.Update(downloadRunners_, AnyDownloadRunning());
+        const bool speedLogReady = downloadSpeedHistory_.HasSamples();
+
+        float rightEdge = footer.x + footer.width - rightPad;
+        drawFooterRight(FOURKDOWNER_VERSION, rightEdge);
+        rightEdge -= versionWidth;
+
+        drawFooterAt(kFooterSeparator, rightEdge - separatorWidth);
+        rightEdge -= separatorWidth;
+
+        // Fixed 3-digit slot; number right-aligned to "FPS" so left meta (net/disk) does not jitter.
+        drawFooterAt(kFpsSuffix, rightEdge - fpsSuffixWidth);
+        drawFooterRight(fpsNumber, rightEdge - fpsSuffixWidth);
+        rightEdge -= fpsSuffixWidth + fpsValueBoxWidth;
+
+        drawFooterAt(kFooterSeparator, rightEdge - separatorWidth);
+        rightEdge -= separatorWidth;
+
+        float cursorX = rightEdge - speedBlockWidth;
+        drawFooterAt(kNetPrefix, cursorX);
+        cursorX += netPrefixWidth;
+        drawFooterAt(footerDownloadSpeedMeter_.NetValue().c_str(), cursorX);
+        cursorX += netValueBoxWidth;
+        drawFooterAt(kNetSuffix, cursorX);
+        cursorX += netSuffixWidth;
+        drawFooterAt(kFooterSeparator, cursorX);
+        cursorX += separatorWidth;
+        drawFooterAt(kDiskPrefix, cursorX);
+        cursorX += diskPrefixWidth;
+        drawFooterAt(footerDownloadSpeedMeter_.DiskValue().c_str(), cursorX);
+        cursorX += diskValueBoxWidth;
+        drawFooterAt(kDiskSuffix, cursorX);
+
+        const float speedBlockLeft = rightEdge - speedBlockWidth;
+        footerSpeedCopyButtonBounds_ = {speedBlockLeft - copyGap - copyButtonSize,
+                                        footer.y + (footer.height - copyButtonSize) * 0.5f,
+                                        copyButtonSize,
+                                        copyButtonSize};
+        const bool copyHovered =
+            speedLogReady && CheckCollisionPointRec(GetMousePosition(), footerSpeedCopyButtonBounds_);
+        DrawFooterCopyIcon(footerSpeedCopyButtonBounds_, copyHovered, speedLogReady);
+        Tooltip::DrawIfHovered(font,
+                               footerSpeedCopyButtonBounds_,
+                               speedLogReady ? "Copy first-download speed log" : "No speed log yet (start a download)");
+        if (copyHovered)
+        {
+            UiCursor::RequestHand();
+        }
     }
 
     footerNotificationShown_ = false;
@@ -9325,13 +12414,30 @@ void DockArea::DrawFooter(Rectangle footer, Font font, Font fontFooterAa) const
     const FooterNotificationTone tone = GetFooterNotificationTone(status, isRunning);
     const bool showCopyButton = tone == FooterNotificationTone::Error ||
                                 (tone == FooterNotificationTone::Success && !footerClipboardLog_.empty());
+    const bool isEstimated = status.rfind("estimated:", 0) == 0;
     const float maxPillWidth = footer.width * 0.5f;
     const float chromeWidth = barHeight + (showCopyButton ? barHeight : 0.0f);
     const float maxTextAreaWidth = std::max(48.0f, maxPillWidth - chromeWidth);
-    const std::string displayStatus =
-        TruncateTextToWidth(font, status, fontSize, maxTextAreaWidth - textPaddingX * 2.0f);
-    const Vector2 labelSize = MeasureTextEx(font, displayStatus.c_str(), fontSize, 0.0f);
-    const float textAreaWidth = std::min(maxTextAreaWidth, labelSize.x + textPaddingX * 2.0f);
+
+    // Fixed ETA plate width — covers "~9h 99m" so "1h 4m" does not clip the trailing 'm'.
+    static constexpr const char* kEstimatedWidthSample = "estimated: ~9h 99m";
+    const float estimatedPadX = 12.0f;
+    std::string displayStatus;
+    float textAreaWidth = 0.0f;
+    Vector2 labelSize{};
+    if (isEstimated)
+    {
+        displayStatus = status;
+        labelSize = MeasureTextEx(font, kEstimatedWidthSample, fontSize, 0.0f);
+        textAreaWidth = std::min(maxTextAreaWidth, labelSize.x + estimatedPadX * 2.0f);
+        labelSize = MeasureTextEx(font, displayStatus.c_str(), fontSize, 0.0f);
+    }
+    else
+    {
+        displayStatus = TruncateTextToWidth(font, status, fontSize, maxTextAreaWidth - textPaddingX * 2.0f);
+        labelSize = MeasureTextEx(font, displayStatus.c_str(), fontSize, 0.0f);
+        textAreaWidth = std::min(maxTextAreaWidth, labelSize.x + textPaddingX * 2.0f);
+    }
     const float totalWidth = chromeWidth + textAreaWidth;
     const float startX = footer.x + (footer.width - totalWidth) * 0.5f;
     const float roundness = 4.0f / barHeight;
@@ -9388,7 +12494,7 @@ void DockArea::DrawFooter(Rectangle footer, Font font, Font fontFooterAa) const
         DrawLineEx({copyButton.x, barY + 2.0f}, {copyButton.x, barY + barHeight - 2.0f}, 1.0f, border);
     }
 
-    if (isRunning)
+    if (isRunning && !isEstimated)
     {
         const float progress = useConvertStatus ? 0.35f : 1.0f;
         const Rectangle progressFill = {
@@ -9396,9 +12502,10 @@ void DockArea::DrawFooter(Rectangle footer, Font font, Font fontFooterAa) const
         DrawRectangleRounded(progressFill, 1.0f, 4, Color{120, 156, 120, 255});
     }
 
+    const float padX = isEstimated ? estimatedPadX : textPaddingX;
     const float textY = barY + (barHeight - labelSize.y) * 0.5f;
-    UiClip::Push({textArea.x + textPaddingX, textArea.y, textArea.width - textPaddingX * 2.0f, textArea.height});
-    DrawTextEx(font, displayStatus.c_str(), {textArea.x + textPaddingX, textY}, fontSize, 0.0f, textColor);
+    UiClip::Push({textArea.x + padX, textArea.y, textArea.width - padX * 2.0f, textArea.height});
+    DrawTextEx(font, displayStatus.c_str(), {textArea.x + padX, textY}, fontSize, 0.0f, textColor);
     UiClip::Pop();
 
     footerCloseButtonBounds_ = closeButton;
@@ -9505,11 +12612,12 @@ void DockArea::UpdateAboutDialog(int windowWidth, int windowHeight, Font font)
         return;
     }
 
-    static constexpr std::array<AboutDialogLink, 4> kLinks = {{
+    static constexpr std::array<AboutDialogLink, 5> kLinks = {{
         {"https://github.com/epsill0n/ytdown", "https://github.com/epsill0n/ytdown", 142.0f},
         {"https://ffmpeg.org", "https://ffmpeg.org", 192.0f},
         {"https://www.raylib.com", "https://www.raylib.com", 242.0f},
         {"http://tinyfiledialogs.sourceforge.net", "http://tinyfiledialogs.sourceforge.net", 292.0f},
+        {"https://github.com/googlefonts/noto-emoji", "https://github.com/googlefonts/noto-emoji", 342.0f},
     }};
 
     for (const AboutDialogLink& link : kLinks)
@@ -9561,61 +12669,263 @@ void DockArea::DrawAboutDialog(int windowWidth, int windowHeight, Font font) con
     DrawTextEx(font, "the tinyfiledialogs project", {itemX, modal.y + 270.0f}, 16.0f, 0.0f, bodyColor);
     DrawAboutLink(font, "http://tinyfiledialogs.sourceforge.net", modal.y + 292.0f, itemX, linkColor, linkHoverColor);
 
+    DrawTextEx(font, "Noto Emoji (emoji graphics)", {itemX, modal.y + 320.0f}, 16.0f, 0.0f, bodyColor);
+    DrawAboutLink(
+        font, "https://github.com/googlefonts/noto-emoji", modal.y + 342.0f, itemX, linkColor, linkHoverColor);
+
     closeAboutButton_.Draw(okBounds, font);
 }
 
 namespace
 {
-constexpr float kInfoModalWidth = 520.0f;
-constexpr float kInfoModalHeight = 480.0f;
+constexpr float kInfoModalWidthFrac = 0.62f;
+constexpr float kInfoModalHeightFrac = 0.72f;
+constexpr float kInfoModalMinWidth = 420.0f;
+constexpr float kInfoModalMinHeight = 360.0f;
+constexpr float kInfoModalEdgePad = 24.0f;
 constexpr float kInfoTitleBlock = 48.0f;
 constexpr float kInfoFooterBlock = 56.0f;
+constexpr float kInfoContentSidePad = 18.0f;
+constexpr float kInfoContentTopPad = 10.0f;
+constexpr float kInfoContentBottomPad = 10.0f;
 constexpr float kInfoSectionGap = 10.0f;
 constexpr float kInfoLineStep = 22.0f;
-constexpr float kInfoSectionHeaderStep = 26.0f;
-// Selecting(5) + Queue(4) + Shortcuts(17) + Handy(6) = 32 lines; 4 sections; 3 gaps between sections.
-constexpr float kInfoSectionCount = 4.0f;
-constexpr float kInfoLineCount = 32.0f;
-constexpr float kInfoSectionGaps = 3.0f;
+constexpr float kInfoSectionHeaderStep = 28.0f;
+constexpr float kInfoSectionPad = 16.0f;
+constexpr float kInfoSectionHeaderSize = 21.0f;
+constexpr float kInfoSectionBodySize = 16.0f;
+// Keep section stroke inside the clip rect (border is not clipped flush to the modal).
+constexpr float kInfoCardInset = 2.0f;
 
-float InfoDialogContentHeight()
+struct InfoDialogMetrics
 {
-    return kInfoSectionHeaderStep * kInfoSectionCount + kInfoLineStep * kInfoLineCount +
-           kInfoSectionGap * kInfoSectionGaps + 8.0f;
+    Rectangle modal{};
+    Rectangle okButton{};
+    Rectangle contentViewport{};
+
+    static InfoDialogMetrics FromWindow(int windowWidth, int windowHeight)
+    {
+        const float maxW = std::max(1.0f, static_cast<float>(windowWidth) - kInfoModalEdgePad * 2.0f);
+        const float maxH = std::max(1.0f, static_cast<float>(windowHeight) - kInfoModalEdgePad * 2.0f);
+        const float modalWidth =
+            std::clamp(static_cast<float>(windowWidth) * kInfoModalWidthFrac, std::min(kInfoModalMinWidth, maxW), maxW);
+        const float modalHeight = std::clamp(
+            static_cast<float>(windowHeight) * kInfoModalHeightFrac, std::min(kInfoModalMinHeight, maxH), maxH);
+        InfoDialogMetrics metrics;
+        metrics.modal = {(static_cast<float>(windowWidth) - modalWidth) * 0.5f,
+                         (static_cast<float>(windowHeight) - modalHeight) * 0.5f,
+                         modalWidth,
+                         modalHeight};
+        metrics.okButton = {metrics.modal.x + metrics.modal.width - 118.0f,
+                            metrics.modal.y + metrics.modal.height - 48.0f,
+                            84.0f,
+                            34.0f};
+        metrics.contentViewport = {metrics.modal.x + kInfoContentSidePad,
+                                   metrics.modal.y + kInfoTitleBlock,
+                                   metrics.modal.width - kInfoContentSidePad * 2.0f,
+                                   metrics.modal.height - kInfoTitleBlock - kInfoFooterBlock};
+        return metrics;
+    }
+};
+
+float InfoDialogSectionCardHeight(int visualLineCount)
+{
+    return kInfoSectionPad * 2.0f + kInfoSectionHeaderStep + kInfoLineStep * static_cast<float>(visualLineCount);
+}
+
+struct InfoDialogSection
+{
+    const char* title;
+    const char* const* lines;
+    int lineCount;
+};
+
+constexpr const char* kInfoSelectingLines[] = {
+    "Click a card to select it",
+    "Ctrl+click to select several",
+    "Shift+click to grab a whole range",
+    "Ctrl+A - select every card",
+    "Playlist/channel cards expand with chevron or A on the header",
+};
+constexpr const char* kInfoQueueLines[] = {
+    "Hover \"in queue\", then click Prioritize,",
+    "|That download jumps ahead right away,",
+    "|It may pause whichever one is least finished",
+    "To drop something from the queue, use Cancel",
+};
+constexpr const char* kInfoShortcutLines[] = {
+    "1 / 2 - switch Downloader / Converter",
+    "Up / Down - move selection",
+    "Tab / Shift+Tab - move selection",
+    "Shift+Up / Down - select a range",
+    "Mouse wheel - scroll the list",
+    "Ctrl+wheel - scroll faster (x6)",
+    "Shift+wheel - scroll much faster (x12)",
+    "Ctrl+V - paste a link / choose files",
+    "Ctrl+Shift+V - paste the same link again",
+    "Enter / Space - start or stop the selected item(s)",
+    "Ctrl+Enter - download/convert all",
+    "Alt+Enter / Cancel All - cancel every download/convert and clear the queue",
+    "Esc - clear selection",
+    "Delete - stop and remove the selected card(s)",
+    "Ctrl+Delete / Ctrl+X - stop and remove every card",
+    "X - close the card under the mouse",
+    "A - fold or unfold the section title under the mouse",
+    "Ctrl+Z / Ctrl+Y - undo / redo (including all / cancel all)",
+    "Ctrl+Q - quit",
+};
+constexpr const char* kInfoHandyLines[] = {
+    "Click the thumbnail to open the output folder",
+    "Exclude selected skips convert (gold border); Custom uses a blue border",
+    "Auto Convert holds Global Convert, Exclude, and Custom Convert",
+    "Custom Convert: per-card override for the selected video(s)",
+    "Large playlists show Load more (+50) at the bottom when expanded",
+    "Download All materializes every playlist entry before queuing",
+};
+constexpr InfoDialogSection kInfoSections[] = {
+    {"Selecting cards",
+     kInfoSelectingLines,
+     static_cast<int>(sizeof(kInfoSelectingLines) / sizeof(kInfoSelectingLines[0]))},
+    {"Queue", kInfoQueueLines, static_cast<int>(sizeof(kInfoQueueLines) / sizeof(kInfoQueueLines[0]))},
+    {"Shortcuts", kInfoShortcutLines, static_cast<int>(sizeof(kInfoShortcutLines) / sizeof(kInfoShortcutLines[0]))},
+    {"Handy stuff", kInfoHandyLines, static_cast<int>(sizeof(kInfoHandyLines) / sizeof(kInfoHandyLines[0]))},
+};
+
+// Lines starting with '|' are continuations of the previous bullet (no new dash).
+bool InfoDialogLineIsContinuation(const char* line)
+{
+    return line != nullptr && line[0] == '|';
+}
+
+const char* InfoDialogLineText(const char* line)
+{
+    return InfoDialogLineIsContinuation(line) ? line + 1 : line;
+}
+
+std::vector<std::string> WrapInfoWords(Font font, const std::string& text, float fontSize, float maxWidth)
+{
+    std::vector<std::string> lines;
+    if (text.empty())
+    {
+        lines.emplace_back();
+        return lines;
+    }
+    if (maxWidth <= 1.0f)
+    {
+        lines.push_back(text);
+        return lines;
+    }
+
+    const auto fits = [&](const std::string& value)
+    {
+        return MeasureTextEx(font, value.c_str(), fontSize, 0.0f).x <= maxWidth;
+    };
+
+    std::stringstream stream(text);
+    std::string word;
+    std::string current;
+    while (stream >> word)
+    {
+        const std::string candidate = current.empty() ? word : current + " " + word;
+        if (fits(candidate))
+        {
+            current = candidate;
+            continue;
+        }
+        if (!current.empty())
+        {
+            lines.push_back(std::move(current));
+            current.clear();
+        }
+        if (fits(word))
+        {
+            current = word;
+            continue;
+        }
+
+        std::string rest = word;
+        while (!rest.empty())
+        {
+            size_t low = 1;
+            size_t high = rest.size();
+            while (low < high)
+            {
+                const size_t mid = (low + high + 1) / 2;
+                if (fits(rest.substr(0, mid)))
+                {
+                    low = mid;
+                }
+                else
+                {
+                    high = mid - 1;
+                }
+            }
+            lines.push_back(rest.substr(0, low));
+            rest.erase(0, low);
+        }
+    }
+    if (!current.empty())
+    {
+        lines.push_back(std::move(current));
+    }
+    if (lines.empty())
+    {
+        lines.emplace_back();
+    }
+    return lines;
+}
+
+float InfoDialogCardWidth(float contentViewportWidth)
+{
+    const float scrollbarGutter = Scrollbar::kIdleWidth + Scrollbar::kEdgePad * 2.0f;
+    return std::max(1.0f, contentViewportWidth - scrollbarGutter - kInfoCardInset * 2.0f);
+}
+
+int InfoDialogSectionVisualLineCount(Font font, const InfoDialogSection& section, float innerWidth, float bulletIndent)
+{
+    const float wrapWidth = std::max(1.0f, innerWidth - bulletIndent);
+    int visual = 0;
+    for (int i = 0; i < section.lineCount; ++i)
+    {
+        visual += static_cast<int>(
+            WrapInfoWords(font, InfoDialogLineText(section.lines[i]), kInfoSectionBodySize, wrapWidth).size());
+    }
+    return visual;
+}
+
+float InfoDialogContentHeight(Font font, float contentViewportWidth)
+{
+    const float cardWidth = InfoDialogCardWidth(contentViewportWidth);
+    const float innerWidth = std::max(1.0f, cardWidth - kInfoSectionPad * 2.0f);
+    const float bulletIndent = MeasureTextEx(font, "\xE2\x80\x94 ", kInfoSectionBodySize, 0.0f).x;
+    float height = kInfoContentTopPad + kInfoContentBottomPad;
+    bool first = true;
+    for (const InfoDialogSection& section : kInfoSections)
+    {
+        if (!first)
+        {
+            height += kInfoSectionGap;
+        }
+        first = false;
+        height +=
+            InfoDialogSectionCardHeight(InfoDialogSectionVisualLineCount(font, section, innerWidth, bulletIndent));
+    }
+    return height;
 }
 } // namespace
 
 void DockArea::UpdateInfoDialog(int windowWidth, int windowHeight, Font font)
 {
-    (void)font;
-    const Rectangle modal = {(static_cast<float>(windowWidth) - kInfoModalWidth) * 0.5f,
-                             (static_cast<float>(windowHeight) - kInfoModalHeight) * 0.5f,
-                             kInfoModalWidth,
-                             kInfoModalHeight};
-    const Rectangle okButton = {modal.x + modal.width - 118.0f, modal.y + modal.height - 48.0f, 84.0f, 34.0f};
-    const Rectangle contentViewport = {modal.x + 12.0f,
-                                       modal.y + kInfoTitleBlock,
-                                       modal.width - 24.0f,
-                                       modal.height - kInfoTitleBlock - kInfoFooterBlock};
+    const InfoDialogMetrics metrics = InfoDialogMetrics::FromWindow(windowWidth, windowHeight);
+    const Rectangle& modal = metrics.modal;
+    const Rectangle& okButton = metrics.okButton;
+    const Rectangle& contentViewport = metrics.contentViewport;
 
-    const float maxScroll = std::max(0.0f, InfoDialogContentHeight() - contentViewport.height);
+    const float maxScroll =
+        std::max(0.0f, InfoDialogContentHeight(font, contentViewport.width) - contentViewport.height);
 
-    if (closeInfoButton_.Update(okButton) || IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_ENTER) ||
-        IsKeyPressed(KEY_SPACE))
-    {
-        isInfoDialogOpen_ = false;
-        infoDialogScrollOffset_ = 0.0f;
-        return;
-    }
-
-    if (IsMouseButtonReleased(MOUSE_BUTTON_LEFT) && !CheckCollisionPointRec(GetMousePosition(), modal))
-    {
-        isInfoDialogOpen_ = false;
-        infoDialogScrollOffset_ = 0.0f;
-        return;
-    }
-
-    if (CheckCollisionPointRec(GetMousePosition(), modal))
+    if (CheckCollisionPointRec(GetMousePosition(), modal) && !infoDialogScrollbar_.IsDragging() &&
+        !(IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)))
     {
         const float wheel = GetMouseWheelMove();
         if (wheel != 0.0f)
@@ -9623,7 +12933,26 @@ void DockArea::UpdateInfoDialog(int windowWidth, int windowHeight, Font font)
             infoDialogScrollOffset_ = std::clamp(infoDialogScrollOffset_ - wheel * 40.0f, 0.0f, maxScroll);
         }
     }
+    const bool scrollbarConsumed = infoDialogScrollbar_.Update(contentViewport, infoDialogScrollOffset_, maxScroll);
     infoDialogScrollOffset_ = std::clamp(infoDialogScrollOffset_, 0.0f, maxScroll);
+
+    if (closeInfoButton_.Update(okButton) || IsKeyPressed(KEY_ESCAPE) || IsKeyPressed(KEY_ENTER) ||
+        IsKeyPressed(KEY_SPACE))
+    {
+        isInfoDialogOpen_ = false;
+        infoDialogScrollOffset_ = 0.0f;
+        infoDialogScrollbar_.Reset();
+        return;
+    }
+
+    if (!scrollbarConsumed && IsMouseButtonReleased(MOUSE_BUTTON_LEFT) &&
+        !CheckCollisionPointRec(GetMousePosition(), modal))
+    {
+        isInfoDialogOpen_ = false;
+        infoDialogScrollOffset_ = 0.0f;
+        infoDialogScrollbar_.Reset();
+        return;
+    }
 }
 
 void DockArea::DrawInfoDialog(int windowWidth, int windowHeight, Font font) const
@@ -9635,87 +12964,80 @@ void DockArea::DrawInfoDialog(int windowWidth, int windowHeight, Font font) cons
 
     DrawRectangle(0, 0, windowWidth, windowHeight, Color{0, 0, 0, 120});
 
-    const Rectangle modal = {(static_cast<float>(windowWidth) - kInfoModalWidth) * 0.5f,
-                             (static_cast<float>(windowHeight) - kInfoModalHeight) * 0.5f,
-                             kInfoModalWidth,
-                             kInfoModalHeight};
-    const Rectangle okBounds = {modal.x + modal.width - 118.0f, modal.y + modal.height - 48.0f, 84.0f, 34.0f};
-    const Rectangle contentViewport = {modal.x + 12.0f,
-                                       modal.y + kInfoTitleBlock,
-                                       modal.width - 24.0f,
-                                       modal.height - kInfoTitleBlock - kInfoFooterBlock};
+    const InfoDialogMetrics metrics = InfoDialogMetrics::FromWindow(windowWidth, windowHeight);
+    const Rectangle& modal = metrics.modal;
+    const Rectangle& okBounds = metrics.okButton;
+    const Rectangle& contentViewport = metrics.contentViewport;
 
-    const float maxScroll = std::max(0.0f, InfoDialogContentHeight() - contentViewport.height);
+    const float maxScroll =
+        std::max(0.0f, InfoDialogContentHeight(font, contentViewport.width) - contentViewport.height);
     const float scroll = std::clamp(infoDialogScrollOffset_, 0.0f, maxScroll);
 
     const Color titleColor = {232, 238, 232, 255};
     const Color sectionColor = {220, 232, 220, 255};
     const Color bodyColor = {186, 200, 186, 255};
-    const float textX = modal.x + 20.0f;
+    const Color cardFill = {30, 40, 30, 255};
+    const Color cardBorder = {70, 95, 70, 255};
+    const float textX = modal.x + kInfoContentSidePad;
 
     DrawRectangleRounded(modal, 0.08f, 14, Color{24, 32, 24, 255});
     DrawRectangleRoundedLines(modal, 0.08f, 14, Color{96, 126, 96, 255});
     DrawTextEx(font, "Info", {textX, modal.y + 14.0f}, 24.0f, 0.0f, titleColor);
 
+    const float cardWidth = InfoDialogCardWidth(contentViewport.width);
+    const float innerWidth = std::max(1.0f, cardWidth - kInfoSectionPad * 2.0f);
+    const float bulletIndent = MeasureTextEx(font, "\xE2\x80\x94 ", kInfoSectionBodySize, 0.0f).x;
+    const float wrapWidth = std::max(1.0f, innerWidth - bulletIndent);
+
     UiClip::Push(contentViewport);
-    float y = contentViewport.y - scroll;
+    float y = contentViewport.y - scroll + kInfoContentTopPad;
 
-    const auto drawSection = [&](const char* title)
+    for (const InfoDialogSection& section : kInfoSections)
     {
-        DrawTextEx(font, title, {textX, y}, 18.0f, 0.0f, sectionColor);
-        y += kInfoSectionHeaderStep;
-    };
-    const auto drawLine = [&](const char* line)
-    {
-        DrawTextEx(font, line, {textX, y}, 16.0f, 0.0f, bodyColor);
-        y += kInfoLineStep;
-    };
+        const int visualLines = InfoDialogSectionVisualLineCount(font, section, innerWidth, bulletIndent);
+        const float cardHeight = InfoDialogSectionCardHeight(visualLines);
+        const Rectangle cardBounds = {contentViewport.x + kInfoCardInset, y, cardWidth, cardHeight};
+        DrawRectangleRounded(cardBounds, 0.08f, 12, cardFill);
+        DrawRectangleRoundedLines(cardBounds, 0.08f, 12, cardBorder);
 
-    drawSection("Selecting cards");
-    drawLine("Click a card to select it");
-    drawLine("Ctrl+click to select several");
-    drawLine("Shift+click to grab a whole range");
-    drawLine("Ctrl+A - select every card");
-    drawLine("Playlist/channel cards expand with chevron or A on the header");
-    y += kInfoSectionGap;
+        float textY = y + kInfoSectionPad;
+        const float sectionTextX = cardBounds.x + kInfoSectionPad;
+        DrawTextEx(font, section.title, {sectionTextX, textY}, kInfoSectionHeaderSize, 0.0f, sectionColor);
+        DrawTextEx(font, section.title, {sectionTextX + 1.0f, textY}, kInfoSectionHeaderSize, 0.0f, sectionColor);
+        textY += kInfoSectionHeaderStep;
 
-    drawSection("Queue");
-    drawLine("Hover \"in queue\", then click Prioritize");
-    drawLine("That download jumps ahead right away");
-    drawLine("It may pause whichever one is least finished");
-    drawLine("To drop something from the queue, use Cancel");
-    y += kInfoSectionGap;
+        for (int i = 0; i < section.lineCount; ++i)
+        {
+            const char* raw = section.lines[i];
+            const bool continuation = InfoDialogLineIsContinuation(raw);
+            const std::vector<std::string> wrapped =
+                WrapInfoWords(font, InfoDialogLineText(raw), kInfoSectionBodySize, wrapWidth);
+            for (size_t part = 0; part < wrapped.size(); ++part)
+            {
+                const bool hanging = continuation || part > 0;
+                if (hanging)
+                {
+                    DrawTextEx(font,
+                               wrapped[part].c_str(),
+                               {sectionTextX + bulletIndent, textY},
+                               kInfoSectionBodySize,
+                               0.0f,
+                               bodyColor);
+                }
+                else
+                {
+                    const std::string line = std::string("\xE2\x80\x94 ") + wrapped[part];
+                    DrawTextEx(font, line.c_str(), {sectionTextX, textY}, kInfoSectionBodySize, 0.0f, bodyColor);
+                }
+                textY += kInfoLineStep;
+            }
+        }
 
-    drawSection("Shortcuts");
-    drawLine("1 / 2 - switch Downloader / Converter");
-    drawLine("Up / Down - move selection");
-    drawLine("Tab / Shift+Tab - move selection");
-    drawLine("Shift+Up / Down - select a range");
-    drawLine("Ctrl+Up / Down - add or remove from selection");
-    drawLine("Ctrl+V - paste a link / choose files");
-    drawLine("Ctrl+Shift+V - paste the same link again");
-    drawLine("Enter / Space - start or stop the selected item(s)");
-    drawLine("Ctrl+Enter - download/convert all");
-    drawLine("Alt+Enter / Cancel All - cancel every download/convert and clear the queue");
-    drawLine("Esc - clear selection");
-    drawLine("Delete - stop and remove the selected card(s)");
-    drawLine("Ctrl+Delete / Ctrl+X - stop and remove every card");
-    drawLine("X - close the card under the mouse");
-    drawLine("A - fold or unfold the section title under the mouse");
-    drawLine("Ctrl+Z / Ctrl+Y - undo / redo (including all / cancel all)");
-    drawLine("Ctrl+Q - quit");
-    y += kInfoSectionGap;
-
-    drawSection("Handy stuff");
-    drawLine("Click the thumbnail to open the output folder");
-    drawLine("Exclude selected skips convert (gold border); Custom uses a blue border");
-    drawLine("Auto Convert holds Global Convert, Exclude, and Custom Convert");
-    drawLine("Custom Convert: per-card override for the selected video(s)");
-    drawLine("Large playlists show Load more (+50) at the bottom when expanded");
-    drawLine("Download All materializes every playlist entry before queuing");
+        y += cardHeight + kInfoSectionGap;
+    }
 
     UiClip::Pop();
-    DrawOptionsScrollbar(contentViewport, scroll, maxScroll);
+    infoDialogScrollbar_.Draw(contentViewport, scroll, maxScroll);
     closeInfoButton_.Draw(okBounds, font);
 }
 
@@ -9729,12 +13051,18 @@ LinkCardNode* DockArea::GetSelectedCard()
         }
         if (item.kind == DownloaderListItem::Kind::Group)
         {
-            for (LinkCardNode& child : item.group->LoadedCards())
-            {
-                if (child.IsSelected())
+            LinkCardNode* found = nullptr;
+            item.group->ForEachLoadedCard(
+                [&](LinkCardNode& child)
                 {
-                    return &child;
-                }
+                    if (found == nullptr && child.IsSelected())
+                    {
+                        found = &child;
+                    }
+                });
+            if (found != nullptr)
+            {
+                return found;
             }
         }
     }
@@ -9752,12 +13080,19 @@ const LinkCardNode* DockArea::GetSelectedCard() const
         }
         if (item.kind == DownloaderListItem::Kind::Group)
         {
-            for (const LinkCardNode& child : item.group->LoadedCards())
+            const LinkCardNode* found = nullptr;
+            static_cast<const LinkCardGroupNode&>(*item.group)
+                .ForEachLoadedCard(
+                    [&](const LinkCardNode& child)
+                    {
+                        if (found == nullptr && child.IsSelected())
+                        {
+                            found = &child;
+                        }
+                    });
+            if (found != nullptr)
             {
-                if (child.IsSelected())
-                {
-                    return &child;
-                }
+                return found;
             }
         }
     }
@@ -10068,45 +13403,55 @@ void DockArea::ProcessFinishedDownloadRunner(DownloadRunner& runner)
         ForEachLinkCard(
             [&](LinkCardNode& card)
             {
-                if (card.HasUrl(completedDownloadUrl))
+                if (!CardMatchesDownloadRunner(card, runner))
                 {
-                    // Cancel already marked this card; do not promote it to "took".
-                    if (card.IsCancelled())
-                    {
-                        skippedCancelledCard = true;
-                        return;
-                    }
-                    card.SetDownloadElapsed(completedDownloadElapsed);
-                    card.SetDownloadBrowserReport(runner.LastDownloadBrowserReport());
-
-                    const std::filesystem::path outputDir = std::filesystem::u8path(card.ExpectedOutputDirectory());
-                    const std::string expectedTitle = card.ExpectedNormalizedTitle().empty()
-                                                          ? card.NormalizedTitle()
-                                                          : card.ExpectedNormalizedTitle();
-                    std::filesystem::path found =
-                        FindExistingOutputFile(outputDir, expectedTitle, card.ExpectedFileFormat());
-                    if (found.empty())
-                    {
-                        // yt-dlp may write a different container than the UI format label.
-                        found = FindExistingOutputFile(outputDir, expectedTitle, {});
-                    }
-                    if (!found.empty())
-                    {
-                        const std::string foundPath = PathUtf8(found);
-                        card.SetLastDownloadedPath(foundPath);
-                        if (card.HasAutoConvertDelivery())
-                        {
-                            card.SetAutoConvertStagingPath(foundPath);
-                        }
-                    }
-                    else if (card.HasAutoConvertDelivery())
-                    {
-                        WriteDebugLog("auto-convert skipped: staging file not found for " + completedDownloadUrl);
-                        card.ClearAutoConvertSnapshot();
-                        card.ClearAutoConvertDelivery();
-                    }
-                    completedCard = &card;
+                    return;
                 }
+                // Cancel already marked this card; do not promote it to "took".
+                if (card.IsCancelled())
+                {
+                    skippedCancelledCard = true;
+                    return;
+                }
+                card.SetDownloadElapsed(completedDownloadElapsed);
+                card.SetDownloadBrowserReport(runner.LastDownloadBrowserReport());
+                if (!runner.LastResolvedTitle().empty())
+                {
+                    card.ApplyOriginalTitle(runner.LastResolvedTitle());
+                }
+                if (!runner.LastResolvedNormalizedTitle().empty() && !card.ExpectedOutputDirectory().empty())
+                {
+                    card.SetExpectedDownloadOutput(card.ExpectedOutputDirectory(),
+                                                   card.ExpectedFileFormat(),
+                                                   runner.LastResolvedNormalizedTitle());
+                }
+
+                const std::filesystem::path outputDir = std::filesystem::u8path(card.ExpectedOutputDirectory());
+                const std::string expectedTitle =
+                    card.ExpectedNormalizedTitle().empty() ? card.NormalizedTitle() : card.ExpectedNormalizedTitle();
+                std::filesystem::path found =
+                    FindExistingOutputFile(outputDir, expectedTitle, card.ExpectedFileFormat());
+                if (found.empty())
+                {
+                    // yt-dlp may write a different container than the UI format label.
+                    found = FindExistingOutputFile(outputDir, expectedTitle, {});
+                }
+                if (!found.empty())
+                {
+                    const std::string foundPath = PathUtf8(found);
+                    card.SetLastDownloadedPath(foundPath);
+                    if (card.HasAutoConvertDelivery())
+                    {
+                        card.SetAutoConvertStagingPath(foundPath);
+                    }
+                }
+                else if (card.HasAutoConvertDelivery())
+                {
+                    WriteDebugLog("auto-convert skipped: staging file not found for " + completedDownloadUrl);
+                    card.ClearAutoConvertSnapshot();
+                    card.ClearAutoConvertDelivery();
+                }
+                completedCard = &card;
             });
         if (skippedCancelledCard && completedCard == nullptr)
         {
@@ -10115,9 +13460,55 @@ void DockArea::ProcessFinishedDownloadRunner(DownloadRunner& runner)
         }
         AppendFooterDiagnosticsForCard(completedDownloadUrl, runner.LastDownloadBrowserReport());
 
+        {
+            GroupEntryRef batchRef;
+            if (FindGroupEntryByUrl(completedDownloadUrl, batchRef) && batchRef.ownerGroup != nullptr)
+            {
+                batchRef.ownerGroup->NotifyBatchDownloadFinished(completedDownloadUrl, completedDownloadElapsed);
+                if (!runner.LastResolvedTitle().empty())
+                {
+                    batchRef.ownerGroup->UpdateEntryTitleByUrl(completedDownloadUrl, runner.LastResolvedTitle());
+                }
+                const std::string rememberedPath =
+                    completedCard != nullptr ? completedCard->LastDownloadedPath() : std::string{};
+                const std::string& entryUrl = batchRef.entry.url;
+                if (!entryUrl.empty())
+                {
+                    batchRef.ownerGroup->RememberEntryDownloadCompletion(
+                        entryUrl, completedDownloadElapsed, rememberedPath);
+                }
+                if (!completedDownloadUrl.empty() && completedDownloadUrl != entryUrl)
+                {
+                    batchRef.ownerGroup->RememberEntryDownloadCompletion(
+                        completedDownloadUrl, completedDownloadElapsed, rememberedPath);
+                }
+                // If the UI card for this entry is already loaded, keep it in sync when the
+                // completion landed on an ephemeral host (or vice versa).
+                if (LinkCardNode* uiCard = batchRef.ownerGroup->FindLoadedCardByUrl(completedDownloadUrl))
+                {
+                    if (completedCard != uiCard)
+                    {
+                        if (!uiCard->HasCompletedDownload())
+                        {
+                            uiCard->SetDownloadElapsed(completedDownloadElapsed);
+                        }
+                        if (!rememberedPath.empty() && uiCard->LastDownloadedPath().empty())
+                        {
+                            uiCard->SetLastDownloadedPath(rememberedPath);
+                        }
+                        if (!runner.LastResolvedTitle().empty())
+                        {
+                            uiCard->ApplyOriginalTitle(runner.LastResolvedTitle());
+                        }
+                    }
+                }
+            }
+        }
+
         if (completedCard != nullptr)
         {
             QueueAutoConvertForCard(*completedCard);
+            MaybeReleaseDownloadHost(completedCard);
         }
 
         if (pendingDownloadQueue_.empty() && !AnyDownloadRunning())
@@ -10161,30 +13552,21 @@ void DockArea::ProcessFinishedDownloadRunner(DownloadRunner& runner)
         ForEachLinkCard(
             [&](LinkCardNode& card)
             {
-                if (!cancelledUrl.empty() && !card.HasUrl(cancelledUrl))
+                if (!CardMatchesDownloadRunner(card, runner))
                 {
                     return;
                 }
                 if (softPreempt)
                 {
-                    if (card.IsDownloading())
-                    {
-                        card.DemoteDownloadingToQueued();
-                        card.ClearAutoConvertSnapshot();
-                        card.ClearAutoConvertDelivery();
-                    }
-                    else if (!card.IsInQueue())
-                    {
-                        card.SetQueued();
-                    }
-                    return;
-                }
-                if (card.IsDownloading())
-                {
-                    card.ClearDownloading();
+                    card.DemoteDownloadingToQueued();
                     card.ClearAutoConvertSnapshot();
                     card.ClearAutoConvertDelivery();
+                    return;
                 }
+                card.ClearDownloading();
+                card.ClearAutoConvertSnapshot();
+                card.ClearAutoConvertDelivery();
+                MaybeReleaseDownloadHost(&card);
             });
 
         if (softPreempt)
@@ -10193,6 +13575,14 @@ void DockArea::ProcessFinishedDownloadRunner(DownloadRunner& runner)
             runner.SetStatus("");
             StartNextPendingDownload();
             return;
+        }
+
+        {
+            GroupEntryRef batchRef;
+            if (!cancelledUrl.empty() && FindGroupEntryByUrl(cancelledUrl, batchRef) && batchRef.ownerGroup != nullptr)
+            {
+                batchRef.ownerGroup->NotifyBatchDownloadFinished(cancelledUrl, 0.0);
+            }
         }
 
         const std::string status = runner.Status();
@@ -10223,14 +13613,23 @@ void DockArea::ProcessFinishedDownloadRunner(DownloadRunner& runner)
         ForEachLinkCard(
             [&](LinkCardNode& card)
             {
-                if (card.IsDownloading() && (failedUrl.empty() || card.HasUrl(failedUrl)))
+                if (!CardMatchesDownloadRunner(card, runner))
                 {
-                    card.SetDownloadBrowserReport(runner.LastDownloadBrowserReport());
-                    card.ClearDownloading();
-                    card.ClearAutoConvertSnapshot();
-                    card.ClearAutoConvertDelivery();
+                    return;
                 }
+                card.SetDownloadBrowserReport(runner.LastDownloadBrowserReport());
+                card.ClearDownloading();
+                card.ClearAutoConvertSnapshot();
+                card.ClearAutoConvertDelivery();
+                MaybeReleaseDownloadHost(&card);
             });
+        {
+            GroupEntryRef batchRef;
+            if (!failedUrl.empty() && FindGroupEntryByUrl(failedUrl, batchRef) && batchRef.ownerGroup != nullptr)
+            {
+                batchRef.ownerGroup->NotifyBatchDownloadFinished(failedUrl, 0.0);
+            }
+        }
         const std::string status = runner.Status();
         if (isBatchDownloading_ && (!pendingDownloadQueue_.empty() || AnyDownloadRunning()))
         {
@@ -10297,7 +13696,29 @@ void DockArea::ProcessFinishedConvertRunner(ConvertRunner& runner)
                     card.SetLastDownloadedPath(completedConvertOutputPath);
                 }
                 CleanupLinkCardAutoConvertStaging(card, completedConvertPath);
+                MaybeReleaseDownloadHost(&card);
             });
+
+        if (!completedLinkCardUrl.empty())
+        {
+            GroupEntryRef batchRef;
+            if (FindGroupEntryByUrl(completedLinkCardUrl, batchRef) && batchRef.ownerGroup != nullptr)
+            {
+                const std::string& entryUrl = batchRef.entry.url;
+                const std::string rememberedPath =
+                    !completedConvertOutputPath.empty() ? completedConvertOutputPath : completedConvertPath;
+                if (!entryUrl.empty())
+                {
+                    batchRef.ownerGroup->RememberEntryConvertCompletion(
+                        entryUrl, completedConvertElapsed, rememberedPath);
+                }
+                if (completedLinkCardUrl != entryUrl)
+                {
+                    batchRef.ownerGroup->RememberEntryConvertCompletion(
+                        completedLinkCardUrl, completedConvertElapsed, rememberedPath);
+                }
+            }
+        }
 
         if (completedDeleteInput && !completedConvertPath.empty())
         {
@@ -10478,35 +13899,8 @@ std::string DockArea::GetDefaultDownloadPath()
 
 std::string DockArea::GetAutoConvertStagingPath()
 {
-    std::filesystem::path documentsDir;
-#ifdef _WIN32
-    char* userProfile = nullptr;
-    size_t userProfileSize = 0;
-    if (_dupenv_s(&userProfile, &userProfileSize, "USERPROFILE") == 0 && userProfile != nullptr &&
-        userProfile[0] != '\0')
-    {
-        documentsDir = std::filesystem::path(userProfile) / "Documents";
-        std::free(userProfile);
-    }
-    else
-    {
-        std::free(userProfile);
-    }
-#else
-    const char* home = std::getenv("HOME");
-    if (home != nullptr && home[0] != '\0')
-    {
-        documentsDir = std::filesystem::path(home) / "Documents";
-    }
-#endif
-
-    if (documentsDir.empty())
-    {
-        documentsDir = std::filesystem::path("Documents");
-    }
-
+    const std::filesystem::path staging = GetDocuments4KDownerTempPath();
     std::error_code error;
-    const std::filesystem::path staging = documentsDir / "4KDownerTemp";
     std::filesystem::create_directories(staging, error);
     return PathUtf8(staging);
 }

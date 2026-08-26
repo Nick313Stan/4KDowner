@@ -4,6 +4,7 @@
 #include <future>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "DownloadFormatPredictor.h"
@@ -51,6 +52,9 @@ public:
     const LinkInfo& GetResult() const;
 
     static LinkInfo LoadVideo(std::string url, std::shared_ptr<std::atomic_bool> cancelRequested);
+    // Lightweight duration lookup (no formats/thumbnails). Returns (videoId, durationDisplay).
+    static std::vector<std::pair<std::string, std::string>>
+    LoadDurationsByUrl(const std::vector<std::string>& urls, std::shared_ptr<std::atomic_bool> cancelRequested);
     static std::string Quote(const std::string& value);
 
 private:

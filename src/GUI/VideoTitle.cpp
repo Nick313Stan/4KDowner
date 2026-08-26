@@ -132,7 +132,7 @@ bool IsAllowedCodepoint(int codepoint)
     }
 
     if (codepoint == ' ' || codepoint == '-' || codepoint == '_' || codepoint == '\'' || codepoint == '.' ||
-        codepoint == '(' || codepoint == ')')
+        codepoint == '(' || codepoint == ')' || codepoint == '+')
     {
         return true;
     }

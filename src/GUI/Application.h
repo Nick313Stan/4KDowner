@@ -1,8 +1,11 @@
 #pragma once
 
 #include "DockArea.h"
+#include "IEmojiBackend.h"
 
 #include "raylib.h"
+
+#include <memory>
 
 class Application
 {
@@ -21,7 +24,8 @@ private:
     void Draw();
 
     Font font_{};
-    // Native 12px grayscale AA font for footer FPS/version.
+    // Native grayscale AA font for footer FPS/version (see DockArea::kFooterMetaFontSize).
     Font fontFooterAa_{};
+    std::unique_ptr<IEmojiBackend> emojiBackend_;
     DockArea dockArea_;
 };

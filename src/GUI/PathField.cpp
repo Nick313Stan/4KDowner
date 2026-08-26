@@ -507,7 +507,8 @@ void PathField::Update(Rectangle bounds, Font font, std::string& path, bool enab
     }
 
     if (CheckCollisionPointRec(GetMousePosition(), textBounds) &&
-        !CheckCollisionPointRec(GetMousePosition(), browseBounds))
+        !CheckCollisionPointRec(GetMousePosition(), browseBounds) &&
+        !(IsKeyDown(KEY_LEFT_CONTROL) || IsKeyDown(KEY_RIGHT_CONTROL)))
     {
         const float wheel = GetMouseWheelMove();
         if (wheel != 0.0f)

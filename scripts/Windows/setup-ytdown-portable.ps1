@@ -48,8 +48,8 @@ if ($LASTEXITCODE -ne 0) {
     throw "get-pip failed."
 }
 
-Write-Host "Installing yt-dlp..."
-& $PythonExe -m pip install --upgrade yt-dlp --no-warn-script-location
+Write-Host "Installing yt-dlp (needs visionos client for HLS 4K fallback, >=2026.08.19)..."
+& $PythonExe -m pip install --upgrade "yt-dlp[default]>=2026.08.19" --no-warn-script-location
 if ($LASTEXITCODE -ne 0) {
     throw "pip install yt-dlp failed."
 }

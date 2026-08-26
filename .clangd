@@ -3,4 +3,4 @@ CompileFlags:
   Add:
     - "-Wall"
     - "-Wextra"
-CompilationDatabase: build-linux
+  CompilationDatabase: build-linux

@@ -1,4 +1,5 @@
 build/
+build-windows/
 build-linux/
 out/
 .vs/
@@ -22,4 +23,6 @@ scripts/Windows/msi/branding/
 
 # Editor / local
 .cursor/
+.cache/
+cache/
 *.h.new

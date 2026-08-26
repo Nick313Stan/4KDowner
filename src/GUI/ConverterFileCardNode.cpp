@@ -17,11 +17,25 @@ namespace
 {
 std::string FormatElapsed(double seconds)
 {
+    if (seconds <= 0.0)
+    {
+        return "0:00";
+    }
+
     const int totalSeconds = static_cast<int>(seconds + 0.5);
-    const int minutes = totalSeconds / 60;
-    const int secs = totalSeconds % 60;
+    const int hours = totalSeconds / 3600;
+    const int remainder = totalSeconds % 3600;
+    const int minutes = remainder / 60;
+    const int secs = remainder % 60;
     char buffer[32]{};
-    std::snprintf(buffer, sizeof(buffer), "%d:%02d", minutes, secs);
+    if (hours > 0)
+    {
+        std::snprintf(buffer, sizeof(buffer), "%d:%02d:%02d", hours, minutes, secs);
+    }
+    else
+    {
+        std::snprintf(buffer, sizeof(buffer), "%d:%02d", minutes, secs);
+    }
     return buffer;
 }
 

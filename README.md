@@ -1,7 +1,7 @@
 # 4KDowner
 
 <p align="center">
-  <img src="assets/4KDowner-Screen-1.1.0.png" alt="4KDowner" width="1024">
+  <img src="assets/4KDowner-Screen-1.2.0.png" alt="4KDowner" width="1024">
 </p>
 
 Desktop app for downloading online video and converting media files on **Windows** and **Linux**.
@@ -82,20 +82,20 @@ At runtime you also need `ytdown`, `ffmpeg`, and a JS runtime (`packages/nodejs`
 ### Windows
 
 ```powershell
-cmake -S . -B build
-cmake --build build --config Release --target 4KDowner
+cmake -S . -B build-windows
+cmake --build build-windows --config Release --target 4KDowner
 ```
 
-Output: `build/Release/4KDowner.exe` (or `build/Debug/` for Debug).
+Output: `build-windows/Release/4KDowner.exe` (or `build-windows/Debug/` for Debug).
 
 ### Linux
 
 ```bash
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --target 4KDowner
+cmake -S . -B build-linux -DCMAKE_BUILD_TYPE=Release
+cmake --build build-linux --target 4KDowner
 ```
 
-Output: `build/4KDowner`.
+Output: `build-linux/4KDowner`.
 
 Run from a directory that can resolve `assets/` and `packages/` (the portable layout below, or the repo root after staging those folders).
 
@@ -107,13 +107,14 @@ Default Windows output folder (next to the repo under `yCompiled/`):
 Coding/
   4KDowner/
   yCompiled/
-    4KDownerCompiled/
-      4KDowner-1.1.0-windows-x64/          ← portable
-      4KDowner-1.1.0-windows-x64.zip
-      4KDowner-1.1.0-windows-x64.msi
-      4KDowner-1.1.0-linux-x64/            ← portable (Linux)
-      4KDowner-1.1.0-linux-x64.tar.gz
+    4KDowner-<version>-windows-x64/          ← portable
+    4KDowner-<version>-windows-x64.zip
+    4KDowner-<version>-windows-x64.msi
+    4KDowner-<version>-linux-x64/            ← portable (Linux)
+    4KDowner-<version>-linux-x64.tar.gz
 ```
+
+(`<version>` = `CMakeLists.txt` `project(… VERSION …)`.)
 
 ### Windows one-shot (`main.ps1`)
 
@@ -128,10 +129,10 @@ Optional flags: `-SkipMsi`, `-SkipArchive`, `-EnsureYtDown`.
 ### Manual CMake targets
 
 ```bash
-cmake --build build --config Release --target package-portable   # Windows multi-config
-cmake --build build --target package-portable                    # Linux
-cmake --build build --config Release --target package-archive    # Windows
-cmake --build build --target package-archive                     # Linux
+cmake --build build-windows --config Release --target package-portable   # Windows multi-config
+cmake --build build-linux --target package-portable                      # Linux
+cmake --build build-windows --config Release --target package-archive    # Windows
+cmake --build build-linux --target package-archive                       # Linux
 ```
 
 ### Windows MSI only
@@ -156,9 +157,9 @@ chmod +x scripts/Linux/main.sh
 ./scripts/Linux/main.sh
 ```
 
-Output under `../yCompiled/4KDownerCompiled/` (same root as Windows):
-- `4KDowner-1.1.0-linux-x64/` (portable folder)
-- `4KDowner-1.1.0-linux-x64.tar.gz`
+Output under `../yCompiled/` (same root as Windows):
+- `4KDowner-<version>-linux-x64/` (portable folder)
+- `4KDowner-<version>-linux-x64.tar.gz`
 
 Optional: `--skip-archive`, `--ensure-ytdown`.
 
@@ -167,3 +168,4 @@ Optional: `--skip-archive`, `--ensure-ytdown`.
 4KDowner is licensed under the [GNU GPL v3](LICENSE).
 
 Third-party license texts used by dependencies are in [`licenses/`](licenses/).
+Emoji graphics default to [Noto Emoji](https://github.com/googlefonts/noto-emoji)-style PNGs (OFL): a frequent subset ships in `assets/emoji/noto/`; others download on demand into `Documents/4KDownerTemp/cache/emoji/`. Twemoji remains an alternate CDN-backed backend (not bundled).

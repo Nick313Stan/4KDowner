@@ -1,6 +1,9 @@
+#include "Version.h"
+
 #include "Application.h"
 
 #include "ConverterInfoLoader.h"
+#include "EmojiText.h"
 #include "LinkInfoLoader.h"
 #include "ShortcutRouter.h"
 #include "WinAppPaths.h"
@@ -8,10 +11,6 @@
 
 #include <filesystem>
 #include <vector>
-
-#ifndef FOURKDOWNER_VERSION
-#define FOURKDOWNER_VERSION "1.1.0"
-#endif
 
 #ifdef _WIN32
 #define NOMINMAX
@@ -53,28 +52,6 @@ std::vector<int> BuildFontCodepoints()
         codepoints.push_back(codepoint);
     }
     return codepoints;
-}
-
-std::filesystem::path FindAssetPath(const std::filesystem::path& relativePath)
-{
-    std::filesystem::path directory = std::filesystem::current_path();
-    while (!directory.empty())
-    {
-        const std::filesystem::path candidate = directory / relativePath;
-        if (std::filesystem::exists(candidate))
-        {
-            return std::filesystem::absolute(candidate);
-        }
-
-        const std::filesystem::path parent = directory.parent_path();
-        if (parent == directory)
-        {
-            break;
-        }
-        directory = parent;
-    }
-
-    return relativePath;
 }
 
 Font LoadFontWithType(const std::filesystem::path& fontPath,
@@ -203,8 +180,8 @@ Application::Application()
     font_ = LoadFontEx(fontPath.string().c_str(), 48, codepoints.data(), static_cast<int>(codepoints.size()));
     SetTextureFilter(font_.texture, TEXTURE_FILTER_BILINEAR);
 
-    // Native 12px bake for footer FPS/version (grayscale AA).
-    constexpr int kFooterAaFontSize = 12;
+    // Native bake for footer FPS/version (drawn at DockArea::kFooterMetaFontSize).
+    constexpr int kFooterAaFontSize = static_cast<int>(DockArea::kFooterMetaFontSize + 0.5f);
     std::vector<int> footerCodepoints;
     for (int codepoint = 0x0020; codepoint <= 0x007E; ++codepoint)
     {
@@ -212,6 +189,10 @@ Application::Application()
     }
     fontFooterAa_ = LoadFontWithType(fontPath, kFooterAaFontSize, footerCodepoints, FONT_DEFAULT);
     SetTargetFPS(60);
+
+    // Default emoji backend: Noto-like PNG sprites (Twemoji via EmojiBackendKind::Sprites).
+    emojiBackend_ = CreateEmojiBackend(EmojiBackendKind::NotoSprites);
+    EmojiText::SetBackend(emojiBackend_.get());
 }
 
 Application::~Application()
@@ -221,6 +202,12 @@ Application::~Application()
     g_application = nullptr;
 #endif
     dockArea_.UnloadResources();
+    EmojiText::SetBackend(nullptr);
+    if (emojiBackend_ != nullptr)
+    {
+        emojiBackend_->UnloadAll();
+        emojiBackend_.reset();
+    }
     UnloadFont(fontFooterAa_);
     UnloadFont(font_);
     CloseWindow();
@@ -242,6 +229,7 @@ void Application::Run()
 
 void Application::Update()
 {
+    EmojiText::Pump();
     LinkInfoLoader::ReapAbandoned();
     ConverterInfoLoader::ReapAbandoned();
     dockArea_.Update(GetScreenWidth(), GetScreenHeight(), font_);

@@ -217,7 +217,9 @@ std::string NormalizeYoutubeUrl(const std::string& url)
 
 std::string BuildYoutubeJsRuntimeArgs()
 {
-    std::string args = " --remote-components ejs:github";
+    // Prefer IPv4: on Windows, default IPv6 routing can throttle long YouTube downloads
+    // to ~0.5 MB/s while IPv4 stays at tens of MiB/s (same network / same yt-dlp).
+    std::string args = " --force-ipv4 --remote-components ejs:github";
 
     // yt-dlp enables only deno by default; pass any available runtime explicitly.
     std::string runtimes;
@@ -244,8 +246,106 @@ std::string BuildYoutubeJsRuntimeArgs()
         args += " --js-runtimes " + QuoteShellArgument(runtimes);
     }
 
-    // Default web clients are often SABR-capped at 1080p. These still expose full DASH (2K/4K/8K).
-    args += " --extractor-args " + QuoteShellArgument("youtube:player_client=android_vr,tv_downgraded,web_embedded");
+    // android_vr / tv_downgraded / web_embedded: DASH (2K/4K/8K when GVS PO allows).
+    // web_safari: Safari UA → HLS muxed streams up to 1080p (age-restricted / long VODs).
+    // visionos: HLS m3u8 up to 4K — needed for format listing when android_vr skips PO-token https
+    // formats (yt-dlp ≥2026.08) and for downloads that would otherwise 403 mid-file on itag 401/315.
+    args += " --extractor-args " +
+            QuoteShellArgument("youtube:player_client=android_vr,tv_downgraded,web_embedded,web_safari,visionos");
+    return args;
+}
+
+std::string BuildYoutubeVisionOsJsRuntimeArgs()
+{
+    // Same as BuildYoutubeJsRuntimeArgs, but only visionos: HLS (m3u8) often still serves 1440/2160
+    // when android_vr https DASH URLs 403 mid-download (GVS PO token / SABR experiments).
+    std::string args = " --force-ipv4 --remote-components ejs:github";
+
+    std::string runtimes;
+    const std::filesystem::path denoPath = FindExecutableInPath("deno");
+    if (!denoPath.empty())
+    {
+        if (!runtimes.empty())
+        {
+            runtimes += ',';
+        }
+        runtimes += "deno:" + denoPath.string();
+    }
+    const std::filesystem::path nodePath = FindNodeExecutable();
+    if (!nodePath.empty())
+    {
+        if (!runtimes.empty())
+        {
+            runtimes += ',';
+        }
+        runtimes += "node:" + nodePath.string();
+    }
+    if (!runtimes.empty())
+    {
+        args += " --js-runtimes " + QuoteShellArgument(runtimes);
+    }
+
+    args += " --extractor-args " + QuoteShellArgument("youtube:player_client=visionos");
+    return args;
+}
+
+std::string BuildYoutubeFlatPlaylistArgs()
+{
+    // Flat dumps only need a JS runtime for challenges — not the watch-page client ladder.
+    std::string args = " --force-ipv4 --remote-components ejs:github";
+    std::string runtimes;
+    const std::filesystem::path denoPath = FindExecutableInPath("deno");
+    if (!denoPath.empty())
+    {
+        runtimes += "deno:" + denoPath.string();
+    }
+    const std::filesystem::path nodePath = FindNodeExecutable();
+    if (!nodePath.empty())
+    {
+        if (!runtimes.empty())
+        {
+            runtimes += ',';
+        }
+        runtimes += "node:" + nodePath.string();
+    }
+    if (!runtimes.empty())
+    {
+        args += " --js-runtimes " + QuoteShellArgument(runtimes);
+    }
+    return args;
+}
+
+std::string BuildYoutubeDurationLookupArgs()
+{
+    // Same JS challenge plumbing as full parse (needed for many Shorts), but fewer clients —
+    // duration metadata does not need the full DASH quality ladder.
+    std::string args = " --force-ipv4 --remote-components ejs:github";
+
+    std::string runtimes;
+    const std::filesystem::path denoPath = FindExecutableInPath("deno");
+    if (!denoPath.empty())
+    {
+        if (!runtimes.empty())
+        {
+            runtimes += ',';
+        }
+        runtimes += "deno:" + denoPath.string();
+    }
+    const std::filesystem::path nodePath = FindNodeExecutable();
+    if (!nodePath.empty())
+    {
+        if (!runtimes.empty())
+        {
+            runtimes += ',';
+        }
+        runtimes += "node:" + nodePath.string();
+    }
+    if (!runtimes.empty())
+    {
+        args += " --js-runtimes " + QuoteShellArgument(runtimes);
+    }
+
+    args += " --extractor-args " + QuoteShellArgument("youtube:player_client=android,web_embedded");
     return args;
 }
 
@@ -288,6 +388,13 @@ void AppendDetectedOperaBrowsers(std::vector<std::string>& browsersToTry)
         {
             continue;
         }
+        // Profile folder can exist after uninstall leftovers without a Cookies DB.
+        const bool hasCookies = std::filesystem::exists(operaPath / "Cookies", error) ||
+                                std::filesystem::exists(operaPath / "Network" / "Cookies", error);
+        if (!hasCookies)
+        {
+            continue;
+        }
 
         const std::string spec = "opera:" + operaPath.string();
         if (std::find(browsersToTry.begin(), browsersToTry.end(), spec) == browsersToTry.end())
@@ -301,7 +408,8 @@ void AppendDetectedOperaBrowsers(std::vector<std::string>& browsersToTry)
 
 const std::vector<std::string>& GetYoutubeCookieBrowsersToTry()
 {
-    static const std::vector<std::string> browsers = {"firefox", "edge", "chrome", "vivaldi", "opera"};
+    // Do not list bare "opera" — only AppendDetectedOperaBrowsers when a real Cookies DB exists.
+    static const std::vector<std::string> browsers = {"firefox", "edge", "chrome", "vivaldi"};
     return browsers;
 }
 
@@ -359,16 +467,28 @@ std::string BuildYoutubeDownloadExtraArgs()
 
 bool ShouldRetryYoutubeWithDifferentCookies(const std::string& output)
 {
-    // Auth / cookie / JS challenge failures — try the next browser (and finally no cookies).
-    // Do NOT include "requested format is not available": that means cookies worked
-    // and the format selector must be relaxed on the same browser instead.
-    // "page needs to be reloaded" is a common cookie/client mismatch on YouTube; bare
-    // extraction without cookies often still succeeds.
+    // Auth / cookie / JS challenge / rights-block failures — try the next browser (and finally
+    // no cookies). Bare extraction often restores full android_vr DASH (2K/4K/8K).
+    //
+    // "requested format is not available": on download, callers try a relaxed -f on the same
+    // browser first; if that still fails, falling through here is correct (cookie clients can
+    // leave only storyboards while no-cookies still has the ladder).
+    // "page needs to be reloaded" is a common cookie/client mismatch on YouTube.
+    // Age-gate / rate-limit: another logged-in browser may still work (different Google session).
     return ContainsInsensitive(output, "not a bot") || ContainsInsensitive(output, "sign in to confirm") ||
+           ContainsInsensitive(output, "sign in to youtube") ||
            ContainsInsensitive(output, "signature solving failed") ||
            ContainsInsensitive(output, "challenge solving failed") ||
            ContainsInsensitive(output, "page needs to be reloaded") ||
            ContainsInsensitive(output, "only images are available") ||
+           ContainsInsensitive(output, "requested format is not available") ||
+           ContainsInsensitive(output, "blocked it from display") || ContainsInsensitive(output, "blocked it from") ||
+           ContainsInsensitive(output, "age-restricted") || ContainsInsensitive(output, "age restricted") ||
+           ContainsInsensitive(output, "confirm your age") ||
+           ContainsInsensitive(output, "only available on youtube") || ContainsInsensitive(output, "rate-limited") ||
+           ContainsInsensitive(output, "rate limited") || ContainsInsensitive(output, "try again later") ||
+           (ContainsInsensitive(output, "video unavailable") &&
+            (ContainsInsensitive(output, "blocked") || ContainsInsensitive(output, "watch on youtube"))) ||
            ContainsInsensitive(output, "could not copy chrome cookie") ||
            ContainsInsensitive(output, "failed to decrypt with dpapi") ||
            ContainsInsensitive(output, "could not find") && ContainsInsensitive(output, "cookies database");
@@ -377,6 +497,88 @@ bool ShouldRetryYoutubeWithDifferentCookies(const std::string& output)
 bool IsYoutubeFormatUnavailableError(const std::string& output)
 {
     return ContainsInsensitive(output, "requested format is not available");
+}
+
+bool IsYoutubeHttpForbiddenError(const std::string& output)
+{
+    return ContainsInsensitive(output, "http error 403") ||
+           ContainsInsensitive(output, "unable to download video data");
+}
+
+bool IsYtDlpDownloadProgressLine(const std::string& line)
+{
+    if (line.find("[download]") == std::string::npos)
+    {
+        return false;
+    }
+
+    if (line.find("Got error:") != std::string::npos || line.find("ERROR:") != std::string::npos)
+    {
+        return false;
+    }
+
+    if (line.find("Destination:") != std::string::npos)
+    {
+        return false;
+    }
+
+    return line.find("% of") != std::string::npos;
+}
+
+std::string FilterYtDlpProgressLinesFromOutput(const std::string& output)
+{
+    std::ostringstream filtered;
+    std::stringstream stream(output);
+    std::string line;
+    while (std::getline(stream, line))
+    {
+        if (!line.empty() && line.back() == '\r')
+        {
+            line.pop_back();
+        }
+        if (IsYtDlpDownloadProgressLine(line))
+        {
+            continue;
+        }
+        if (!filtered.str().empty())
+        {
+            filtered << '\n';
+        }
+        filtered << line;
+    }
+    return filtered.str();
+}
+
+std::string ExtractLastMeaningfulYtDlpOutputLine(const std::string& output)
+{
+    size_t end = output.size();
+    while (end > 0)
+    {
+        while (end > 0 && (output[end - 1] == '\r' || output[end - 1] == '\n' || output[end - 1] == ' '))
+        {
+            --end;
+        }
+        if (end == 0)
+        {
+            break;
+        }
+
+        size_t start = end;
+        while (start > 0 && output[start - 1] != '\r' && output[start - 1] != '\n')
+        {
+            --start;
+        }
+
+        const std::string line = output.substr(start, end - start);
+        end = start;
+        if (line.empty() || IsYtDlpDownloadProgressLine(line))
+        {
+            continue;
+        }
+        return line;
+    }
+
+    return {};
 }
 
 std::string SimplifyYtDlpError(const std::string& output)
@@ -420,7 +622,18 @@ std::string SimplifyYtDlpError(const std::string& output)
         {
             return line.substr(6);
         }
+        if (line.find("[download] Got error:") != std::string::npos)
+        {
+            const size_t errorStart = line.find("Got error:");
+            return line.substr(errorStart);
+        }
     }
 
-    return output.empty() ? "yt-dlp could not parse this link." : output;
+    const std::string meaningfulLine = ExtractLastMeaningfulYtDlpOutputLine(output);
+    if (!meaningfulLine.empty())
+    {
+        return meaningfulLine;
+    }
+
+    return output.empty() ? "yt-dlp could not parse this link." : "yt-dlp could not parse this link.";
 }

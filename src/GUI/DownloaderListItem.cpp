@@ -88,10 +88,9 @@ void DownloaderListItem::ClearSelection()
     if (group != nullptr)
     {
         group->SetHeaderSelected(false);
-        for (LinkCardNode& child : group->LoadedCards())
-        {
-            child.SetSelected(false);
-        }
+        group->ClearChannelTabSelection();
+        group->ClearPlaylistShelfSelection();
+        group->ClearLoadedCardSelection();
     }
 }
 
@@ -105,18 +104,20 @@ bool DownloaderListItem::AnySelected() const
     {
         return false;
     }
-    if (group->IsHeaderSelected())
+    if (group->IsHeaderSelected() || group->AnyChannelTabSelected() || group->SelectedPlaylistShelfIndex() >= 0)
     {
         return true;
     }
-    for (const LinkCardNode& child : group->LoadedCards())
-    {
-        if (child.IsSelected())
+    bool found = false;
+    static_cast<const LinkCardGroupNode&>(*group).ForEachLoadedCard(
+        [&](const LinkCardNode& child)
         {
-            return true;
-        }
-    }
-    return false;
+            if (child.IsSelected())
+            {
+                found = true;
+            }
+        });
+    return found;
 }
 
 bool DownloaderListItem::IsGroupHeaderSelected() const
@@ -130,14 +131,16 @@ LinkCardNode* DownloaderListItem::GetSelectedChild()
     {
         return nullptr;
     }
-    for (LinkCardNode& child : group->LoadedCards())
-    {
-        if (child.IsSelected())
+    LinkCardNode* found = nullptr;
+    group->ForEachLoadedCard(
+        [&](LinkCardNode& child)
         {
-            return &child;
-        }
-    }
-    return nullptr;
+            if (found == nullptr && child.IsSelected())
+            {
+                found = &child;
+            }
+        });
+    return found;
 }
 
 const LinkCardNode* DownloaderListItem::GetSelectedChild() const
@@ -146,14 +149,16 @@ const LinkCardNode* DownloaderListItem::GetSelectedChild() const
     {
         return nullptr;
     }
-    for (const LinkCardNode& child : group->LoadedCards())
-    {
-        if (child.IsSelected())
+    const LinkCardNode* found = nullptr;
+    static_cast<const LinkCardGroupNode&>(*group).ForEachLoadedCard(
+        [&](const LinkCardNode& child)
         {
-            return &child;
-        }
-    }
-    return nullptr;
+            if (found == nullptr && child.IsSelected())
+            {
+                found = &child;
+            }
+        });
+    return found;
 }
 
 int DownloaderListItem::CountSelectableChildren() const
@@ -179,14 +184,23 @@ bool DownloaderListItem::IsHovered() const
     {
         return true;
     }
-    for (const LinkCardNode& child : group->LoadedCards())
+    for (int tab = 0; tab < kChannelTabCount; ++tab)
     {
-        if (child.IsHovered())
+        if (group->IsChannelTabHovered(tab))
         {
             return true;
         }
     }
-    return false;
+    bool hovered = false;
+    static_cast<const LinkCardGroupNode&>(*group).ForEachLoadedCard(
+        [&](const LinkCardNode& child)
+        {
+            if (child.IsHovered())
+            {
+                hovered = true;
+            }
+        });
+    return hovered;
 }
 
 bool DownloaderListItem::IsSelected() const
@@ -211,16 +225,13 @@ void DownloaderListItem::SetSelected(bool selected)
     group->SetHeaderSelected(selected);
     if (!selected)
     {
-        for (LinkCardNode& child : group->LoadedCards())
-        {
-            child.SetSelected(false);
-        }
+        group->ClearChannelTabSelection();
+        group->ClearPlaylistShelfSelection();
+        group->ClearLoadedCardSelection();
     }
     else
     {
-        for (LinkCardNode& child : group->LoadedCards())
-        {
-            child.SetSelected(false);
-        }
+        group->ClearPlaylistShelfSelection();
+        group->ClearLoadedCardSelection();
     }
 }

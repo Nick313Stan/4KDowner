@@ -11,7 +11,7 @@
           "-S",
           "${workspaceFolder}",
           "-B",
-          "${workspaceFolder}/build",
+          "${workspaceFolder}/build-windows",
           "-G",
           "Visual Studio 18 2026",
           "-A",
@@ -46,7 +46,7 @@
         "command": "cmake",
         "args": [
           "--build",
-          "${workspaceFolder}/build",
+          "${workspaceFolder}/build-windows",
           "--config",
           "Release",
           "--target",
@@ -80,7 +80,7 @@
         "command": "cmake",
         "args": [
           "--build",
-          "${workspaceFolder}/build",
+          "${workspaceFolder}/build-windows",
           "--config",
           "Debug",
           "--target",

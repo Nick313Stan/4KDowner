@@ -20,7 +20,8 @@ bool operator!=(const AutoConvertOptions& a, const AutoConvertOptions& b)
 bool operator==(const DownloadOptions& a, const DownloadOptions& b)
 {
     return a.fileFormat == b.fileFormat && a.mediaMode == b.mediaMode && a.quality == b.quality &&
-           a.qualityCap == b.qualityCap && a.useCustomPath == b.useCustomPath && a.customPath == b.customPath;
+           a.qualityCap == b.qualityCap && a.useCustomPath == b.useCustomPath && a.customPath == b.customPath &&
+           a.keepNumbering == b.keepNumbering && a.inverseNumbering == b.inverseNumbering;
 }
 
 bool operator!=(const DownloadOptions& a, const DownloadOptions& b)

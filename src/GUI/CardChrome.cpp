@@ -1,5 +1,6 @@
 #include "CardChrome.h"
 
+#include "EmojiText.h"
 #include "MouseCursor.h"
 #include "Tooltip.h"
 
@@ -16,43 +17,7 @@ namespace
 {
 std::vector<std::string> WrapLines(Font font, const std::string& text, float fontSize, float maxWidth, int maxLines)
 {
-    std::stringstream stream(text);
-    std::vector<std::string> lines;
-    std::string word;
-    std::string currentLine;
-
-    while (stream >> word)
-    {
-        const std::string candidate = currentLine.empty() ? word : currentLine + " " + word;
-        if (MeasureTextEx(font, candidate.c_str(), fontSize, 0.0f).x <= maxWidth)
-        {
-            currentLine = candidate;
-            continue;
-        }
-
-        if (!currentLine.empty())
-        {
-            lines.push_back(currentLine);
-            currentLine = word;
-        }
-        else
-        {
-            lines.push_back(word);
-            currentLine.clear();
-        }
-
-        if (static_cast<int>(lines.size()) >= maxLines)
-        {
-            break;
-        }
-    }
-
-    if (!currentLine.empty() && static_cast<int>(lines.size()) < maxLines)
-    {
-        lines.push_back(currentLine);
-    }
-
-    return lines;
+    return EmojiText::WrapLines(font, text, fontSize, maxWidth, maxLines);
 }
 } // namespace
 
@@ -184,6 +149,28 @@ void DrawOpenPathButton(Rectangle bounds, Font font, bool enabled)
     }
 }
 
+void DrawCompletedCheckmarkBackdrop(Rectangle cardBounds)
+{
+    const float left = cardBounds.x + kTextXOffset;
+    const float right = cardBounds.x + cardBounds.width - 34.0f;
+    if (right <= left + 8.0f || cardBounds.height <= 8.0f)
+    {
+        return;
+    }
+
+    const float cx = (left + right) * 0.5f;
+    const float cy = cardBounds.y + cardBounds.height * 0.5f;
+    const float size = std::min(cardBounds.height * 0.78f, (right - left) * 0.62f);
+    const Color check = {72, 210, 110, 58};
+    const float thickness = std::max(3.5f, size * 0.11f);
+
+    const Vector2 p1 = {cx - size * 0.38f, cy + size * 0.02f};
+    const Vector2 p2 = {cx - size * 0.06f, cy + size * 0.34f};
+    const Vector2 p3 = {cx + size * 0.44f, cy - size * 0.32f};
+    DrawLineEx(p1, p2, thickness, check);
+    DrawLineEx(p2, p3, thickness, check);
+}
+
 void DrawPreviewElapsedOverlay(Font font, Rectangle previewBounds, double elapsedSeconds)
 {
     if (elapsedSeconds < 0.0 || previewBounds.width < 8.0f || previewBounds.height < 8.0f)
@@ -273,16 +260,7 @@ void DrawPreviewIndexBadge(Font font, Rectangle previewBounds, int displayIndex)
 void DrawWrappedText(
     Font font, const std::string& text, Vector2 position, float fontSize, float maxWidth, int maxLines, Color color)
 {
-    const std::vector<std::string> lines = WrapLines(font, text, fontSize, maxWidth, maxLines);
-    for (int index = 0; index < static_cast<int>(lines.size()); ++index)
-    {
-        DrawTextEx(font,
-                   lines[index].c_str(),
-                   {position.x, position.y + static_cast<float>(index) * (fontSize + 3.0f)},
-                   fontSize,
-                   0.0f,
-                   color);
-    }
+    EmojiText::DrawWrapped(font, text, position, fontSize, maxWidth, maxLines, color);
 }
 
 bool IsTitleTextHovered(Rectangle bounds,
@@ -307,7 +285,7 @@ bool IsTitleTextHovered(Rectangle bounds,
     const Vector2 mouse = GetMousePosition();
     for (int index = 0; index < static_cast<int>(lines.size()); ++index)
     {
-        const float lineWidth = MeasureTextEx(font, lines[index].c_str(), fontSize, 0.0f).x;
+        const float lineWidth = EmojiText::MeasureWidth(font, lines[static_cast<size_t>(index)], fontSize);
         const Rectangle lineBounds = {textX, startY + static_cast<float>(index) * lineStep, lineWidth, fontSize + 2.0f};
         if (CheckCollisionPointRec(mouse, lineBounds))
         {
@@ -319,12 +297,6 @@ bool IsTitleTextHovered(Rectangle bounds,
 
 float MeasureWrappedTextHeight(Font font, const std::string& text, float fontSize, float maxWidth, int maxLines)
 {
-    const std::vector<std::string> lines = WrapLines(font, text, fontSize, maxWidth, maxLines);
-    if (lines.empty())
-    {
-        return fontSize;
-    }
-
-    return static_cast<float>(lines.size()) * fontSize + static_cast<float>(lines.size() - 1) * 3.0f;
+    return EmojiText::MeasureWrappedHeight(font, text, fontSize, maxWidth, maxLines);
 }
 } // namespace CardChrome

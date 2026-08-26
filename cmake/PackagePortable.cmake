@@ -1,7 +1,7 @@
 # Portable staging: exe + assets + optional packages/ffmpeg + packages/ytdown + packages/nodejs
 # Usage:
-#   cmake --build build --config Release --target package-portable
-#   cmake --build build --config Release --target package-archive
+#   cmake --build build-windows --config Release --target package-portable
+#   cmake --build build-windows --config Release --target package-archive
 
 if(WIN32)
     set(_4kd_release_name "4KDowner-${PROJECT_VERSION}-windows-x64")
@@ -14,12 +14,12 @@ else()
 endif()
 
 set(4KDOWNER_PACKAGE_DIR
-    "${CMAKE_SOURCE_DIR}/../yCompiled/4KDownerCompiled/${_4kd_release_name}"
+    "${CMAKE_SOURCE_DIR}/../yCompiled/${_4kd_release_name}"
     CACHE PATH "Output directory for package-portable")
 set(4KDOWNER_PACKAGES_ROOT "${CMAKE_SOURCE_DIR}/../packages" CACHE PATH
     "Source packages (ffmpeg, ytdown)")
 set(4KDOWNER_ARCHIVE_PATH
-    "${CMAKE_SOURCE_DIR}/../yCompiled/4KDownerCompiled/${_4kd_release_name}.${_4kd_archive_ext}"
+    "${CMAKE_SOURCE_DIR}/../yCompiled/${_4kd_release_name}.${_4kd_archive_ext}"
     CACHE FILEPATH "Output archive for package-archive")
 
 function(fourkdowner_stage_portable)

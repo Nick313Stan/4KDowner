@@ -5,7 +5,7 @@ if(POLICY CMP0091)
 endif()
 
 project(FourKDowner
-    VERSION 1.1.0
+    VERSION 1.2.0
     LANGUAGES C CXX
 )
 
@@ -59,6 +59,10 @@ add_executable(4KDowner
     src/GUI/DownloadOptions.h
     src/GUI/DownloadRunner.cpp
     src/GUI/DownloadRunner.h
+    src/GUI/FooterDownloadSpeedMeter.cpp
+    src/GUI/FooterDownloadSpeedMeter.h
+    src/GUI/DownloadSpeedHistory.cpp
+    src/GUI/DownloadSpeedHistory.h
     src/GUI/Dropdown.cpp
     src/GUI/Dropdown.h
     src/GUI/FoldoutPanel.cpp
@@ -67,6 +71,12 @@ add_executable(4KDowner
     src/GUI/BrowserDiagnostics.h
     src/GUI/CardChrome.cpp
     src/GUI/CardChrome.h
+    src/GUI/EmojiText.cpp
+    src/GUI/EmojiText.h
+    src/GUI/EmojiBackendFactory.cpp
+    src/GUI/IEmojiBackend.h
+    src/GUI/SpriteEmojiBackend.cpp
+    src/GUI/SpriteEmojiBackend.h
     src/GUI/LinkInfoLoader.cpp
     src/GUI/LinkInfoLoader.h
     src/GUI/LinkCardNode.cpp
@@ -81,6 +91,8 @@ add_executable(4KDowner
     src/GUI/LoadingSpinner.h
     src/GUI/PathField.cpp
     src/GUI/PathField.h
+    src/GUI/Scrollbar.cpp
+    src/GUI/Scrollbar.h
     src/GUI/ShortcutRouter.cpp
     src/GUI/ShortcutRouter.h
     src/GUI/Tooltip.cpp
@@ -97,11 +109,20 @@ add_executable(4KDowner
 )
 
 target_link_libraries(4KDowner PRIVATE raylib)
-target_compile_definitions(4KDowner PRIVATE "FOURKDOWNER_VERSION=\"${PROJECT_VERSION}\"")
+
+set(_4kd_generated_dir "${CMAKE_CURRENT_BINARY_DIR}/generated")
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/cmake/Version.h.in"
+    "${_4kd_generated_dir}/Version.h" @ONLY)
+target_include_directories(4KDowner BEFORE PRIVATE "${_4kd_generated_dir}")
 
 if(WIN32)
+    set(_4kd_icon_path "${CMAKE_CURRENT_SOURCE_DIR}/assets/logo/logo.ico")
+    file(TO_NATIVE_PATH "${_4kd_icon_path}" _4kd_icon_native)
+    string(REPLACE "\\" "\\\\" _4kd_icon_native "${_4kd_icon_native}")
+    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/resources/app.rc.in"
+        "${_4kd_generated_dir}/app.rc" @ONLY)
     target_link_libraries(4KDowner PRIVATE Shell32 Ole32 winhttp)
-    target_sources(4KDowner PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/resources/app.rc")
+    target_sources(4KDowner PRIVATE "${_4kd_generated_dir}/app.rc")
     if(MSVC)
         target_link_options(4KDowner PRIVATE "/SUBSYSTEM:WINDOWS" "/ENTRY:mainCRTStartup")
     endif()
