@@ -1,0 +1,28 @@
+build/
+build-windows/
+build-linux/
+out/
+.vs/
+
+compile_commands.json
+
+*.exe
+*.ilk
+*.pdb
+*.obj
+*.o
+
+*.part
+*.tmp
+*.zip
+
+.readme-github-preview.html
+
+# Generated WiX branding bitmaps
+scripts/Windows/msi/branding/
+
+# Editor / local
+.cursor/
+.cache/
+cache/
+*.h.new

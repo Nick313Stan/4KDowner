@@ -1,0 +1,18 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "4KDowner",
+      "type": "lldb",
+      "request": "launch",
+      "program": "${workspaceFolder}/build-windows/Debug/4KDowner.exe",
+      "args": [],
+      "cwd": "${workspaceFolder}",
+      "preLaunchTask": "Build 4KDowner (Debug)",
+      "terminal": "integrated",
+      "linux": {
+        "program": "${workspaceFolder}/build-linux/4KDowner"
+      }
+    }
+  ]
+}

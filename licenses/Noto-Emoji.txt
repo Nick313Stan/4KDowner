@@ -1,0 +1,16 @@
+Noto Emoji
+
+Copyright 2013 Google, Inc. All Rights Reserved.
+
+Licensed under the SIL Open Font License, Version 1.1.
+See OFL-1.1.txt in this folder and:
+https://scripts.sil.org/OFL
+
+Project: https://github.com/googlefonts/noto-emoji
+
+4KDowner (default emoji backend):
+- Bundled frequent PNGs: assets/emoji/noto/ (shipped with the app / portable).
+- Additional glyphs on demand from jsDelivr RealityRipple Noto mirror, cached under
+  Documents/4KDownerTemp/cache/emoji/noto/ (Linux: ~/Documents/4KDownerTemp/...).
+
+Twemoji remains available as an alternate sprite pack (EmojiBackendKind::Sprites).

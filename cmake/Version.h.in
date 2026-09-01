@@ -1,0 +1,3 @@
+#pragma once
+
+#define FOURKDOWNER_VERSION "@PROJECT_VERSION@"

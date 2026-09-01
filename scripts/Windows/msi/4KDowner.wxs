@@ -1,0 +1,130 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs"
+     xmlns:ui="http://wixtoolset.org/schemas/v4/wxs/ui">
+  <Package
+      Name="4KDowner"
+      Manufacturer="NickStan"
+      Version="$(var.ProductVersion)"
+      UpgradeCode="A7C3E91B-4F2D-4A8E-9B1C-6D5E8F0A2B3C"
+      Language="1033"
+      Scope="perMachine">
+
+    <SummaryInformation
+        Description="4KDowner Setup"
+        Manufacturer="NickStan" />
+
+    <MajorUpgrade
+        AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of [ProductName] is already installed." />
+
+    <MediaTemplate EmbedCab="yes" CompressionLevel="medium" />
+
+    <Icon Id="AppIcon.ico" SourceFile="!(bindpath.Assets)\logo\logo.ico" />
+    <Property Id="ARPPRODUCTICON" Value="AppIcon.ico" />
+    <Property Id="ARPHELPLINK" Value="https://github.com/Nick313Stan/4KDowner" />
+    <Property Id="ARPNOREPAIR" Value="yes" />
+    <Property Id="REBOOT" Value="ReallySuppress" />
+    <Property Id="MSIRESTARTMANAGERCONTROL" Value="Disable" />
+
+    <SetProperty
+        Id="REINSTALL"
+        Value="ALL"
+        After="FindRelatedProducts"
+        Condition="Installed AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE" />
+    <SetProperty
+        Id="REINSTALLMODE"
+        Value="vomus"
+        After="FindRelatedProducts"
+        Condition="Installed AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE" />
+    <!-- ProgressDlg shows "Installing ..." only when Preselected is set on reinstall -->
+    <SetProperty
+        Id="Preselected"
+        Value="1"
+        After="FindRelatedProducts"
+        Condition="Installed AND NOT REMOVE AND NOT UPGRADINGPRODUCTCODE" />
+
+    <!-- Resolve installing user's Start Menu\Programs before costing -->
+    <Property Id="USERPROGRAMSMENU">
+      <RegistrySearch
+          Id="SearchUserProgramsMenu"
+          Root="HKCU"
+          Key="Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"
+          Name="Programs"
+          Type="directory" />
+    </Property>
+
+    <Feature Id="ProductFeature" Title="4KDowner" Level="1">
+      <ComponentGroupRef Id="ProductComponents" />
+      <ComponentRef Id="StartMenuShortcut" />
+      <ComponentRef Id="DesktopShortcut" />
+    </Feature>
+
+    <ui:WixUI Id="WixUI_InstallDir" InstallDirectory="INSTALLFOLDER" />
+    <UIRef Id="WixUI_InstallDir_NoLicense" />
+
+    <WixVariable Id="WixUIBannerBmp" Value="!(bindpath.Branding)\banner.bmp" />
+    <WixVariable Id="WixUIDialogBmp" Value="!(bindpath.Branding)\dialog.bmp" />
+  </Package>
+
+  <Fragment>
+    <StandardDirectory Id="ProgramFiles64Folder">
+      <Directory Id="INSTALLFOLDER" Name="4KDowner" />
+    </StandardDirectory>
+
+    <!-- Per-machine install → Public Desktop (visible on every user's desktop) -->
+    <StandardDirectory Id="DesktopFolder" />
+
+    <!-- Filled from USERPROGRAMSMENU registry search (= AppData\...\Start Menu\Programs) -->
+    <Directory Id="USERPROGRAMSMENU" Name="UserPrograms" />
+  </Fragment>
+
+  <Fragment>
+    <ComponentGroup Id="ProductComponents" Directory="INSTALLFOLDER">
+      <Files Include="!(bindpath.Portable)\**">
+        <Exclude Files="!(bindpath.Portable)\README.txt" />
+      </Files>
+    </ComponentGroup>
+  </Fragment>
+
+  <Fragment>
+    <Component
+        Id="StartMenuShortcut"
+        Directory="USERPROGRAMSMENU"
+        Guid="C1D5E03D-6F4B-4C0A-9D3E-8F7A1B5C6D7E">
+      <Shortcut
+          Id="StartMenuShortcutLink"
+          Name="4KDowner"
+          Description="4KDowner video downloader"
+          Target="[INSTALLFOLDER]4KDowner.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="AppIcon.ico" />
+      <RegistryValue
+          Root="HKCU"
+          Key="Software\NickStan\4KDowner"
+          Name="startmenu"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+    </Component>
+
+    <Component
+        Id="DesktopShortcut"
+        Directory="DesktopFolder"
+        Guid="D2E6F14E-7A5C-4D1B-0E4F-9A8B2C6D7E8F">
+      <Shortcut
+          Id="DesktopShortcutLink"
+          Name="4KDowner"
+          Description="4KDowner video downloader"
+          Target="[INSTALLFOLDER]4KDowner.exe"
+          WorkingDirectory="INSTALLFOLDER"
+          Icon="AppIcon.ico" />
+      <RegistryValue
+          Root="HKCU"
+          Key="Software\NickStan\4KDowner"
+          Name="desktop"
+          Type="integer"
+          Value="1"
+          KeyPath="yes" />
+    </Component>
+  </Fragment>
+</Wix>

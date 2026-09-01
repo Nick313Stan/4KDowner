@@ -1,0 +1,6 @@
+<?xml version="1.0" encoding="utf-8"?>
+<WixLocalization Culture="en-us" Language="1033" xmlns="http://wixtoolset.org/schemas/v4/wxl">
+  <String Id="InstallDirDlgDescription" Value="Click Next for the default folder, or Change to pick another." />
+  <String Id="ProgressDlgTitleInstalling" Value="{\WixUI_Font_Title}Installing [ProductName]" />
+  <String Id="ProgressDlgTextInstalling" Value="Please wait while the Setup Wizard installs [ProductName]." />
+</WixLocalization>
